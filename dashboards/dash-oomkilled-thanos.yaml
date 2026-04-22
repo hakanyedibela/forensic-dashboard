@@ -73,6 +73,7 @@ data:
         {
           "type": "stat",
           "title": "OOMKills — last 24h",
+          "description": "**OOMKills in den letzten 24 Stunden**\n\nSumme aller Container-Terminierungen mit Grund `OOMKilled` im 24-Stunden-Fenster.\n\n**Query:** `sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\"}[24h]))`\n\n**Schwellenwerte:**\n- Grün: 0 — alles ok\n- Orange: ≥ 1 — ein Container wurde gekillt, prüfen\n- Rot: ≥ 5 — gehäuft, hohe Priorität\n\nVergleich mit 7d/30d zeigt, ob das Problem akut ist oder chronisch.",
           "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{ "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[24h]))" }],
@@ -82,6 +83,7 @@ data:
         {
           "type": "stat",
           "title": "OOMKills — last 7d",
+          "description": "**OOMKills in den letzten 7 Tagen**\n\nSumme der OOMKilled-Terminierungen im Wochenfenster. Dient als Baseline gegen die 24h-Zahl.\n\n**Faustregel:** Wenn `24h > 7d/7`, eskaliert das Problem gerade.",
           "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{ "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[7d]))" }]
@@ -89,6 +91,7 @@ data:
         {
           "type": "stat",
           "title": "OOMKills — last 30d",
+          "description": "**OOMKills in den letzten 30 Tagen**\n\nLangzeit-Trend. Erfordert Thanos (oder ausreichend lange Prometheus-Retention).\n\n**Interpretation:**\n- Konstant hoch → chronische Unterprovisionierung, nicht durch kurzfristiges Hochsetzen des Limits lösbar\n- Steigender Trend → Problem wächst, z. B. durch mehr Traffic oder einen Memory-Leak\n- Plötzlicher Stopp nach einem Deploy → Fix eingespielt",
           "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{ "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[30d]))" }]
@@ -96,6 +99,7 @@ data:
         {
           "type": "stat",
           "title": "Distinct pods OOMKilled (7d)",
+          "description": "**Anzahl unterschiedlicher Pods mit OOMKill (7 Tage)**\n\nZählt die einzigartigen `(namespace, pod)`-Kombinationen, die in den letzten 7 Tagen mindestens einmal OOMKilled waren.\n\n**Interpretation:**\n- Zahl ≈ OOMKills-Summe (Panel 2) → jeder Kill betrifft einen anderen Pod → verteiltes Problem\n- Zahl ≪ OOMKills-Summe → wenige Pods crashen wiederholt → lokales Problem (Leak, zu niedriges Limit)",
           "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{ "expr": "count(count by (namespace,pod) (max_over_time(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[7d]) == 1))" }]
@@ -103,6 +107,7 @@ data:
         {
           "type": "timeseries",
           "title": "OOMKill events over time (rate)",
+          "description": "**OOMKill-Ereignisse im Zeitverlauf**\n\nGestapelte Balken zeigen die Anzahl OOMKills pro Namespace pro Zeit-Bucket.\n\n**Query:** `sum by (namespace) (increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\"}[$__rate_interval]))`\n\n**Muster-Erkennung:**\n- Gleichmäßige vertikale Balken zur gleichen Uhrzeit täglich → Cron/Backup/Batch-Job\n- Cluster-weite gleichzeitige Spikes → Knoten-Memory-Druck, kein App-Bug\n- Nur ein Namespace betroffen → Anwendungsproblem\n\nDie roten Annotationen markieren einzelne OOM-Events für die Korrelation.",
           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -114,6 +119,7 @@ data:
         {
           "type": "table",
           "title": "OOMKilled containers (detail)",
+          "description": "**Tabelle der OOMKilled Container**\n\nListet alle Container, deren letzter Terminierungsgrund `OOMKilled` war, mit Cluster, Namespace, Pod, Container, Node und Restart-Zähler.\n\n**Spalten lesen:**\n- `node` mehrfach derselbe → Knoten-Speicherdruck / Noisy Neighbor (Muster D)\n- `restart count` sehr hoch → wahrscheinlich CrashLoopBackOff — Container kann sich gar nicht starten (Muster E)\n- Wenige Restarts, lange Laufzeit → schleichender Leak oder Spike-Kill\n\n**Drill-down:** Der Dashboard-Link oben rechts öffnet die Forensics-Ansicht für den gewählten Pod.",
           "gridPos": { "h": 10, "w": 24, "x": 0, "y": 12 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -129,6 +135,7 @@ data:
         {
           "type": "timeseries",
           "title": "Top 10 max memory peak (max_over_time 1h windows)",
+          "description": "**Top 10 Speicher-Peaks (absolut)**\n\nFür jede 1-Stunden-Periode wird der Maximalwert von `container_memory_working_set_bytes` ermittelt. Dargestellt sind die 10 größten Workloads.\n\n**Query:** `topk(10, max by (namespace,pod,container) (max_over_time(container_memory_working_set_bytes[1h])))`\n\n**Hinweis:** `working_set_bytes` ist der Wert, den der Kernel-OOM-Killer betrachtet — nicht `usage_bytes` (enthält Page-Cache).\n\n**Nutzung:** Gibt den absoluten Verbrauch in Bytes. Für die Bewertung gegen das Limit siehe das nebenstehende Panel.",
           "gridPos": { "h": 9, "w": 12, "x": 0, "y": 22 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -140,6 +147,7 @@ data:
         {
           "type": "timeseries",
           "title": "Top 10 — % of memory limit consumed (peak)",
+          "description": "**Top 10 Speicher-Peaks relativ zum Limit (wichtigstes Panel!)**\n\nZeigt den Peak-Verbrauch geteilt durch das konfigurierte Memory-Limit.\n\n**Query:** `topk(10, max_over_time(working_set[1h]) / kube_pod_container_resource_limits{resource=\"memory\"})`\n\n**Diagnose-Tabelle:**\n| Wert | Bedeutung |\n|------|-----------|\n| > 100 % | OOM hat stattgefunden |\n| 95–100 % | Limit zu eng für normale Peaks → **Limit erhöhen** |\n| 80–95 % | Grenzwertig, Headroom hinzufügen |\n| < 50 % und dennoch OOM | Kein Container-Limit-Problem! Knoten-Druck oder Kernel-OOM prüfen |\n\n**Interpretation:** Der eindeutigste Einzelindikator für die Ursache eines OOMKills.",
           "gridPos": { "h": 9, "w": 12, "x": 12, "y": 22 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -151,6 +159,7 @@ data:
         {
           "type": "bargauge",
           "title": "Current working-set vs limit (>=70%)",
+          "description": "**Frühwarnsystem: Container bei ≥ 70 % des Limits (aktuell)**\n\nMomentaufnahme aller Container, deren aktueller Speicherverbrauch mindestens 70 % ihres Limits beträgt.\n\n**Query:** `topk(20, (working_set / kube_pod_container_resource_limits{resource=\"memory\"}) > 0.7)`\n\n**Farbcode:**\n- Grün: < 80 %\n- Orange: 80–95 %\n- Rot: > 95 % (unmittelbare OOM-Gefahr)\n\n**Maßnahme:** Container in Rot gehören auf die VPA-Empfehlung geprüft und das Limit entsprechend angehoben.",
           "gridPos": { "h": 10, "w": 12, "x": 0, "y": 31 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -163,6 +172,7 @@ data:
         {
           "type": "timeseries",
           "title": "Memory growth rate (leak detector) — deriv/6h",
+          "description": "**Leak-Detektor: Memory-Wachstumsrate (Ableitung über 6h)**\n\n`deriv()` berechnet die Steigung der Speichernutzung. Dauerhaft positive Werte sind das klassische Zeichen eines Memory-Leaks.\n\n**Query:** `topk(10, deriv(container_memory_working_set_bytes[6h]))`\n\n**Form-Erkennung:**\n- Konstant positive Steigung über Stunden → **Memory-Leak** (Heap-Dump ziehen, Profiler anwerfen)\n- Sägezahn (rauf bis zum Restart, fällt auf 0, wieder rauf) → bestätigter Leak + OOM-Zyklus\n- Flach auf hohem Niveau → Grenze erreicht, aber stabil → Sizing-Problem, kein Leak\n- Negativ nach einem Deploy → Fix hat gewirkt\n\n**Vorsicht:** Nicht einfach das Limit erhöhen — der Leak frisst auch das neue Limit.",
           "gridPos": { "h": 10, "w": 12, "x": 12, "y": 31 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -174,6 +184,7 @@ data:
         {
           "type": "timeseries",
           "title": "P95 / P99 memory peak per workload (1h buckets)",
+          "description": "**P95 / P99 der Speicher-Peaks pro Workload (1h-Buckets)**\n\nPerzentile der stündlichen Peak-Werte. Trennt typische Last von Ausreißern.\n\n**Query:** `quantile_over_time(0.95|0.99, max by (namespace,pod,container) (working_set)[1h:])`\n\n**Interpretation:**\n- **P99 ≫ P95** → Spike-getriebene OOMs (seltene große Payloads, N+1-DB-Queries, Retries stauen sich auf) — Pattern B\n- **P95 ≈ P99 hoch** → Baseline ist generell zu hoch, keine Spikes — **rightsizing** oder Code-Allokationen prüfen — Pattern C\n- **P95 niedrig, P99 sehr hoch** → GC/Caching-Verhalten, JVM/Go-GC tunen\n\nBeide Perzentile an ein Limit heranreichend ≈ Limit anheben auf `P99 × 1.3`.",
           "gridPos": { "h": 9, "w": 24, "x": 0, "y": 41 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [
@@ -191,6 +202,7 @@ data:
         {
           "type": "heatmap",
           "title": "OOMKills by hour-of-day (7d)",
+          "description": "**Heatmap: OOMKills nach Tageszeit (7 Tage)**\n\nVerteilung aller OOMKills über Stunden und Tage. Jede Zelle = ein 1h-Bucket.\n\n**Query:** `sum by (namespace) (increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\"}[1h]))`\n\n**Muster:**\n- Helle vertikale Streifen zu bestimmter Uhrzeit → Cron-Job, Backup, geplanter Traffic-Peak\n- Gleichmäßige Verteilung → organische Nutzung\n- Werktag-/Wochenend-Unterschied → User-Traffic-getrieben\n\nHilft, die Ursache von zeitlichen (vs. zufälligen) OOMs aufzudecken.",
           "gridPos": { "h": 9, "w": 12, "x": 0, "y": 50 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -202,6 +214,7 @@ data:
         {
           "type": "timeseries",
           "title": "Avg container lifetime before OOM (pod uptime at OOM)",
+          "description": "**Durchschnittliche Container-Laufzeit bis zum OOM**\n\nWie lange überlebt ein Container typischerweise, bevor er gekillt wird?\n\n**Query:** `avg by (namespace) ((time() - kube_pod_start_time) and on(...) last_terminated_reason{reason=\"OOMKilled\"} == 1)`\n\n**Interpretation:**\n- **Sekunden bis Minuten** → Container kann nicht einmal starten (z. B. JVM `-Xmx` > Container-Limit, ML-Modell zu groß) — Pattern E\n- **Stunden** → schleichender Leak\n- **Tage** → langsamer Leak oder Speicherfragmentierung (typisch bei langlaufenden C/C++-Prozessen)",
           "gridPos": { "h": 9, "w": 12, "x": 12, "y": 50 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -213,6 +226,7 @@ data:
         {
           "type": "stat",
           "title": "All-time peak (max_over_time $__range) — selected workload",
+          "description": "**Maximaler Speicher-Peak über den gesamten Zeitbereich des Dashboards**\n\nHöchster beobachteter Wert von `working_set_bytes` innerhalb des aktuell eingestellten Zeitfensters (oben rechts).\n\n**Query:** `max(max_over_time(container_memory_working_set_bytes[$__range]))`\n\n**Nutzung:** Zeigt den Worst-Case, auf den das Limit ausgelegt sein muss. Für eine sichere Dimensionierung: Limit ≥ Peak × 1.3.",
           "gridPos": { "h": 5, "w": 12, "x": 0, "y": 59 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -223,6 +237,7 @@ data:
         {
           "type": "stat",
           "title": "Top peak container name",
+          "description": "**Container mit dem höchsten Peak im aktuellen Zeitfenster**\n\nNamespace/Pod/Container-Identifikation plus Peak-Wert — wer hat am meisten verbraucht?\n\n**Query:** `topk(1, max by (namespace,pod,container) (max_over_time(working_set[$__range])))`\n\n**Nutzung:** Schneller Einstieg in die Ursachenanalyse — der Name kann direkt in den Drill-down-Link oben oder in den Forensics-Dashboard übernommen werden.",
           "gridPos": { "h": 5, "w": 12, "x": 12, "y": 59 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{

@@ -92,6 +92,7 @@ data:
         {
           "type": "stat",
           "title": "Current memory / limit",
+          "description": "**Aktueller Speicher geteilt durch Limit**\n\nMomentwert des Verhältnisses `working_set / memory_limit` für den ausgewählten Pod/Container.\n\n**Query:** `max(container_memory_working_set_bytes) / max(kube_pod_container_resource_limits{resource=\"memory\"})`\n\n**Farbcode:**\n- Grün: < 80 %\n- Orange: 80–95 %\n- Rot: > 95 % (OOM wahrscheinlich)",
           "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -103,6 +104,7 @@ data:
         {
           "type": "stat",
           "title": "Peak memory in range",
+          "description": "**Höchster Speicherverbrauch im aktuellen Zeitfenster**\n\nMaximalwert von `working_set_bytes` über den im Dashboard oben rechts eingestellten Zeitraum.\n\n**Query:** `max(max_over_time(container_memory_working_set_bytes[$__range]))`\n\n**Nutzung:** Als Basis für die Dimensionierung des Memory-Limits — Faustregel: `Limit ≥ Peak × 1.3`.",
           "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -113,6 +115,7 @@ data:
         {
           "type": "stat",
           "title": "Container restarts",
+          "description": "**Gesamtzahl der Container-Neustarts**\n\nSumme aller Restarts seit Pod-Erstellung (nicht nur im Zeitfenster — Zähler ist kumulativ).\n\n**Query:** `sum(kube_pod_container_status_restarts_total)`\n\n**Interpretation:**\n- 0 → stabil\n- Einzelne Restarts → einmaliger Vorfall\n- Schnell steigender Zähler → CrashLoopBackOff, Container kann sich nicht halten",
           "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -122,6 +125,7 @@ data:
         {
           "type": "stat",
           "title": "OOMKills in range",
+          "description": "**OOMKills für diesen Pod im aktuellen Zeitfenster**\n\nAnzahl der Terminierungen mit Grund `OOMKilled` für den ausgewählten Pod/Container.\n\n**Query:** `sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\"}[$__range]))`\n\n- Grün: 0 — kein OOM aufgetreten\n- Rot: ≥ 1 — mindestens ein OOM, siehe Memory-Panel für Zeitpunkt",
           "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -136,6 +140,7 @@ data:
         {
           "type": "timeseries",
           "title": "Working set vs limit vs request",
+          "description": "**Speicher-Zeitverlauf mit Referenzlinien für Limit und Request**\n\nDarstellung von Working-Set, RSS und Cache im Zeitverlauf. Limit (rot, gestrichelt) und Request (blau, gestrichelt) dienen als Referenzlinien.\n\n**Metriken:**\n- `working_set` — der Wert, den der OOM-Killer betrachtet (wichtigste Kurve)\n- `rss` — Resident Set Size (tatsächlicher Heap-Speicher des Prozesses)\n- `cache` — Page-Cache (vom Kernel wiederverwendbar, zählt NICHT als OOM-Grund)\n- `limit` — konfiguriertes `resources.limits.memory`\n- `request` — konfiguriertes `resources.requests.memory` (für Scheduling relevant)\n\n**Lesehilfe:**\n- Working-Set nähert sich dem Limit → bald OOM\n- Working-Set deutlich unter Limit, aber OOM passiert → Node-Druck oder Kernel-OOM\n- Große Cache-Anteile → OK, werden bei Druck zurückgegeben",
           "gridPos": { "h": 9, "w": 24, "x": 0, "y": 7 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [
@@ -176,6 +181,7 @@ data:
         {
           "type": "timeseries",
           "title": "Memory deriv (leak detector)",
+          "description": "**Memory-Ableitung — der Leak-Detektor**\n\n`deriv()` berechnet die Steigung der Speichernutzung in Bytes pro Sekunde über die letzten 5 Minuten.\n\n**Query:** `deriv(container_memory_working_set_bytes[5m])`\n\n**Interpretation:**\n- Konstant positiv über Stunden → Memory-Leak (Heap-Dump ziehen!)\n- Oszillierend um 0 → GC arbeitet normal\n- Scharfe Spitzen → Request-getriebene Allokationen (Pattern B)\n- Negativ nach einem Deploy → Fix hat gegriffen",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -188,6 +194,7 @@ data:
         {
           "type": "timeseries",
           "title": "Page faults (major)",
+          "description": "**Major Page Faults — Kernel muss Speicher von Disk laden**\n\nRate der Major Page Faults. Jeder Fault bedeutet, dass der Kernel eine Speicherseite von der Disk lesen musste.\n\n**Query:** `rate(container_memory_failures_total{failure_type=\"pgmajfault\"}[$__rate_interval])`\n\n**Interpretation:**\n- Konstant nahe 0 → normal\n- Hoher Wert → Speicher-Druck, System beginnt zu swappen (falls aktiv) oder Pages werden ständig geladen\n- Ansteigend vor einem OOM → der Kernel versucht verzweifelt, Speicher freizumachen",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -202,6 +209,7 @@ data:
         {
           "type": "timeseries",
           "title": "CPU usage vs limit",
+          "description": "**CPU-Nutzung im Vergleich zum Limit**\n\nTatsächlicher CPU-Verbrauch (Cores) gegen das konfigurierte CPU-Limit.\n\n**Query:** `rate(container_cpu_usage_seconds_total[$__rate_interval])`\n\n**Interpretation:**\n- Nutzung am Limit → potenziell Request-Stau → mehr Speicher wird gepuffert → OOM-Risiko steigt\n- Nutzung weit unter Limit, aber Throttling im Nachbar-Panel → Scheduler-Kontention oder Limits zu niedrig angesetzt",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [
@@ -214,6 +222,7 @@ data:
         {
           "type": "timeseries",
           "title": "CPU throttling (high throttling often precedes OOM)",
+          "description": "**CPU Throttling — hohes Throttling geht OOMs oft voraus**\n\nZeit in Sekunden, in der der Container vom CFS-Scheduler gedrosselt wurde.\n\n**Query:** `rate(container_cpu_cfs_throttled_seconds_total[$__rate_interval])`\n\n**Warum relevant für OOM?**\nWenn die App gedrosselt wird, kann sie Requests/Queues nicht rechtzeitig abarbeiten — Puffer wachsen im Speicher an, bis das Limit erreicht ist. Throttling ist oft ein Vorbote des eigentlichen OOMs.\n\n**Maßnahme:** CPU-Limit anheben oder entfernen (CPU-Requests reichen für Scheduling).",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 25 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -228,6 +237,7 @@ data:
         {
           "type": "timeseries",
           "title": "Network bytes (rx/tx)",
+          "description": "**Netzwerk-Bytes pro Sekunde (Empfang / Senden)**\n\nAn der Pod-Netzwerkschnittstelle gemessener Durchsatz.\n\n**Query:** `rate(container_network_receive_bytes_total[...])` und `rate(container_network_transmit_bytes_total[...])`\n\n**OOM-Korrelation:**\n- Peak bei rx unmittelbar vor OOM → große Response wurde komplett in den Speicher gepuffert (Pattern B: Request-Spike)\n- Hohe tx-Rate → App streamt Ergebnisse, evtl. ohne Backpressure → Heap wächst\n- Niedrige Werte, aber OOM → kein Netzwerk-Trigger, eher interner Leak",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 34 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [
@@ -240,6 +250,7 @@ data:
         {
           "type": "timeseries",
           "title": "Packets dropped / errors",
+          "description": "**Verworfene Pakete und Fehler**\n\nPakete, die das Kernel-Netzwerk-Subsystem verwerfen musste (Queue voll, Buffer zu klein, Checksummen-Fehler).\n\n**Queries:** `rate(container_network_{receive,transmit}_packets_dropped_total[...])` und `_errors_total`\n\n**Interpretation:**\n- Drops auf rx ansteigend → CNI-Buffer überlastet, App kann Traffic nicht schnell genug abnehmen (CPU-Throttling prüfen)\n- Plötzliche Error-Spikes → Netzwerkproblem auf Node-Ebene (MTU, NIC)\n- Korrelation mit OOM → Pod war speicherseitig so ausgelastet, dass Netzwerk-Callbacks ausfielen",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 34 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [
@@ -256,6 +267,7 @@ data:
         {
           "type": "timeseries",
           "title": "Container filesystem usage",
+          "description": "**Belegung des Container-Dateisystems**\n\nBelegter Speicher des EmptyDir/overlayfs/PVC je Device.\n\n**Query:** `container_fs_usage_bytes`\n\n**Relevanz für OOM:**\n- Wachsende FS-Belegung + wachsender Working-Set → evtl. eine disk-basierte Cache-Explosion, die auch Memory-Pages reserviert\n- Plötzlicher Drop → Log-Rotation oder Cleanup-Job\n- Wird NICHT vom OOM-Killer bewertet, kann aber auf DiskPressure-Evictions hindeuten",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 43 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -267,6 +279,7 @@ data:
         {
           "type": "timeseries",
           "title": "Disk I/O (rate)",
+          "description": "**Disk-I/O-Rate — Lese- und Schreibbytes pro Sekunde**\n\nI/O-Durchsatz des Containers.\n\n**Queries:** `rate(container_fs_reads_bytes_total[...])` / `rate(container_fs_writes_bytes_total[...])`\n\n**Interpretation:**\n- Hohe Write-Rate → starke Log-Produktion oder DB-Writes → prüfen, ob Logs im Heap gepuffert werden\n- Hohe Read-Rate vor OOM → App lädt große Dateien in den Speicher (z. B. ML-Modell, Dataset)\n- Konstante I/O im Normalbetrieb → Baseline etablieren, Abweichungen beachten",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 43 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [
@@ -281,6 +294,7 @@ data:
             {
               "type": "timeseries",
               "title": "JVM heap used vs max",
+              "description": "**JVM Heap-Nutzung und -Grenze (Heap + Non-Heap)**\n\nDrei Kurven: `heap used`, `heap max` (= `-Xmx`), und `nonheap used` (Metaspace, Code-Cache, Direct Buffers).\n\n**Queries:** `jvm_memory_bytes_used{area=\"heap|nonheap\"}` und `jvm_memory_bytes_max{area=\"heap\"}`\n\n**Diagnose:**\n- `heap used` dauerhaft nahe `heap max`, aber Container-Working-Set < Limit → **Heap zu klein** — `-Xmx` / `MaxRAMPercentage` erhöhen\n- `heap used` entspannt, aber Container-Working-Set am Limit → **Native Memory Leak** (NIO, JNI, Netty Direct Buffers) — `NativeMemoryTracking` aktivieren\n- `nonheap used` wächst → Metaspace-Leak (zu viele Klassen, oft durch Reflection/DynamicProxy-Bibliotheken)",
               "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
               "datasource": { "type": "prometheus", "uid": "${datasource}" },
               "targets": [
@@ -293,6 +307,7 @@ data:
             {
               "type": "timeseries",
               "title": "JVM GC time (rate)",
+              "description": "**Zeit pro Sekunde, die der GC arbeitet**\n\n**Query:** `rate(jvm_gc_collection_seconds_sum[$__rate_interval])`\n\n**Interpretation:**\n- Normale App: < 5 % der CPU in GC\n- > 20 % in GC → GC-Thrashing, Heap vermutlich zu klein → in Kürze OOM oder `GC overhead limit exceeded`\n- Pro GC-Typ separat sichtbar (`G1 Young Generation`, `G1 Old Generation`, `ZGC` usw.) — Old Gen = Vollsammlung, besonders teuer",
               "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
               "datasource": { "type": "prometheus", "uid": "${datasource}" },
               "targets": [{
@@ -304,6 +319,7 @@ data:
             {
               "type": "timeseries",
               "title": "JVM threads",
+              "description": "**Anzahl aktiver JVM-Threads**\n\n**Query:** `jvm_threads_current`\n\n**Interpretation:**\n- Stetiges Wachstum → Thread-Leak (z. B. unbegrenzter Executor-Pool, nicht geschlossene HttpClients)\n- Jeder Thread kostet ~1 MiB Stack-Speicher — 10k Threads = 10 GiB nativer Speicher → direkte OOM-Ursache\n- Plötzlicher Sprung → Thread-Storm durch Request-Flut",
               "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
               "datasource": { "type": "prometheus", "uid": "${datasource}" },
               "targets": [{ "expr": "jvm_threads_current{namespace=\"$namespace\",pod=\"$pod\"}", "legendFormat": "threads" }]
@@ -316,6 +332,7 @@ data:
             {
               "type": "timeseries",
               "title": "Go heap inuse vs sys",
+              "description": "**Go Runtime — Heap-Nutzung vs. vom OS reservierter Heap**\n\nDrei Kurven:\n- `heap_inuse` — aktiv genutzter Heap\n- `heap_sys` — gesamter vom OS reservierter Heap (inkl. freier, nicht zurückgegebener Pages)\n- `next_gc` — bei welcher Heap-Größe die nächste GC läuft\n\n**Interpretation:**\n- `heap_sys ≫ heap_inuse` → Go hält viel Speicher, gibt ihn aber nicht schnell ans OS zurück. Lösung: `GOMEMLIMIT` setzen (ca. 80 % des Container-Limits)\n- `heap_inuse` wächst stetig → echter Leak, pprof anwerfen (`go tool pprof http://pod:6060/debug/pprof/heap`)\n- `next_gc` steigt mit `heap_inuse` mit → GC passt sich an, normal",
               "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
               "datasource": { "type": "prometheus", "uid": "${datasource}" },
               "targets": [
@@ -328,6 +345,7 @@ data:
             {
               "type": "timeseries",
               "title": "Goroutines + GC pause",
+              "description": "**Anzahl Goroutines und GC-Aktivität**\n\n- `goroutines` — aktive Goroutines\n- `gc rate` — Zeit, die der GC beschäftigt ist\n\n**Queries:** `go_goroutines`, `rate(go_gc_duration_seconds_sum[$__rate_interval])`\n\n**Interpretation:**\n- Stetig wachsende Goroutines → Goroutine-Leak (häufig fehlende `context` oder blockierte Channel-Receives) → `/debug/pprof/goroutine?debug=2` im Pod auswerten\n- Jede Goroutine nutzt ~8 KiB Stack — 100k+ = mehrere GiB\n- Hohe GC-Rate → GC kann nicht mithalten, Heap wächst → bald OOM",
               "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
               "datasource": { "type": "prometheus", "uid": "${datasource}" },
               "targets": [
@@ -343,6 +361,7 @@ data:
         {
           "type": "logs",
           "title": "Error / OOM / GC log lines",
+          "description": "**Gefilterte Logzeilen (Loki): nur Fehler/OOM/GC/Heap**\n\nZeigt Logzeilen des ausgewählten Pods, die kritische Schlüsselwörter enthalten.\n\n**Filter-Regex (case-insensitive):** `error|exception|fatal|oom|killed|out ?of ?memory|heap|allocation failed`\n\n**Nutzung:**\n- Zeitbereich ist synchron mit den Metrik-Panels → direkte zeitliche Korrelation mit Speicher-Peaks\n- Klick auf eine Zeile öffnet Volltext-Details\n- Typische Fundstellen bei OOM: `java.lang.OutOfMemoryError`, `killed process N (name)`, `fatal error: runtime: out of memory`",
           "gridPos": { "h": 10, "w": 24, "x": 0, "y": 54 },
           "datasource": { "type": "loki", "uid": "${loki}" },
           "targets": [{
@@ -355,6 +374,7 @@ data:
         {
           "type": "timeseries",
           "title": "Log rate by level (if logs are JSON with a 'level' field)",
+          "description": "**Lograte nach Log-Level (funktioniert nur bei JSON-strukturierten Logs)**\n\n**Query:** `sum by (level) (rate({...} | json | __error__=\"\" [$__interval]))`\n\nNur brauchbar, wenn die App JSON-Logs mit einem Feld `level` produziert (z. B. `{\"level\":\"ERROR\", \"msg\":\"...\"}`). Für unstrukturierte Logs bleibt das Panel leer — dann Panel \"Error / OOM / GC log lines\" nutzen.\n\n**Aussage:** Trennt ERROR/WARN/INFO/DEBUG-Raten voneinander — ermöglicht z. B. das schnelle Erkennen plötzlicher WARN-Spikes vor einem OOM.",
           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 64 },
           "datasource": { "type": "loki", "uid": "${loki}" },
           "targets": [{
@@ -366,6 +386,7 @@ data:
         {
           "type": "logs",
           "title": "All logs",
+          "description": "**Vollständiger Logstream des ausgewählten Pods**\n\nAlle Logzeilen ohne Filter, im aktuellen Dashboard-Zeitfenster.\n\n**Nutzung:**\n- Nach einem OOM-Event: genau zum Zeitpunkt der roten Annotation scrollen, um die letzten App-Ausgaben vor dem Kill zu sehen\n- Mit `kubectl logs <pod> --previous` kombinieren, um Logs aus dem vorherigen (gekillten) Container-Inkarnation zu erhalten — die stehen in Loki, nicht mehr im laufenden Container",
           "gridPos": { "h": 12, "w": 24, "x": 0, "y": 72 },
           "datasource": { "type": "loki", "uid": "${loki}" },
           "targets": [{

@@ -32,6 +32,7 @@ data:
         {
           "type": "timeseries",
           "title": "Log rate by namespace",
+          "description": "**Lograte pro Namespace**\n\nZeigt die Anzahl der Logzeilen pro Sekunde, aggregiert je Namespace.\n\n**Query:** `sum by (namespace) (rate({namespace=~\"$namespace\"}[5m]))`\n\n**Interpretation:**\n- Plötzlicher Anstieg → Traffic-Peak oder Fehlerschleife (App loggt im Kreis)\n- Plötzlicher Abfall auf 0 → Service abgestürzt oder Promtail gestört\n- Gleichmäßige Baseline → Normalbetrieb",
           "datasource": { "type": "loki", "uid": "Loki" },
           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
           "targets": [
@@ -44,6 +45,7 @@ data:
         {
           "type": "timeseries",
           "title": "Error log rate",
+          "description": "**Fehler-Lograte**\n\nRate der Logzeilen, die die Begriffe `error`, `exception` oder `fatal` enthalten (case-insensitive).\n\n**Query:** `sum by (namespace) (rate({namespace=~\"$namespace\"} |~ \"(?i)error|exception|fatal\" [5m]))`\n\n**Interpretation:**\n- Ein Anstieg deutet auf Anwendungsprobleme hin, oft bevor Alerts feuern\n- Vergleich mit Panel 1 (Gesamtrate) zeigt den Fehleranteil an\n- Idealerweise sollte diese Kurve flach nahe null liegen",
           "datasource": { "type": "loki", "uid": "Loki" },
           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
           "targets": [
@@ -56,6 +58,7 @@ data:
         {
           "type": "logs",
           "title": "Recent logs",
+          "description": "**Aktuelle Logs**\n\nRohlogs aus den ausgewählten Namespaces im aktuellen Zeitbereich.\n\n**Query:** `{namespace=~\"$namespace\"}`\n\n**Nutzung:**\n- Zeitraum oben rechts einstellen\n- Klick auf eine Zeile öffnet Volltext + Metadaten\n- Für Filterung auf einzelne Pods die Namespace-Variable einschränken oder in Explore wechseln und `| pod=\"...\"` anhängen",
           "datasource": { "type": "loki", "uid": "Loki" },
           "gridPos": { "h": 12, "w": 24, "x": 0, "y": 16 },
           "targets": [
