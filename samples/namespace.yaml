@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: oom-test
+  labels:
+    name: oom-test
+    purpose: chaos-testing

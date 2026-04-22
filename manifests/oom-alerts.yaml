@@ -1,0 +1,55 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: oom-rules
+  namespace: monitoring
+  labels:
+    release: kps
+spec:
+  groups:
+    - name: oom
+      rules:
+        - alert: ContainerOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+            and on(namespace,pod,container) changes(kube_pod_container_status_restarts_total[10m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} OOMKilled"
+            description: "Raise memory limits or investigate leak."
+
+        - alert: ContainerNearMemoryLimit
+          expr: |
+            (container_memory_working_set_bytes{container!="",container!="POD"}
+             / on(namespace,pod,container) group_left()
+             kube_pod_container_resource_limits{resource="memory"}) > 0.9
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} >90% of memory limit"
+            description: "OOM likely. Review VPA recommendation or bump limits."
+
+        - alert: MemoryLeakSuspect
+          expr: |
+            deriv(container_memory_working_set_bytes{container!="",container!="POD"}[6h]) > 1024*1024
+          for: 2h
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} memory growing steadily"
+            description: "Working set climbing >1 MiB/s over 6h — possible leak."
+
+        - alert: FrequentOOMKills
+          expr: |
+            sum by (namespace, pod, container) (
+              increase(kube_pod_container_status_terminated_reason{reason="OOMKilled"}[1h])
+            ) > 2
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }} OOMKilled >2x/hour"
+            description: "Chronic OOM. Stop patching, right-size based on dashboard peak."

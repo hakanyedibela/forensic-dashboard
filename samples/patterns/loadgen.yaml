@@ -1,0 +1,30 @@
+# Traffic generator for pattern B (spike-app).
+# Hits /spike every 30s to produce periodic memory spikes.
+# Deploy alongside pattern-b-spike.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spike-loadgen
+  namespace: oom-test
+  labels: { app: spike-loadgen }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: spike-loadgen } }
+  template:
+    metadata:
+      labels: { app: spike-loadgen }
+    spec:
+      containers:
+        - name: loadgen
+          image: curlimages/curl:8.10.1
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              while true; do
+                echo "$(date) firing /spike"
+                curl -sS --max-time 30 http://spike-app:8080/spike || true
+                sleep 30
+              done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+            limits:   { cpu: "50m", memory: "32Mi" }

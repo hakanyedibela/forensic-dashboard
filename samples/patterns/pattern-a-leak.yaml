@@ -1,0 +1,34 @@
+# Pattern A — steady memory leak.
+# Expected dashboard signals:
+#   - Panel 6 (deriv): steady positive slope ~5 MiB/s
+#   - Panel 5 (peak/limit): climbs to >100% then container OOMKilled + restart
+#   - Panel 9 (lifetime before OOM): ~ limit / leak_rate seconds (e.g. 256MiB / 5MiB/s ≈ 50s)
+#   - Panel 2: sawtooth OOM events ~every minute
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: leak-app
+  namespace: oom-test
+  labels: { app: leak-app, oom-pattern: "A" }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: leak-app } }
+  template:
+    metadata:
+      labels: { app: leak-app, oom-pattern: "A" }
+    spec:
+      containers:
+        - name: leak
+          image: python:3.12-alpine
+          command: ["python", "-u", "/app/app.py"]
+          env:
+            - { name: MODE,            value: "leak" }
+            - { name: LEAK_MB_PER_SEC, value: "5" }
+          resources:
+            requests: { cpu: "50m",  memory: "64Mi"  }
+            limits:   { cpu: "200m", memory: "256Mi" }  # tight, will OOM
+          volumeMounts:
+            - { name: app, mountPath: /app }
+      volumes:
+        - name: app
+          configMap: { name: oom-simulator }

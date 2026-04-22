@@ -1,0 +1,132 @@
+fullnameOverride: kps
+
+prometheus:
+  prometheusSpec:
+    retention: 15d
+    retentionSize: "40GB"
+    resources:
+      requests: { cpu: 200m, memory: 1Gi }
+      limits:   { memory: 4Gi }
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path       # change if your SC differs
+          accessModes: ["ReadWriteOnce"]
+          resources: { requests: { storage: 50Gi } }
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+alertmanager:
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: ["ReadWriteOnce"]
+          resources: { requests: { storage: 5Gi } }
+    secrets:
+      - alertmanager-slack
+      - alertmanager-smtp
+  config:
+    global:
+      resolve_timeout: 5m
+      # smtp fields only active if alertmanager-smtp secret exists
+      smtp_from: alerts@example.com
+      smtp_smarthost: smtp.example.com:587
+      smtp_auth_username: alerts@example.com
+      smtp_auth_password_file: /etc/alertmanager/secrets/alertmanager-smtp/password
+      smtp_require_tls: true
+    route:
+      receiver: slack-default
+      group_by: ['alertname', 'namespace', 'severity']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+        - matchers: [ severity="critical" ]
+          receiver: slack-critical
+          continue: true
+        - matchers: [ alertname="Watchdog" ]
+          receiver: "null"
+    receivers:
+      - name: "null"
+      - name: slack-default
+        slack_configs:
+          - api_url_file: /etc/alertmanager/secrets/alertmanager-slack/url
+            channel: "#alerts"
+            send_resolved: true
+            title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+            text: |
+              *Severity:* {{ .CommonLabels.severity }}
+              *Namespace:* {{ .CommonLabels.namespace }}
+              {{ range .Alerts }}
+              *Summary:* {{ .Annotations.summary }}
+              *Description:* {{ .Annotations.description }}
+              {{ end }}
+      - name: slack-critical
+        slack_configs:
+          - api_url_file: /etc/alertmanager/secrets/alertmanager-slack/url
+            channel: "#alerts-critical"
+            send_resolved: true
+            title: ':rotating_light: [{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+            text: |
+              *Severity:* {{ .CommonLabels.severity }}
+              *Cluster:* prod-rke2
+              {{ range .Alerts }}• {{ .Annotations.summary }}
+              {{ end }}
+    inhibit_rules:
+      - source_matchers: [ severity="critical" ]
+        target_matchers: [ severity="warning" ]
+        equal: [ alertname, namespace ]
+
+grafana:
+  adminPassword: "ChangeMe123!"
+  persistence:
+    enabled: true
+    storageClassName: local-path
+    size: 10Gi
+  defaultDashboardsTimezone: browser
+  service:
+    type: ClusterIP
+    # type: NodePort
+    # nodePort: 30080
+  sidecar:
+    dashboards:
+      enabled: true
+      searchNamespace: ALL
+      label: grafana_dashboard
+      labelValue: "1"
+    datasources:
+      enabled: true
+      label: grafana_datasource
+      labelValue: "1"
+
+# RKE2 control-plane scraping
+kubeControllerManager:
+  service:
+    enabled: true
+    port: 10257
+    targetPort: 10257
+  serviceMonitor:
+    https: true
+    insecureSkipVerify: true
+
+kubeScheduler:
+  service:
+    enabled: true
+    port: 10259
+    targetPort: 10259
+  serviceMonitor:
+    https: true
+    insecureSkipVerify: true
+
+kubeEtcd:
+  service:
+    enabled: true
+    port: 2381
+
+kubeProxy:
+  service:
+    enabled: true
+    port: 10249

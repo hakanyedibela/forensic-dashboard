@@ -1,0 +1,35 @@
+# Pattern E — startup allocation exceeds limit.
+# Simulates a JVM with -Xmx bigger than container, or an ML pod loading a model.
+# Expected dashboard signals:
+#   - Panel 9 (lifetime before OOM): single-digit seconds
+#   - Panel 3: restart count climbs fast, CrashLoopBackOff kicks in
+#   - Panel 6 (deriv): near-vertical single spike at start
+#   - kubectl logs --previous: "MemoryError" or process killed before ready
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: startup-app
+  namespace: oom-test
+  labels: { app: startup-app, oom-pattern: "E" }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: startup-app } }
+  template:
+    metadata:
+      labels: { app: startup-app, oom-pattern: "E" }
+    spec:
+      containers:
+        - name: startup
+          image: python:3.12-alpine
+          command: ["python", "-u", "/app/app.py"]
+          env:
+            - { name: MODE,       value: "startup" }
+            - { name: STARTUP_MB, value: "400" }    # >> 128 MiB limit → instant OOM
+          resources:
+            requests: { cpu: "50m",  memory: "64Mi"  }
+            limits:   { cpu: "200m", memory: "128Mi" }
+          volumeMounts:
+            - { name: app, mountPath: /app }
+      volumes:
+        - name: app
+          configMap: { name: oom-simulator }

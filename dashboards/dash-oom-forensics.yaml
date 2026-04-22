@@ -1,0 +1,378 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dash-oom-forensics
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  oom-forensics.json: |
+    {
+      "title": "OOM Forensics — Metrics + Logs + Network",
+      "uid": "oom-forensics",
+      "schemaVersion": 39,
+      "version": 1,
+      "tags": ["oom","forensics","loki","thanos"],
+      "timezone": "browser",
+      "time": { "from": "now-3h", "to": "now" },
+      "refresh": "30s",
+      "links": [
+        {
+          "title": "Back to OOMKilled — Thanos Deep Dive",
+          "type": "link",
+          "url": "/d/oomkilled-thanos",
+          "targetBlank": false
+        }
+      ],
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": { "text": "Thanos", "value": "Thanos" }
+          },
+          {
+            "name": "loki",
+            "type": "datasource",
+            "query": "loki",
+            "current": { "text": "Loki", "value": "Loki" }
+          },
+          {
+            "name": "namespace",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "query": "label_values(kube_pod_info, namespace)",
+            "includeAll": false, "multi": false, "refresh": 2
+          },
+          {
+            "name": "pod",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "query": "label_values(kube_pod_info{namespace=\"$namespace\"}, pod)",
+            "includeAll": false, "multi": false, "refresh": 2
+          },
+          {
+            "name": "container",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "query": "label_values(container_memory_working_set_bytes{namespace=\"$namespace\",pod=\"$pod\",container!=\"\",container!=\"POD\"}, container)",
+            "includeAll": true, "multi": true, "refresh": 2
+          }
+        ]
+      },
+      "annotations": {
+        "list": [
+          {
+            "name": "OOMKill events",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "enable": true,
+            "iconColor": "red",
+            "target": {
+              "expr": "changes(kube_pod_container_status_restarts_total{namespace=\"$namespace\",pod=\"$pod\"}[5m]) > 0 and on(namespace,pod,container) kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"} == 1",
+              "legendFormat": "OOM {{container}}"
+            }
+          },
+          {
+            "name": "Pod restarts (any reason)",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "enable": false,
+            "iconColor": "orange",
+            "target": {
+              "expr": "changes(kube_pod_container_status_restarts_total{namespace=\"$namespace\",pod=\"$pod\"}[5m]) > 0",
+              "legendFormat": "restart {{container}}"
+            }
+          }
+        ]
+      },
+      "panels": [
+
+        { "type": "row", "title": "Overview", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false },
+
+        {
+          "type": "stat",
+          "title": "Current memory / limit",
+          "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "max(container_memory_working_set_bytes{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",container!=\"\",container!=\"POD\"}) / max(kube_pod_container_resource_limits{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",resource=\"memory\"})"
+          }],
+          "fieldConfig": { "defaults": { "unit": "percentunit", "thresholds": { "mode": "absolute",
+            "steps": [{"color":"green","value":null},{"color":"orange","value":0.8},{"color":"red","value":0.95}] } } }
+        },
+        {
+          "type": "stat",
+          "title": "Peak memory in range",
+          "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "max(max_over_time(container_memory_working_set_bytes{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",container!=\"\",container!=\"POD\"}[$__range]))"
+          }],
+          "fieldConfig": { "defaults": { "unit": "bytes" } }
+        },
+        {
+          "type": "stat",
+          "title": "Container restarts",
+          "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "sum(kube_pod_container_status_restarts_total{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\"})"
+          }]
+        },
+        {
+          "type": "stat",
+          "title": "OOMKills in range",
+          "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\"}[$__range]))"
+          }],
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute",
+            "steps": [{"color":"green","value":null},{"color":"red","value":1}] } } }
+        },
+
+        { "type": "row", "title": "Memory", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 }, "collapsed": false },
+
+        {
+          "type": "timeseries",
+          "title": "Working set vs limit vs request",
+          "gridPos": { "h": 9, "w": 24, "x": 0, "y": 7 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            {
+              "expr": "container_memory_working_set_bytes{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",container!=\"\",container!=\"POD\"}",
+              "legendFormat": "working_set {{container}}"
+            },
+            {
+              "expr": "kube_pod_container_resource_limits{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",resource=\"memory\"}",
+              "legendFormat": "limit {{container}}"
+            },
+            {
+              "expr": "kube_pod_container_resource_requests{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",resource=\"memory\"}",
+              "legendFormat": "request {{container}}"
+            },
+            {
+              "expr": "container_memory_rss{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",container!=\"\",container!=\"POD\"}",
+              "legendFormat": "rss {{container}}"
+            },
+            {
+              "expr": "container_memory_cache{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",container!=\"\",container!=\"POD\"}",
+              "legendFormat": "cache {{container}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } },
+            "overrides": [
+              { "matcher": { "id": "byRegexp", "options": "^limit .*" },
+                "properties": [{ "id": "custom.lineStyle", "value": { "fill": "dash" } },
+                               { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] },
+              { "matcher": { "id": "byRegexp", "options": "^request .*" },
+                "properties": [{ "id": "custom.lineStyle", "value": { "fill": "dash" } },
+                               { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }] }
+            ]
+          }
+        },
+
+        {
+          "type": "timeseries",
+          "title": "Memory deriv (leak detector)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "deriv(container_memory_working_set_bytes{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",container!=\"\",container!=\"POD\"}[5m])",
+            "legendFormat": "{{container}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "Bps" } }
+        },
+
+        {
+          "type": "timeseries",
+          "title": "Page faults (major)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "rate(container_memory_failures_total{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",failure_type=\"pgmajfault\"}[$__rate_interval])",
+            "legendFormat": "pgmajfault {{container}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+
+        { "type": "row", "title": "CPU", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 }, "collapsed": false },
+
+        {
+          "type": "timeseries",
+          "title": "CPU usage vs limit",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            { "expr": "rate(container_cpu_usage_seconds_total{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",container!=\"\",container!=\"POD\"}[$__rate_interval])", "legendFormat": "usage {{container}}" },
+            { "expr": "kube_pod_container_resource_limits{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",resource=\"cpu\"}", "legendFormat": "limit {{container}}" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "cores" } }
+        },
+
+        {
+          "type": "timeseries",
+          "title": "CPU throttling (high throttling often precedes OOM)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 25 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "rate(container_cpu_cfs_throttled_seconds_total{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",container!=\"\",container!=\"POD\"}[$__rate_interval])",
+            "legendFormat": "throttled {{container}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        },
+
+        { "type": "row", "title": "Network", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 }, "collapsed": false },
+
+        {
+          "type": "timeseries",
+          "title": "Network bytes (rx/tx)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 34 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            { "expr": "rate(container_network_receive_bytes_total{namespace=\"$namespace\",pod=\"$pod\"}[$__rate_interval])", "legendFormat": "rx {{interface}}" },
+            { "expr": "rate(container_network_transmit_bytes_total{namespace=\"$namespace\",pod=\"$pod\"}[$__rate_interval])", "legendFormat": "tx {{interface}}" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "Bps" } }
+        },
+
+        {
+          "type": "timeseries",
+          "title": "Packets dropped / errors",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 34 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            { "expr": "rate(container_network_receive_packets_dropped_total{namespace=\"$namespace\",pod=\"$pod\"}[$__rate_interval])", "legendFormat": "rx drop {{interface}}" },
+            { "expr": "rate(container_network_transmit_packets_dropped_total{namespace=\"$namespace\",pod=\"$pod\"}[$__rate_interval])", "legendFormat": "tx drop {{interface}}" },
+            { "expr": "rate(container_network_receive_errors_total{namespace=\"$namespace\",pod=\"$pod\"}[$__rate_interval])", "legendFormat": "rx err {{interface}}" },
+            { "expr": "rate(container_network_transmit_errors_total{namespace=\"$namespace\",pod=\"$pod\"}[$__rate_interval])", "legendFormat": "tx err {{interface}}" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "pps" } }
+        },
+
+        { "type": "row", "title": "Filesystem", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 }, "collapsed": false },
+
+        {
+          "type": "timeseries",
+          "title": "Container filesystem usage",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 43 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "container_fs_usage_bytes{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\",container!=\"\",container!=\"POD\"}",
+            "legendFormat": "{{container}} {{device}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "bytes" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Disk I/O (rate)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 43 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            { "expr": "rate(container_fs_reads_bytes_total{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\"}[$__rate_interval])", "legendFormat": "read {{container}}" },
+            { "expr": "rate(container_fs_writes_bytes_total{namespace=\"$namespace\",pod=\"$pod\",container=~\"$container\"}[$__rate_interval])", "legendFormat": "write {{container}}" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "Bps" } }
+        },
+
+        { "type": "row", "title": "JVM runtime (if jmx_exporter present)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 51 }, "collapsed": true,
+          "panels": [
+            {
+              "type": "timeseries",
+              "title": "JVM heap used vs max",
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "targets": [
+                { "expr": "jvm_memory_bytes_used{namespace=\"$namespace\",pod=\"$pod\",area=\"heap\"}", "legendFormat": "heap used" },
+                { "expr": "jvm_memory_bytes_max{namespace=\"$namespace\",pod=\"$pod\",area=\"heap\"}",  "legendFormat": "heap max" },
+                { "expr": "jvm_memory_bytes_used{namespace=\"$namespace\",pod=\"$pod\",area=\"nonheap\"}", "legendFormat": "nonheap used" }
+              ],
+              "fieldConfig": { "defaults": { "unit": "bytes" } }
+            },
+            {
+              "type": "timeseries",
+              "title": "JVM GC time (rate)",
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "targets": [{
+                "expr": "rate(jvm_gc_collection_seconds_sum{namespace=\"$namespace\",pod=\"$pod\"}[$__rate_interval])",
+                "legendFormat": "{{gc}}"
+              }],
+              "fieldConfig": { "defaults": { "unit": "s" } }
+            },
+            {
+              "type": "timeseries",
+              "title": "JVM threads",
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "targets": [{ "expr": "jvm_threads_current{namespace=\"$namespace\",pod=\"$pod\"}", "legendFormat": "threads" }]
+            }
+          ]
+        },
+
+        { "type": "row", "title": "Go runtime (if /metrics exposes go_*)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 52 }, "collapsed": true,
+          "panels": [
+            {
+              "type": "timeseries",
+              "title": "Go heap inuse vs sys",
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "targets": [
+                { "expr": "go_memstats_heap_inuse_bytes{namespace=\"$namespace\",pod=\"$pod\"}", "legendFormat": "heap_inuse" },
+                { "expr": "go_memstats_heap_sys_bytes{namespace=\"$namespace\",pod=\"$pod\"}",   "legendFormat": "heap_sys"   },
+                { "expr": "go_memstats_next_gc_bytes{namespace=\"$namespace\",pod=\"$pod\"}",   "legendFormat": "next_gc"    }
+              ],
+              "fieldConfig": { "defaults": { "unit": "bytes" } }
+            },
+            {
+              "type": "timeseries",
+              "title": "Goroutines + GC pause",
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "targets": [
+                { "expr": "go_goroutines{namespace=\"$namespace\",pod=\"$pod\"}", "legendFormat": "goroutines" },
+                { "expr": "rate(go_gc_duration_seconds_sum{namespace=\"$namespace\",pod=\"$pod\"}[$__rate_interval])", "legendFormat": "gc rate" }
+              ]
+            }
+          ]
+        },
+
+        { "type": "row", "title": "Logs (Loki) — same time range as metrics", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 53 }, "collapsed": false },
+
+        {
+          "type": "logs",
+          "title": "Error / OOM / GC log lines",
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 54 },
+          "datasource": { "type": "loki", "uid": "${loki}" },
+          "targets": [{
+            "expr": "{namespace=\"$namespace\", pod=\"$pod\"} |~ \"(?i)error|exception|fatal|oom|killed|out ?of ?memory|heap|allocation failed\"",
+            "refId": "A"
+          }],
+          "options": { "showTime": true, "wrapLogMessage": true, "dedupStrategy": "none" }
+        },
+
+        {
+          "type": "timeseries",
+          "title": "Log rate by level (if logs are JSON with a 'level' field)",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 64 },
+          "datasource": { "type": "loki", "uid": "${loki}" },
+          "targets": [{
+            "expr": "sum by (level) (rate({namespace=\"$namespace\", pod=\"$pod\"} | json | __error__=\"\" [$__interval]))",
+            "legendFormat": "{{level}}"
+          }]
+        },
+
+        {
+          "type": "logs",
+          "title": "All logs",
+          "gridPos": { "h": 12, "w": 24, "x": 0, "y": 72 },
+          "datasource": { "type": "loki", "uid": "${loki}" },
+          "targets": [{
+            "expr": "{namespace=\"$namespace\", pod=\"$pod\"}",
+            "refId": "A"
+          }],
+          "options": { "showTime": true, "wrapLogMessage": true, "dedupStrategy": "none" }
+        }
+      ]
+    }

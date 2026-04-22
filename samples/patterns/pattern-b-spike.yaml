@@ -1,0 +1,52 @@
+# Pattern B — flat baseline with request-driven spikes.
+# Trigger with:  curl http://spike-app.oom-test.svc:8080/spike
+# Or deploy loadgen.yaml for continuous spiking.
+# Expected dashboard signals:
+#   - Panel 6 (deriv): flat with sharp short-lived bumps
+#   - Panel 7: P99 ≫ P95 — spike-driven
+#   - Panel 5: brief excursions to >100% → OOMKilled during spike
+#   - OOM Kills concentrated at the times the /spike endpoint is hit
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spike-app
+  namespace: oom-test
+  labels: { app: spike-app, oom-pattern: "B" }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: spike-app } }
+  template:
+    metadata:
+      labels: { app: spike-app, oom-pattern: "B" }
+    spec:
+      containers:
+        - name: spike
+          image: python:3.12-alpine
+          command: ["python", "-u", "/app/app.py"]
+          env:
+            - { name: MODE,     value: "spike" }
+            - { name: SPIKE_MB, value: "180" }        # spike size > (limit - baseline)
+          ports:
+            - { containerPort: 8080, name: http }
+          resources:
+            requests: { cpu: "50m",  memory: "64Mi"  }
+            limits:   { cpu: "200m", memory: "200Mi" }  # spike overflows this
+          volumeMounts:
+            - { name: app, mountPath: /app }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 2
+      volumes:
+        - name: app
+          configMap: { name: oom-simulator }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spike-app
+  namespace: oom-test
+spec:
+  selector: { app: spike-app }
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }

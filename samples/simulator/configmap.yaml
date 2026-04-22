@@ -1,0 +1,90 @@
+# Embeds app.py as a ConfigMap so the deployments in ../patterns/ can mount it
+# directly into a python:3.12-alpine pod WITHOUT building a custom image.
+# Re-generate after editing app.py:
+#   kubectl -n oom-test create configmap oom-simulator \
+#     --from-file=app.py=./app.py \
+#     --dry-run=client -o yaml > configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oom-simulator
+  namespace: oom-test
+data:
+  app.py: |
+    #!/usr/bin/env python3
+    """OOM simulator. See samples/simulator/app.py for the canonical source."""
+    import os, sys, time, threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    MODE            = os.getenv("MODE", "leak").strip().lower()
+    LEAK_MB_PER_SEC = float(os.getenv("LEAK_MB_PER_SEC", "5"))
+    BASELINE_MB     = int(os.getenv("BASELINE_MB", "100"))
+    STARTUP_MB      = int(os.getenv("STARTUP_MB", "500"))
+    SPIKE_MB        = int(os.getenv("SPIKE_MB", "50"))
+    PORT            = int(os.getenv("PORT", "8080"))
+
+    MB = 1024 * 1024
+    _hold, _lock = [], threading.Lock()
+
+    def log(m): print(f"[oom-simulator] {m}", flush=True)
+
+    def allocate_mb(n):
+        with _lock: _hold.append(bytearray(n * MB))
+
+    def total_mb():
+        with _lock: return sum(len(b) for b in _hold) // MB
+
+    def leak_mode():
+        log(f"mode=leak rate={LEAK_MB_PER_SEC} MiB/s")
+        chunk = int(LEAK_MB_PER_SEC * MB)
+        while True:
+            with _lock: _hold.append(bytearray(chunk))
+            if int(time.time()) % 10 == 0: log(f"holding ~{total_mb()} MiB")
+            time.sleep(1.0)
+
+    def baseline_mode():
+        log(f"mode=baseline {BASELINE_MB} MiB then idle")
+        allocate_mb(BASELINE_MB)
+        while True: time.sleep(3600)
+
+    def startup_mode():
+        log(f"mode=startup allocating {STARTUP_MB} MiB at boot")
+        allocate_mb(STARTUP_MB)
+        log(f"holding {total_mb()} MiB (if >limit, OOM fires now)")
+        while True: time.sleep(3600)
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, f, *a): log("HTTP " + f % a)
+        def _r(self, c, b):
+            self.send_response(c); self.send_header("Content-Type","text/plain")
+            self.end_headers(); self.wfile.write(b.encode())
+        def do_GET(self):
+            p = self.path.split("?",1)[0]
+            if p == "/spike":
+                blk = bytearray(SPIKE_MB * MB); time.sleep(10); del blk
+                self._r(200, f"spike {SPIKE_MB} MiB done\n")
+            elif p == "/leak":
+                with _lock: _hold.append(bytearray(SPIKE_MB * MB))
+                self._r(200, f"leaked {SPIKE_MB} MiB, holding {total_mb()} MiB\n")
+            elif p == "/free":
+                with _lock: _hold.clear()
+                self._r(200, "freed all\n")
+            elif p == "/stats":  self._r(200, f"mode={MODE} holding={total_mb()} MiB\n")
+            elif p == "/healthz": self._r(200, "ok\n")
+            else: self._r(200, "endpoints: /spike /leak /free /stats /healthz\n")
+
+    def spike_mode():
+        log(f"mode=spike :{PORT} spike_size={SPIKE_MB} MiB")
+        HTTPServer(("0.0.0.0", PORT), H).serve_forever()
+
+    def idle_mode():
+        log("mode=idle")
+        while True: time.sleep(3600)
+
+    MODES = {"leak": leak_mode, "spike": spike_mode, "baseline": baseline_mode,
+             "startup": startup_mode, "idle": idle_mode}
+
+    if __name__ == "__main__":
+        if MODE not in MODES:
+            log(f"unknown MODE={MODE} valid: {','.join(MODES)}"); sys.exit(1)
+        MODES[MODE]()

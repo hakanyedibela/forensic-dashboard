@@ -1,0 +1,237 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dash-oomkilled-thanos
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  oomkilled.json: |
+    {
+      "title": "OOMKilled — Thanos Deep Dive",
+      "uid": "oomkilled-thanos",
+      "schemaVersion": 39,
+      "version": 1,
+      "tags": ["oom","memory","thanos","kubernetes"],
+      "timezone": "browser",
+      "time": { "from": "now-7d", "to": "now" },
+      "refresh": "1m",
+      "links": [
+        {
+          "title": "Open Forensics view for selected pod",
+          "type": "link",
+          "url": "/d/oom-forensics?var-namespace=${namespace}&var-pod=${workload}",
+          "targetBlank": false
+        }
+      ],
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": { "text": "Thanos", "value": "Thanos" }
+          },
+          {
+            "name": "cluster",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "query": "label_values(kube_pod_container_status_last_terminated_reason, cluster)",
+            "includeAll": true, "multi": true, "refresh": 2
+          },
+          {
+            "name": "namespace",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "query": "label_values(kube_pod_container_status_last_terminated_reason{cluster=~\"$cluster\"}, namespace)",
+            "includeAll": true, "multi": true, "refresh": 2
+          },
+          {
+            "name": "workload",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "query": "label_values(kube_pod_container_status_last_terminated_reason{cluster=~\"$cluster\",namespace=~\"$namespace\"}, pod)",
+            "includeAll": true, "multi": true, "refresh": 2
+          }
+        ]
+      },
+      "annotations": {
+        "list": [
+          {
+            "name": "OOMKill events",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "enable": true,
+            "iconColor": "red",
+            "target": {
+              "expr": "changes(kube_pod_container_status_restarts_total{cluster=~\"$cluster\",namespace=~\"$namespace\",pod=~\"$workload\"}[5m]) > 0 and on(namespace,pod,container,cluster) kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"} == 1",
+              "legendFormat": "{{namespace}}/{{pod}}/{{container}}"
+            }
+          }
+        ]
+      },
+      "panels": [
+        {
+          "type": "stat",
+          "title": "OOMKills — last 24h",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{ "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[24h]))" }],
+          "options": { "colorMode": "value", "graphMode": "area" },
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":5}] } } }
+        },
+        {
+          "type": "stat",
+          "title": "OOMKills — last 7d",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{ "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[7d]))" }]
+        },
+        {
+          "type": "stat",
+          "title": "OOMKills — last 30d",
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{ "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[30d]))" }]
+        },
+        {
+          "type": "stat",
+          "title": "Distinct pods OOMKilled (7d)",
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{ "expr": "count(count by (namespace,pod) (max_over_time(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[7d]) == 1))" }]
+        },
+        {
+          "type": "timeseries",
+          "title": "OOMKill events over time (rate)",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "sum by (namespace) (increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[$__rate_interval]))",
+            "legendFormat": "{{namespace}}"
+          }],
+          "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" } } } }
+        },
+        {
+          "type": "table",
+          "title": "OOMKilled containers (detail)",
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 12 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "format": "table",
+            "instant": true,
+            "expr": "max by (cluster,namespace,pod,container,node) (kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",cluster=~\"$cluster\",namespace=~\"$namespace\"}) * on (namespace,pod,container,cluster) group_left() max by (cluster,namespace,pod,container) (kube_pod_container_status_restarts_total)"
+          }],
+          "transformations": [{
+            "id": "organize",
+            "options": { "excludeByName": { "Time":true, "__name__":true, "job":true, "endpoint":true, "instance":true, "service":true } }
+          }]
+        },
+        {
+          "type": "timeseries",
+          "title": "Top 10 max memory peak (max_over_time 1h windows)",
+          "gridPos": { "h": 9, "w": 12, "x": 0, "y": 22 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "topk(10, max by (namespace,pod,container) (max_over_time(container_memory_working_set_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",pod=~\"$workload\",container!=\"\",container!=\"POD\"}[1h])))",
+            "legendFormat": "{{namespace}}/{{pod}}/{{container}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "bytes" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Top 10 — % of memory limit consumed (peak)",
+          "gridPos": { "h": 9, "w": 12, "x": 12, "y": 22 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "topk(10, max by (namespace,pod,container) (max_over_time(container_memory_working_set_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",container!=\"\",container!=\"POD\"}[1h])) / on (namespace,pod,container,cluster) group_left() max by (namespace,pod,container,cluster) (kube_pod_container_resource_limits{resource=\"memory\",cluster=~\"$cluster\",namespace=~\"$namespace\"}))",
+            "legendFormat": "{{namespace}}/{{pod}}/{{container}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1.2 } }
+        },
+        {
+          "type": "bargauge",
+          "title": "Current working-set vs limit (>=70%)",
+          "gridPos": { "h": 10, "w": 12, "x": 0, "y": 31 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "instant": true,
+            "expr": "topk(20, (container_memory_working_set_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",container!=\"\",container!=\"POD\"} / on (namespace,pod,container,cluster) group_left() kube_pod_container_resource_limits{resource=\"memory\"}) > 0.7)",
+            "legendFormat": "{{namespace}}/{{pod}}/{{container}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "percentunit", "thresholds": { "mode": "absolute", "steps": [{"color":"green","value":null},{"color":"orange","value":0.8},{"color":"red","value":0.95}] } } }
+        },
+        {
+          "type": "timeseries",
+          "title": "Memory growth rate (leak detector) — deriv/6h",
+          "gridPos": { "h": 10, "w": 12, "x": 12, "y": 31 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "topk(10, deriv(container_memory_working_set_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",pod=~\"$workload\",container!=\"\",container!=\"POD\"}[6h]))",
+            "legendFormat": "{{namespace}}/{{pod}}/{{container}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "Bps" } }
+        },
+        {
+          "type": "timeseries",
+          "title": "P95 / P99 memory peak per workload (1h buckets)",
+          "gridPos": { "h": 9, "w": 24, "x": 0, "y": 41 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            {
+              "expr": "quantile_over_time(0.95, max by (namespace,pod,container) (container_memory_working_set_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",pod=~\"$workload\",container!=\"\",container!=\"POD\"})[1h:])",
+              "legendFormat": "p95 {{namespace}}/{{pod}}/{{container}}"
+            },
+            {
+              "expr": "quantile_over_time(0.99, max by (namespace,pod,container) (container_memory_working_set_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",pod=~\"$workload\",container!=\"\",container!=\"POD\"})[1h:])",
+              "legendFormat": "p99 {{namespace}}/{{pod}}/{{container}}"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "bytes" } }
+        },
+        {
+          "type": "heatmap",
+          "title": "OOMKills by hour-of-day (7d)",
+          "gridPos": { "h": 9, "w": 12, "x": 0, "y": 50 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "sum by (namespace) (increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",cluster=~\"$cluster\",namespace=~\"$namespace\"}[1h]))",
+            "format": "heatmap",
+            "legendFormat": "{{namespace}}"
+          }]
+        },
+        {
+          "type": "timeseries",
+          "title": "Avg container lifetime before OOM (pod uptime at OOM)",
+          "gridPos": { "h": 9, "w": 12, "x": 12, "y": 50 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "avg by (namespace) ( (time() - kube_pod_start_time{cluster=~\"$cluster\",namespace=~\"$namespace\"}) and on (namespace,pod,cluster) max by (namespace,pod,cluster) (kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"} == 1) )",
+            "legendFormat": "{{namespace}}"
+          }],
+          "fieldConfig": { "defaults": { "unit": "s" } }
+        },
+        {
+          "type": "stat",
+          "title": "All-time peak (max_over_time $__range) — selected workload",
+          "gridPos": { "h": 5, "w": 12, "x": 0, "y": 59 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "max(max_over_time(container_memory_working_set_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",pod=~\"$workload\",container!=\"\",container!=\"POD\"}[$__range]))"
+          }],
+          "fieldConfig": { "defaults": { "unit": "bytes" } }
+        },
+        {
+          "type": "stat",
+          "title": "Top peak container name",
+          "gridPos": { "h": 5, "w": 12, "x": 12, "y": 59 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "instant": true,
+            "expr": "topk(1, max by (namespace,pod,container) (max_over_time(container_memory_working_set_bytes{cluster=~\"$cluster\",namespace=~\"$namespace\",container!=\"\",container!=\"POD\"}[$__range])))",
+            "legendFormat": "{{namespace}}/{{pod}}/{{container}}"
+          }],
+          "options": { "textMode": "value_and_name" },
+          "fieldConfig": { "defaults": { "unit": "bytes" } }
+        }
+      ]
+    }

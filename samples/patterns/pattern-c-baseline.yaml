@@ -1,0 +1,35 @@
+# Pattern C — high baseline, no leak, under-provisioned limit.
+# Expected dashboard signals:
+#   - Panel 6 (deriv): flat at zero after initial allocation
+#   - Panel 7: P95 ≈ P99 ≈ limit  (both pressed against the ceiling)
+#   - Panel 5: peak/limit ~0.95+ permanently  (CLEAR "raise limit" signal)
+#   - OOMKill only under tiny extra pressure (GC moments, kernel page cache pressure)
+#   - Unlike Pattern A, container may run for hours before OOM
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: baseline-app
+  namespace: oom-test
+  labels: { app: baseline-app, oom-pattern: "C" }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: baseline-app } }
+  template:
+    metadata:
+      labels: { app: baseline-app, oom-pattern: "C" }
+    spec:
+      containers:
+        - name: baseline
+          image: python:3.12-alpine
+          command: ["python", "-u", "/app/app.py"]
+          env:
+            - { name: MODE,        value: "baseline" }
+            - { name: BASELINE_MB, value: "240" }    # 240 MiB vs 256 MiB limit = 94%
+          resources:
+            requests: { cpu: "50m",  memory: "200Mi" }
+            limits:   { cpu: "200m", memory: "256Mi" }
+          volumeMounts:
+            - { name: app, mountPath: /app }
+      volumes:
+        - name: app
+          configMap: { name: oom-simulator }
