@@ -12,7 +12,8 @@ CLI = "oc"
 
 
 def run(*args, check=True):
-    proc = subprocess.run([CLI, *args], capture_output=True, text=True)
+    proc = subprocess.run([CLI, *args], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, universal_newlines=True)
     if check and proc.returncode != 0:
         sys.stderr.write(f"command failed: {CLI} {' '.join(args)}\n{proc.stderr}\n")
         sys.exit(proc.returncode)
@@ -24,8 +25,27 @@ def current_namespace():
         out = run("project", "-q", check=False).strip()
         if out:
             return out
-    out = run("config", "view", "--minify", "-o", "jsonpath={..namespace}", check=False).strip()
+    out = run("config", "view", "--minify", "-o", "jsonpath={..namespace}",
+              check=False).strip()
     return out or "default"
+
+
+def _parse_iso(ts):
+    """Parse Kubernetes ISO 8601 timestamps. Python 3.6-compatible (no fromisoformat)."""
+    if not ts:
+        return None
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1]
+    elif len(s) >= 6 and s[-3] == ":" and s[-6] in "+-":
+        # strptime %z in 3.6 cannot parse offsets containing a colon; drop and assume UTC
+        s = s[:-6]
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
 
 
 def get_json(*args):
@@ -90,9 +110,8 @@ def fmt_bytes(n):
 def fmt_age(ts):
     if not ts:
         return "-"
-    try:
-        when = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
+    when = _parse_iso(ts)
+    if when is None:
         return ts
     s = int((datetime.now(timezone.utc) - when).total_seconds())
     if s < 60:

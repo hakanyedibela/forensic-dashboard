@@ -11,7 +11,7 @@ data:
       "title": "OOMKilled — Detail + Drilldown",
       "uid": "oom-7d-detail",
       "schemaVersion": 39,
-      "version": 2,
+      "version": 3,
       "tags": ["oom","memory","kubernetes","forensics"],
       "timezone": "browser",
       "time": { "from": "now-7d", "to": "now" },
@@ -59,7 +59,7 @@ data:
             "enable": true,
             "iconColor": "red",
             "target": {
-              "expr": "changes(kube_pod_container_status_restarts_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]) > 0 and on(namespace,pod,container) kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"} == 1",
+              "expr": "max by (namespace,pod,container) (changes(kube_pod_container_status_restarts_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m])) > 0\nand on (namespace,pod,container)\nmax by (namespace,pod,container) (kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"}) == 1",
               "legendFormat": "OOM {{namespace}}/{{pod}}/{{container}}"
             }
           }
@@ -72,11 +72,11 @@ data:
         {
           "type": "stat",
           "title": "Total OOMKills",
-          "description": "**Summe aller OOMKill-Ereignisse im ausgewählten Zeitraum** ($__range, oben rechts wählbar) über alle ausgewählten Namespaces.\n\n`sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\"}[$__range]))`",
+          "description": "**Summe aller OOMKill-Ereignisse im ausgewählten Zeitraum** ($__range, oben rechts wählbar) über alle ausgewählten Namespaces.\n\nDedupliziert pro `(namespace,pod,container)` via `max by` — schützt vor Doppelzählung in HA-Thanos-Setups, in denen jede Serie pro Prometheus-Replica einmal vorhanden ist.",
           "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
-            "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[$__range]))"
+            "expr": "sum(\n  max by (namespace,pod,container) (\n    increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[$__range])\n  )\n)"
           }],
           "options": { "colorMode": "value", "graphMode": "area" },
           "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute",
@@ -107,11 +107,11 @@ data:
         {
           "type": "stat",
           "title": "Worst single container",
-          "description": "**Höchste Anzahl an OOMKills für einen einzelnen Container im ausgewählten Zeitraum ($__range).**\n\n`max(sum by (namespace,pod,container) (increase(...[$__range])))`\n\nHohe Zahl → ein Container loopt im OOM-Restart-Zyklus → Pattern A (Leak) oder Pattern E (Startup > Limit) — Drilldown unten verwenden.",
+          "description": "**Höchste Anzahl an OOMKills für einen einzelnen Container im ausgewählten Zeitraum ($__range).**\n\n`max(max by (namespace,pod,container) (increase(...[$__range])))` — `max by` (statt `sum by`) deduplziert HA-Replicas, ohne Counts zu addieren.\n\nHohe Zahl → ein Container loopt im OOM-Restart-Zyklus → Pattern A (Leak) oder Pattern E (Startup > Limit) — Drilldown unten verwenden.",
           "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
-            "expr": "max(sum by (namespace,pod,container) (increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[$__range])))"
+            "expr": "max(max by (namespace,pod,container) (increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[$__range])))"
           }],
           "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute",
             "steps": [{"color":"green","value":null},{"color":"orange","value":3},{"color":"red","value":10}] } } }
@@ -128,7 +128,7 @@ data:
               "refId": "A",
               "format": "table",
               "instant": true,
-              "expr": "label_replace(\n  sum by (namespace, pod, container, node) (\n    (\n      sum by (namespace, pod, container) (\n        increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\", namespace=~\"$namespace\"}[$__range])\n      ) > 0\n    )\n    * on (namespace, pod) group_left(node)\n      max by (namespace, pod, node) (kube_pod_info{namespace=~\"$namespace\"})\n  ),\n  \"workload\", \"$1\", \"pod\", \"^(.+?)(?:-[a-f0-9]{6,10})?-[a-z0-9]{5}$\"\n)"
+              "expr": "label_replace(\n  max by (namespace, pod, container, node) (\n    (\n      max by (namespace, pod, container) (\n        increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\", namespace=~\"$namespace\"}[$__range])\n      ) > 0\n    )\n    * on (namespace, pod) group_left(node)\n      max by (namespace, pod, node) (kube_pod_info{namespace=~\"$namespace\"})\n  ),\n  \"workload\", \"$1\", \"pod\", \"^(.+?)(?:-[a-f0-9]{6,10})?-[a-z0-9]{5}$\"\n)"
             },
             {
               "refId": "B",
@@ -270,7 +270,7 @@ data:
           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 19 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
-            "expr": "sum by (namespace) (increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[$__rate_interval]))",
+            "expr": "sum by (namespace) (\n  max by (namespace,pod,container) (\n    increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[$__rate_interval])\n  )\n)",
             "legendFormat": "{{namespace}}"
           }],
           "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" } } } }
@@ -304,11 +304,11 @@ data:
         {
           "type": "stat",
           "title": "Peak / limit — selected pod",
-          "description": "**Verhältnis Peak zu Limit im gewählten Zeitraum ($__range).**\n\n| Wert | Bedeutung |\n|------|-----------|\n| > 100 % | OOM hat stattgefunden |\n| 95–100 % | Limit zu eng → erhöhen |\n| 80–95 % | Headroom hinzufügen |\n| < 50 % und dennoch OOM | Knoten-Druck oder Kernel-OOM, nicht das Container-Limit |",
+          "description": "**Verhältnis Peak zu Limit im gewählten Zeitraum ($__range).**\n\nBeide Seiten der Division werden vor dem Join via `max by (namespace,pod,container)` dedupliziert. Das verhindert die HA-Thanos-Falle, in der `kube_pod_container_resource_limits` pro Prometheus-Replica einmal vorhanden ist und der Join sonst mit `many-to-many matching not allowed` fehlschlägt.\n\n| Wert | Bedeutung |\n|------|-----------|\n| > 100 % | OOM hat stattgefunden |\n| 95–100 % | Limit zu eng → erhöhen |\n| 80–95 % | Headroom hinzufügen |\n| < 50 % und dennoch OOM | Knoten-Druck oder Kernel-OOM, nicht das Container-Limit |",
           "gridPos": { "h": 5, "w": 6, "x": 12, "y": 28 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
-            "expr": "max(\n  max_over_time(container_memory_working_set_bytes{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[$__range])\n  / on (namespace, pod, container) group_left()\n  kube_pod_container_resource_limits{resource=\"memory\",namespace=~\"$namespace\",pod=~\"$pod\"}\n)"
+            "expr": "max(\n  max by (namespace,pod,container) (\n    max_over_time(container_memory_working_set_bytes{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[$__range])\n  )\n  / on (namespace, pod, container) group_left()\n  max by (namespace,pod,container) (\n    kube_pod_container_resource_limits{resource=\"memory\",namespace=~\"$namespace\",pod=~\"$pod\"}\n  )\n)"
           }],
           "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1.5,
             "thresholds": { "mode": "absolute",
@@ -317,11 +317,11 @@ data:
         {
           "type": "stat",
           "title": "OOMKills — selected pod",
-          "description": "**Anzahl OOMKill-Ereignisse für den ausgewählten Pod im gewählten Zeitraum ($__range).**",
+          "description": "**Anzahl OOMKill-Ereignisse für den ausgewählten Pod im gewählten Zeitraum ($__range).**\n\n`max by (namespace,pod,container)` deduplziert HA-Replicas vor dem Aufsummieren.",
           "gridPos": { "h": 5, "w": 6, "x": 18, "y": 28 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
-            "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\",pod=~\"$pod\"}[$__range]))"
+            "expr": "sum(\n  max by (namespace,pod,container) (\n    increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\",pod=~\"$pod\"}[$__range])\n  )\n)"
           }],
           "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute",
             "steps": [{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":5}] } } }
@@ -334,9 +334,9 @@ data:
           "gridPos": { "h": 9, "w": 12, "x": 0, "y": 33 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [
-            { "expr": "container_memory_working_set_bytes{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}", "legendFormat": "working_set {{container}}" },
-            { "expr": "kube_pod_container_resource_limits{namespace=~\"$namespace\",pod=~\"$pod\",resource=\"memory\"}", "legendFormat": "limit {{container}}" },
-            { "expr": "kube_pod_container_resource_requests{namespace=~\"$namespace\",pod=~\"$pod\",resource=\"memory\"}", "legendFormat": "request {{container}}" }
+            { "expr": "max by (container) (container_memory_working_set_bytes{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"})", "legendFormat": "working_set {{container}}" },
+            { "expr": "max by (container) (kube_pod_container_resource_limits{namespace=~\"$namespace\",pod=~\"$pod\",resource=\"memory\"})", "legendFormat": "limit {{container}}" },
+            { "expr": "max by (container) (kube_pod_container_resource_requests{namespace=~\"$namespace\",pod=~\"$pod\",resource=\"memory\"})", "legendFormat": "request {{container}}" }
           ],
           "fieldConfig": {
             "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } },
@@ -357,7 +357,7 @@ data:
           "gridPos": { "h": 9, "w": 12, "x": 12, "y": 33 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
-            "expr": "deriv(container_memory_working_set_bytes{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[1h])",
+            "expr": "max by (container) (deriv(container_memory_working_set_bytes{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[1h]))",
             "legendFormat": "{{container}}"
           }],
           "fieldConfig": { "defaults": { "unit": "Bps" } }
@@ -371,19 +371,19 @@ data:
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [
             {
-              "expr": "sum by (pod) (rate(container_network_receive_bytes_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))",
+              "expr": "sum by (pod) (\n  max without (prometheus_replica, prometheus, instance, endpoint, job, service) (\n    rate(container_network_receive_bytes_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m])\n  )\n)",
               "legendFormat": "rx {{pod}}"
             },
             {
-              "expr": "sum by (pod) (rate(container_network_transmit_bytes_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))",
+              "expr": "sum by (pod) (\n  max without (prometheus_replica, prometheus, instance, endpoint, job, service) (\n    rate(container_network_transmit_bytes_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m])\n  )\n)",
               "legendFormat": "tx {{pod}}"
             },
             {
-              "expr": "sum by (pod) (rate(container_network_receive_packets_dropped_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))",
+              "expr": "sum by (pod) (\n  max without (prometheus_replica, prometheus, instance, endpoint, job, service) (\n    rate(container_network_receive_packets_dropped_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m])\n  )\n)",
               "legendFormat": "rx dropped {{pod}}"
             },
             {
-              "expr": "sum by (pod) (rate(container_network_transmit_packets_dropped_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))",
+              "expr": "sum by (pod) (\n  max without (prometheus_replica, prometheus, instance, endpoint, job, service) (\n    rate(container_network_transmit_packets_dropped_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m])\n  )\n)",
               "legendFormat": "tx dropped {{pod}}"
             }
           ],
@@ -397,11 +397,11 @@ data:
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [
             {
-              "expr": "rate(container_cpu_usage_seconds_total{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[5m])",
+              "expr": "max by (container) (rate(container_cpu_usage_seconds_total{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[5m]))",
               "legendFormat": "usage {{container}}"
             },
             {
-              "expr": "rate(container_cpu_cfs_throttled_seconds_total{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[5m])",
+              "expr": "max by (container) (rate(container_cpu_cfs_throttled_seconds_total{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[5m]))",
               "legendFormat": "throttled {{container}}"
             }
           ],

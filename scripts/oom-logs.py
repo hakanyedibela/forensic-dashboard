@@ -13,7 +13,8 @@ CLI = "oc"
 
 
 def _exec(args, check):
-    proc = subprocess.run([CLI, *args], capture_output=True, text=True)
+    proc = subprocess.run([CLI, *args], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, universal_newlines=True)
     if check and proc.returncode != 0:
         sys.stderr.write(f"command failed: {CLI} {' '.join(args)}\n{proc.stderr}\n")
         sys.exit(proc.returncode)
@@ -32,11 +33,15 @@ def run_logs(*args):
 
 def current_namespace():
     if CLI == "oc":
-        out = subprocess.run([CLI, "project", "-q"], capture_output=True, text=True).stdout.strip()
+        out = subprocess.run([CLI, "project", "-q"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             universal_newlines=True).stdout.strip()
         if out:
             return out
     out = subprocess.run([CLI, "config", "view", "--minify",
-                          "-o", "jsonpath={..namespace}"], capture_output=True, text=True).stdout.strip()
+                          "-o", "jsonpath={..namespace}"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         universal_newlines=True).stdout.strip()
     return out or "default"
 
 

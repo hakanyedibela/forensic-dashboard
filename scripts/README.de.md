@@ -36,7 +36,7 @@ Für jeden Container, dessen **letzter Terminierungsgrund** `OOMKilled` war, wer
 
 ### Voraussetzungen
 
-- Python 3.8+
+- Python 3.6.8+
 - `oc` (oder `kubectl` mit `--kubectl`)
 - Aktive Session (`oc login` / `kubectl config use-context …`)
 - RBAC: `get pods`, `get replicasets`, `get events` im Ziel-Namespace
@@ -124,7 +124,7 @@ Jedem Abschnitt geht eine fixe `===`-Headerzeile voraus mit Namespace, Pod, Cont
 
 ### Voraussetzungen
 
-- Python 3.8+
+- Python 3.6.8+
 - `oc` (oder `kubectl` mit `--kubectl`)
 - Aktive Session (`oc login`)
 - RBAC: `get pods`, `get replicasets`, `get pods/log` im Ziel-Namespace
@@ -260,7 +260,7 @@ So liest man das:
 
 ### Voraussetzungen
 
-- Python 3.8+ (nur Standardbibliothek — verwendet `urllib`, kein `requests`)
+- Python 3.6.8+ (nur Standardbibliothek — verwendet `urllib`, kein `requests`)
 - `oc` (oder `kubectl` mit `--kubectl`) für die Pod-Discovery
 - Erreichbarer Prometheus- / Thanos-HTTP-Endpunkt
 - Für OpenShift Thanos: ein Bearer-Token (wird automatisch über `oc whoami -t` geholt, falls nicht angegeben)

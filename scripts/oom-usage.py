@@ -12,13 +12,15 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 
 CLI = "oc"
 
 
 def _exec(args, check):
-    proc = subprocess.run([CLI, *args], capture_output=True, text=True)
+    proc = subprocess.run([CLI, *args],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True)
     if check and proc.returncode != 0:
         sys.stderr.write(f"command failed: {CLI} {' '.join(args)}\n{proc.stderr}\n")
         sys.exit(proc.returncode)
@@ -31,11 +33,15 @@ def run(*args, check=True):
 
 def current_namespace():
     if CLI == "oc":
-        out = subprocess.run([CLI, "project", "-q"], capture_output=True, text=True).stdout.strip()
+        out = subprocess.run([CLI, "project", "-q"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             universal_newlines=True).stdout.strip()
         if out:
             return out
     out = subprocess.run([CLI, "config", "view", "--minify",
-                          "-o", "jsonpath={..namespace}"], capture_output=True, text=True).stdout.strip()
+                          "-o", "jsonpath={..namespace}"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         universal_newlines=True).stdout.strip()
     return out or "default"
 
 
@@ -97,9 +103,21 @@ def find_oom_targets(ns_args):
 
 
 def parse_iso(ts):
+    """Parse Kubernetes ISO 8601 timestamps. Python 3.6-compatible (no fromisoformat)."""
     if not ts:
         return None
-    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1]
+    elif len(s) >= 6 and s[-3] == ":" and s[-6] in "+-":
+        # strptime %z in 3.6 cannot parse offsets containing a colon; drop and assume UTC
+        s = s[:-6]
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
 
 
 def fmt_bytes(n):
@@ -183,7 +201,8 @@ PROM_SERVICE_CANDIDATES = [
 def discover_prom_service():
     for ns, name, port in PROM_SERVICE_CANDIDATES:
         rc = subprocess.run([CLI, "get", "svc", name, "-n", ns],
-                            capture_output=True).returncode
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL).returncode
         if rc == 0:
             return ns, name, port
     return None
@@ -215,7 +234,9 @@ def auto_token():
     if CLI != "oc":
         return None
     try:
-        proc = subprocess.run(["oc", "whoami", "-t"], capture_output=True, text=True)
+        proc = subprocess.run(["oc", "whoami", "-t"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True)
         return proc.stdout.strip() or None
     except FileNotFoundError:
         return None
