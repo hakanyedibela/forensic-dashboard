@@ -20,7 +20,7 @@ singleBinary:
   replicas: 1
   persistence:
     enabled: true
-    storageClass: local-path       # change if your SC differs
+    storageClass: cassandra-storage       # change if your SC differs
     size: 50Gi
 
 # disable scalable components — we use SingleBinary

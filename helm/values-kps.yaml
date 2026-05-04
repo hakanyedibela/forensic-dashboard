@@ -10,7 +10,7 @@ prometheus:
     storageSpec:
       volumeClaimTemplate:
         spec:
-          storageClassName: local-path       # change if your SC differs
+          storageClassName: cassandra-storage       # change if your SC differs
           accessModes: ["ReadWriteOnce"]
           resources: { requests: { storage: 50Gi } }
     serviceMonitorSelectorNilUsesHelmValues: false
@@ -84,7 +84,7 @@ grafana:
   adminPassword: "ChangeMe123!"
   persistence:
     enabled: true
-    storageClassName: local-path
+    storageClassName: cassandra-storage
     size: 10Gi
   defaultDashboardsTimezone: browser
   service:

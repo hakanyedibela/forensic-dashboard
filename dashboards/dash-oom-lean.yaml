@@ -1,0 +1,232 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dash-oom-lean
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+    # For OpenShift with operator-based Grafana, you may also need:
+    # console.openshift.io/dashboard: "true"
+data:
+  oom-lean.json: |
+    {
+      "title": "OOM — Lean (OpenShift)",
+      "uid": "oom-lean",
+      "schemaVersion": 39,
+      "version": 1,
+      "tags": ["oom","lean","openshift"],
+      "timezone": "browser",
+      "time": { "from": "now-1h", "to": "now" },
+      "refresh": "1m",
+      "description": "Schlanke OOM-Übersicht: Events, Speicher, CPU, Netzwerk und Fehler-Logs. Optimiert für schnelle Ladezeit auf OpenShift — keine teuren Long-Range-Aggregationen, keine Cluster-Label-Filter.",
+      "links": [
+        {
+          "title": "Open deep-dive (Thanos) dashboard",
+          "type": "link",
+          "url": "/d/oomkilled-thanos",
+          "targetBlank": true
+        },
+        {
+          "title": "Open forensics dashboard",
+          "type": "link",
+          "url": "/d/oom-forensics?var-namespace=${namespace}&var-pod=${pod}",
+          "targetBlank": true
+        }
+      ],
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": { "text": "Prometheus", "value": "Prometheus" }
+          },
+          {
+            "name": "loki",
+            "type": "datasource",
+            "query": "loki",
+            "current": { "text": "Loki", "value": "Loki" }
+          },
+          {
+            "name": "namespace",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "query": "label_values(kube_pod_info, namespace)",
+            "includeAll": true, "multi": false, "refresh": 2,
+            "current": { "text": "All", "value": "$__all" }
+          },
+          {
+            "name": "pod",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "query": "label_values(kube_pod_info{namespace=~\"$namespace\"}, pod)",
+            "includeAll": true, "multi": false, "refresh": 2,
+            "current": { "text": "All", "value": "$__all" }
+          }
+        ]
+      },
+      "annotations": {
+        "list": [
+          {
+            "name": "OOMKill events",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "enable": true,
+            "iconColor": "red",
+            "target": {
+              "expr": "changes(kube_pod_container_status_restarts_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]) > 0 and on(namespace,pod,container) kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"} == 1",
+              "legendFormat": "OOM {{namespace}}/{{pod}}"
+            }
+          }
+        ]
+      },
+      "panels": [
+
+        {
+          "type": "stat",
+          "title": "OOMKills (last 24h)",
+          "description": "**OOMKills in den letzten 24 Stunden**\n\nEinfache Zählung — keine Range-Queries über Tage.\n\n**Query:** `sum(increase(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"}[24h]))`",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "sum(increase(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\",pod=~\"$pod\"}[24h]))"
+          }],
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute",
+            "steps": [{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":5}] } } }
+        },
+        {
+          "type": "stat",
+          "title": "Pods near limit (>90%)",
+          "description": "**Anzahl Container aktuell über 90 % ihres Memory-Limits**\n\nMomentaufnahme — unmittelbare OOM-Gefahr.\n\n**Query:** `count((working_set / memory_limit) > 0.9)`",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "instant": true,
+            "expr": "count((container_memory_working_set_bytes{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"} / on(namespace,pod,container) group_left() kube_pod_container_resource_limits{resource=\"memory\"}) > 0.9)"
+          }],
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute",
+            "steps": [{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":5}] } } }
+        },
+        {
+          "type": "stat",
+          "title": "Recent restarts (1h)",
+          "description": "**Summe Container-Restarts in der letzten Stunde**\n\nGrober Indikator für Instabilität, unabhängig vom Grund.",
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "expr": "sum(increase(kube_pod_container_status_restarts_total{namespace=~\"$namespace\",pod=~\"$pod\"}[1h]))"
+          }]
+        },
+        {
+          "type": "stat",
+          "title": "Nodes under memory pressure",
+          "description": "**Knoten mit MemoryPressure=True**\n\nWenn > 0: OOMKills auf diesen Knoten sind wahrscheinlich system-bedingt, nicht App-bedingt.",
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "instant": true,
+            "expr": "count(kube_node_status_condition{condition=\"MemoryPressure\",status=\"true\"} == 1)"
+          }],
+          "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute",
+            "steps": [{"color":"green","value":null},{"color":"red","value":1}] } } }
+        },
+
+        {
+          "type": "table",
+          "title": "Recently OOMKilled containers",
+          "description": "**Kürzlich OOMKilled Container**\n\nListe aller Container, deren letzter Terminierungsgrund `OOMKilled` ist.\n\nSpalten: namespace, pod, container, node, Restart-Zähler.\n\nBei Produktivclustern mit vielen Workloads ggf. über den `namespace`-Selector einschränken.",
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 4 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [{
+            "format": "table",
+            "instant": true,
+            "expr": "max by (namespace,pod,container,node) (kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\",pod=~\"$pod\"}) * on(namespace,pod,container) group_left() max by (namespace,pod,container) (kube_pod_container_status_restarts_total)"
+          }],
+          "transformations": [{
+            "id": "organize",
+            "options": { "excludeByName": {
+              "Time":true, "__name__":true, "job":true, "endpoint":true,
+              "instance":true, "service":true, "prometheus":true
+            } }
+          }]
+        },
+
+        {
+          "type": "timeseries",
+          "title": "Memory: working set + limit",
+          "description": "**Speicherverbrauch je Container mit Limit-Referenz**\n\nDurchgezogene Linien = aktuell genutzter Speicher, gestrichelt = Limit. Rote Annotationen markieren OOMKill-Events.\n\n**Tipp:** Einen konkreten Pod auswählen, sonst unübersichtlich bei vielen Workloads.",
+          "gridPos": { "h": 9, "w": 12, "x": 0, "y": 14 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            {
+              "expr": "container_memory_working_set_bytes{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}",
+              "legendFormat": "{{pod}}/{{container}}"
+            },
+            {
+              "expr": "kube_pod_container_resource_limits{namespace=~\"$namespace\",pod=~\"$pod\",resource=\"memory\"}",
+              "legendFormat": "limit {{pod}}/{{container}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } },
+            "overrides": [
+              { "matcher": { "id": "byRegexp", "options": "^limit .*" },
+                "properties": [
+                  { "id": "custom.lineStyle", "value": { "fill": "dash" } },
+                  { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "type": "timeseries",
+          "title": "CPU usage + throttling",
+          "description": "**CPU-Nutzung und Throttling auf einer Achse**\n\nHohes Throttling kurz vor einem OOM deutet darauf hin, dass die App Requests nicht schnell genug abarbeiten kann und Puffer im Speicher anwachsen.",
+          "gridPos": { "h": 9, "w": 12, "x": 12, "y": 14 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            {
+              "expr": "rate(container_cpu_usage_seconds_total{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[5m])",
+              "legendFormat": "usage {{pod}}/{{container}}"
+            },
+            {
+              "expr": "rate(container_cpu_cfs_throttled_seconds_total{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[5m])",
+              "legendFormat": "throttled {{pod}}/{{container}}"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+
+        {
+          "type": "timeseries",
+          "title": "Network rx / tx",
+          "description": "**Netzwerk-Durchsatz (Empfang und Senden)**\n\nPlötzliche rx-Spitzen direkt vor einem OOM → große Response wurde komplett in den Speicher gepuffert (Spike-Pattern).",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 23 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            {
+              "expr": "sum by (pod) (rate(container_network_receive_bytes_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))",
+              "legendFormat": "rx {{pod}}"
+            },
+            {
+              "expr": "sum by (pod) (rate(container_network_transmit_bytes_total{namespace=~\"$namespace\",pod=~\"$pod\"}[5m]))",
+              "legendFormat": "tx {{pod}}"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "Bps" } }
+        },
+
+        {
+          "type": "logs",
+          "title": "Error / OOM log lines (Loki)",
+          "description": "**Gefilterte Logzeilen der ausgewählten Pods**\n\nZeigt nur Zeilen, die Fehler- oder OOM-Schlüsselwörter enthalten. Zeitraum ist synchron zu den Metrik-Panels oben — direkte zeitliche Korrelation.\n\n**Filter:** `error|exception|fatal|oom|killed|out ?of ?memory|heap`",
+          "gridPos": { "h": 12, "w": 24, "x": 0, "y": 31 },
+          "datasource": { "type": "loki", "uid": "${loki}" },
+          "targets": [{
+            "expr": "{namespace=~\"$namespace\", pod=~\"$pod\"} |~ \"(?i)error|exception|fatal|oom|killed|out ?of ?memory|heap\"",
+            "refId": "A"
+          }],
+          "options": { "showTime": true, "wrapLogMessage": true, "dedupStrategy": "none" }
+        }
+      ]
+    }
