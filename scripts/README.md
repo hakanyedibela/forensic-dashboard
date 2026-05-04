@@ -11,6 +11,7 @@ Helper scripts for working with the OOM observability stack from the command lin
 | [`oom-extract.py`](#oom-extractpy) | List currently-OOMKilled containers in a namespace (or all) with workload, node, limits, and matching kube events. |
 | [`oom-logs.py`](#oom-logspy) | Dump the **pre-OOM** (and optionally current / sibling) container logs for every OOMKilled container in a namespace. |
 | [`oom-usage.py`](#oom-usagepy) | Recover **memory and CPU usage at OOM time** by querying Prometheus/Thanos for each OOMKilled container's last terminated timestamp. |
+| [`oom-history.py`](#oom-historypy) | Walk each Deployment's **rollout history** (revisions / ReplicaSets) and report OOM status + pre-OOM logs per revision — answers "which version of the deployment started OOMing?". |
 
 ---
 
@@ -357,6 +358,126 @@ The `db-0` row above (% LIMIT = 47%) is the textbook signature of a **node-press
 - `2` — `oc` / `kubectl` not on `PATH`
 - `3` — Prometheus is unreachable, or `--port-forward` could not start a tunnel
 - non-zero — a non-Prometheus underlying CLI command failed; stderr is forwarded
+
+---
+
+## `oom-history.py`
+
+Answers **"which version of the Deployment started OOMing, and what changed between revisions?"** by walking each Deployment's `oc rollout history` — i.e. the chain of ReplicaSets owned by the Deployment — and annotating every revision with its current OOM status and pre-OOM container logs.
+
+For each Deployment in the namespace, the script:
+
+1. Lists every ReplicaSet owned by the Deployment, sorted by `deployment.kubernetes.io/revision` annotation (newest first — same order as `oc rollout history`).
+2. For each ReplicaSet (= revision) reports: revision number, RS name, age, replica counts (desired / status / ready / alive pods), `kubernetes.io/change-cause` annotation (set by `kubectl rollout` / CI tools), per-container image and resource limits/requests.
+3. For each revision whose pods are still alive, picks up containers with `lastState.terminated.reason == "OOMKilled"` and lists pod / container / node / exit code / restart count / OOM timestamp.
+4. Cross-references the namespace's `OOMKilling` kube events against each revision's pods (events typically retain ~1h, so this catches in-flight kills only).
+5. With `--logs`, dumps `oc logs <pod> -c <ctr> --previous` for every OOMKilled container, with each block prefixed by a fixed `---` header.
+
+### Honest limitations
+
+- The Kubernetes API only retains pods of currently-existing ReplicaSets. Older ReplicaSets get garbage-collected once the Deployment exceeds `revisionHistoryLimit` (default `10`). Even within retained RSes, the pods of scaled-down revisions are gone — so per-revision OOM detail is reliable for the **active revision** and the most-recent few.
+- For older revisions you still see the rollout metadata (image, resources, age, change-cause) — that part comes from the ReplicaSet itself, which sticks around — but the OOM column will be empty even if those revisions did OOM in their day.
+- For deeper history use the Grafana drilldown (`oom-7d-detail`, backed by Prometheus / Thanos), or `oom-usage.py` which queries Prometheus at the OOM timestamp.
+
+### Requirements
+
+- Python 3.6.8+
+- `oc` (or `kubectl` with `--kubectl`)
+- An active session (`oc login`)
+- RBAC: `get deployments`, `get replicasets`, `get pods`, `get events`, `get pods/log` in the target namespace(s)
+
+### Usage
+
+```bash
+# rollout history + OOM status for every Deployment in the current namespace
+./oom-history.py
+
+# specific namespace
+./oom-history.py -n my-app
+
+# specific Deployment only
+./oom-history.py --deployment leak-a
+
+# only show Deployments that have at least one OOM in their history
+./oom-history.py -A --only-oom
+
+# include pre-OOM container logs for each OOMKilled pod
+./oom-history.py --logs --tail 200
+
+# filter the log output to error-ish lines
+./oom-history.py --logs --grep "out of memory|OutOfMemoryError|fatal|panic"
+
+# JSON output for piping / archiving
+./oom-history.py -A --only-oom --json > rollout-oom-state.json
+```
+
+### Example output
+
+```
+# Deployment rollout history + OOM status — namespace oom-test
+
+================================================================================
+Deployment: oom-test/leak-a  (replicas: 0/1 ready)
+================================================================================
+
+  Revision 4 [ACTIVE, OOM x1]
+    ReplicaSet:   leak-a-6f7c9b8d57
+    Age:          12m ago (2026-05-04T07:58:11Z)
+    Replicas:     desired=1 status=1 ready=0 alive_pods=1
+    Change cause: kubectl set image deploy/leak-a app=registry/leak-a:v0.4.0
+    Container:    app  image=registry/leak-a:v0.4.0  (mem=256Mi, mem-req=128Mi, cpu=200m)
+    OOMKilled containers (1):
+      - pod=leak-a-6f7c9b8d57-x4f2g  container=app  node=worker-2  exit=137  restarts=12  finished=2026-05-04T08:10:48Z
+    Kube events (reason=OOMKilling) for these pods: leak-a-6f7c9b8d57-x4f2g
+
+      --- pre-OOM log: oom-test/leak-a-6f7c9b8d57-x4f2g/app (oc logs --previous) ---
+      | 2026-05-04T08:10:46.881Z INFO  serving request id=abc123 size=82MiB
+      | 2026-05-04T08:10:47.402Z WARN  GC pause 940ms
+      | 2026-05-04T08:10:47.119Z ERROR java.lang.OutOfMemoryError: Java heap space
+
+  Revision 3
+    ReplicaSet:   leak-a-7d4b5c6789
+    Age:          2h ago (2026-05-04T05:42:08Z)
+    Replicas:     desired=0 status=0 ready=0 alive_pods=0
+    Change cause: kubectl set image deploy/leak-a app=registry/leak-a:v0.3.1
+    Container:    app  image=registry/leak-a:v0.3.1  (mem=256Mi, mem-req=128Mi, cpu=200m)
+
+  Revision 2
+    ReplicaSet:   leak-a-58fb96c7f8
+    Age:          3d ago (2026-05-01T11:15:42Z)
+    Replicas:     desired=0 status=0 ready=0 alive_pods=0
+    Container:    app  image=registry/leak-a:v0.3.0  (mem=256Mi, mem-req=128Mi, cpu=200m)
+```
+
+The "ACTIVE, OOM x1" tag shows revision 4 is the live one and is OOMing. Older revisions (3 and 2) only show their metadata — that's the limitation called out above.
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `-n, --namespace NS` | Specific namespace (default: current `oc project`). |
+| `-A, --all-namespaces` | Walk every namespace's Deployments. |
+| `--deployment NAME` | Only show this Deployment's history. |
+| `--only-oom` | Hide Deployments whose history has no OOMKilled containers (useful with `-A`). |
+| `--logs` | After each revision's OOM list, dump `oc logs --previous` for each OOMKilled pod/container. |
+| `--tail N` | Lines per log block when `--logs` is set. Default `100`. |
+| `--grep PATTERN` | Case-insensitive regex applied per log line. Blocks with no match show `[no lines matched filter]`. |
+| `--json` | Emit a structured JSON record per Deployment instead of the text report. Suitable for archiving or piping into `jq`. |
+| `--kubectl` | Use `kubectl` instead of `oc`. |
+
+### Behaviour notes
+
+- Revision number comes from the standard `deployment.kubernetes.io/revision` annotation on each ReplicaSet — this is exactly what `oc rollout history` reads. So this script's revisions match `oc rollout history deploy/<name>` 1:1.
+- `Change cause` is the `kubernetes.io/change-cause` annotation, set automatically when you use `--record` on Kubernetes ≤1.21, or set manually by CI tools (`kubectl annotate rs <name> kubernetes.io/change-cause="..."`). Often empty in modern clusters.
+- StatefulSet / DaemonSet rollout histories are **not** walked. Their revisions live on `controllerrevisions` (different mechanism). Open an issue if you want them added.
+- The script makes one bulk API call per resource type (`deployments`, `rs`, `pods`, `events`) regardless of how many Deployments exist, then matches in memory by owner UID. So the API load is independent of `revisionHistoryLimit`.
+- Combine with `oom-usage.py` to get the actual memory/CPU values at OOM time from Prometheus, and with the Grafana dashboard `oom-7d-detail` for the long historical view.
+
+### Exit codes
+
+- `0` — completed (output may be empty if no Deployments / no OOMs)
+- `2` — `oc` / `kubectl` not on `PATH`
+- non-zero — underlying CLI command failed; stderr is forwarded
 
 ---
 
