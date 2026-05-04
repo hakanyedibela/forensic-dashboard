@@ -365,6 +365,8 @@ Die `db-0`-Zeile oben (% LIMIT = 47 %) ist die typische Signatur eines **Node-Pr
 
 Beantwortet **„Welche Version des Deployments fing an, OOM zu killen, und was hat sich zwischen den Revisionen geändert?"** — das Skript läuft die `oc rollout history` jedes Deployments durch (also die Kette der dem Deployment gehörenden ReplicaSets) und annotiert jede Revision mit ihrem aktuellen OOM-Status und Pre-OOM-Container-Logs.
 
+**Standardmäßig wird die Ausgabe auf OOM-Fälle gefiltert**: Deployments ohne OOMKilled-Container in der sichtbaren History werden ausgeblendet, und innerhalb OOM-betroffener Deployments werden nur die OOM-betroffenen Revisionen gezeigt. `--all` bringt die volle Rollout-Historie zurück, wenn man Vergleichskontext braucht (Image-Diff, Resource-Diff, Change-Cause über Revisionen hinweg).
+
 Für jedes Deployment im Namespace:
 
 1. Listet jedes ReplicaSet, das dem Deployment gehört, sortiert nach `deployment.kubernetes.io/revision`-Annotation (neueste zuerst — selbe Reihenfolge wie `oc rollout history`).
@@ -389,7 +391,7 @@ Für jedes Deployment im Namespace:
 ### Verwendung
 
 ```bash
-# Rollout-History + OOM-Status für jedes Deployment im aktuellen Namespace
+# OOM-betroffene Deployments + OOM-betroffene Revisionen im aktuellen Namespace (Default-View)
 ./oom-history.py
 
 # bestimmter Namespace
@@ -398,8 +400,8 @@ Für jedes Deployment im Namespace:
 # nur ein bestimmtes Deployment
 ./oom-history.py --deployment leak-a
 
-# nur Deployments anzeigen, die in ihrer History mindestens einen OOM hatten
-./oom-history.py -A --only-oom
+# alle OOMs im Cluster
+./oom-history.py -A
 
 # Pre-OOM-Container-Logs für jeden OOMKilled-Pod mitausgeben
 ./oom-history.py --logs --tail 200
@@ -408,13 +410,16 @@ Für jedes Deployment im Namespace:
 ./oom-history.py --logs --grep "out of memory|OutOfMemoryError|fatal|panic"
 
 # JSON-Ausgabe für Pipes / Archivierung
-./oom-history.py -A --only-oom --json > rollout-oom-state.json
+./oom-history.py -A --json > rollout-oom-state.json
+
+# volle Rollout-History (jedes Deployment + jede Revision, auch ohne OOM)
+./oom-history.py --all
 ```
 
-### Beispielausgabe
+### Beispielausgabe (Default — nur OOM-betroffen)
 
 ```
-# Deployment rollout history + OOM status — namespace oom-test
+# Deployment rollout history (OOM-affected only) — namespace oom-test
 
 ================================================================================
 Deployment: oom-test/leak-a  (replicas: 0/1 ready)
@@ -434,22 +439,9 @@ Deployment: oom-test/leak-a  (replicas: 0/1 ready)
       | 2026-05-04T08:10:46.881Z INFO  serving request id=abc123 size=82MiB
       | 2026-05-04T08:10:47.402Z WARN  GC pause 940ms
       | 2026-05-04T08:10:47.119Z ERROR java.lang.OutOfMemoryError: Java heap space
-
-  Revision 3
-    ReplicaSet:   leak-a-7d4b5c6789
-    Age:          2h ago (2026-05-04T05:42:08Z)
-    Replicas:     desired=0 status=0 ready=0 alive_pods=0
-    Change cause: kubectl set image deploy/leak-a app=registry/leak-a:v0.3.1
-    Container:    app  image=registry/leak-a:v0.3.1  (mem=256Mi, mem-req=128Mi, cpu=200m)
-
-  Revision 2
-    ReplicaSet:   leak-a-58fb96c7f8
-    Age:          3d ago (2026-05-01T11:15:42Z)
-    Replicas:     desired=0 status=0 ready=0 alive_pods=0
-    Container:    app  image=registry/leak-a:v0.3.0  (mem=256Mi, mem-req=128Mi, cpu=200m)
 ```
 
-Der Tag „ACTIVE, OOM x1" zeigt: Revision 4 ist die aktive und OOM-killt aktuell. Ältere Revisionen (3 und 2) zeigen nur ihre Metadaten — das ist die oben erwähnte Einschränkung.
+Nicht-OOM-Deployments und Nicht-OOM-Revisionen OOM-betroffener Deployments werden standardmäßig ausgeblendet. Mit `./oom-history.py --all` werden sie wieder eingeblendet — sinnvoll, wenn man Image / Resources / Change-Cause der fehlerhaften Revision mit der vorherigen, gesunden Revision vergleichen will, um zu sehen, was sich geändert hat.
 
 ### Optionen
 
@@ -458,7 +450,7 @@ Der Tag „ACTIVE, OOM x1" zeigt: Revision 4 ist die aktive und OOM-killt aktuel
 | `-n, --namespace NS` | Bestimmter Namespace (Standard: aktuelles `oc project`). |
 | `-A, --all-namespaces` | Läuft Deployments aus allen Namespaces durch. |
 | `--deployment NAME` | Nur die History dieses Deployments anzeigen. |
-| `--only-oom` | Versteckt Deployments, deren History keinen OOMKilled-Container enthält (sinnvoll mit `-A`). |
+| `--all` | Zeigt jedes Deployment und jede Revision, auch ohne OOMs. Default ist: nur OOM-betroffene Deployments und nur OOM-betroffene Revisionen. |
 | `--logs` | Hängt nach jeder OOM-Liste pro Revision `oc logs --previous` pro OOMKilled-Pod/-Container an. |
 | `--tail N` | Zeilen pro Log-Block bei `--logs`. Standard `100`. |
 | `--grep PATTERN` | Case-insensitiver Regex pro Logzeile. Blöcke ohne Match zeigen `[no lines matched filter]`. |

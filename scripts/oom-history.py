@@ -174,9 +174,13 @@ def dump_logs(ns, pod, container, tail, grep_re, indent="      "):
         print(f"{indent}| {line}")
 
 
-def render_text(history, with_logs, tail, grep_re):
+def render_text(history, with_logs, tail, grep_re, show_all):
     if not history:
-        print("# no Deployments matched")
+        if show_all:
+            print("# no Deployments matched")
+        else:
+            print("# no OOMKilled containers found in any Deployment "
+                  "(use --all to show non-OOM Deployments + revisions too)")
         return
     for d in history:
         print()
@@ -244,8 +248,11 @@ def main():
                    help="all namespaces")
     p.add_argument("--deployment",
                    help="filter to a single Deployment by name")
+    p.add_argument("--all", action="store_true",
+                   help="show every Deployment and every revision, including ones with no OOMs "
+                        "(default: only OOM-affected Deployments and their OOM-affected revisions)")
     p.add_argument("--only-oom", action="store_true",
-                   help="only show Deployments whose history contains OOMKilled containers")
+                   help="(deprecated, default since 2026-05-05) only show OOM-affected entries; kept as a no-op")
     p.add_argument("--logs", action="store_true",
                    help="dump --previous container logs for each OOMKilled pod")
     p.add_argument("--tail", type=int, default=100,
@@ -295,6 +302,12 @@ def main():
     history = []
     for d in deploys:
         revs = deployment_revisions(d, all_rs, all_pods, oom_event_pods)
+        if not args.all:
+            # Default: hide non-OOM Deployments entirely, and hide non-OOM revisions
+            # inside an OOM-affected Deployment. Use --all to bring the full history back.
+            if not any(r["oom_containers"] for r in revs):
+                continue
+            revs = [r for r in revs if r["oom_containers"]]
         record = {
             "namespace": d["metadata"]["namespace"],
             "deployment": d["metadata"]["name"],
@@ -302,8 +315,6 @@ def main():
             "replicas_ready": d.get("status", {}).get("readyReplicas", 0),
             "revisions": revs,
         }
-        if args.only_oom and not any(r["oom_containers"] for r in revs):
-            continue
         history.append(record)
 
     if args.json:
@@ -311,8 +322,9 @@ def main():
         sys.stdout.write("\n")
         return
 
-    sys.stderr.write(f"# Deployment rollout history + OOM status — {scope}\n")
-    render_text(history, args.logs, args.tail, grep_re)
+    header = "Deployment rollout history" + ("" if args.all else " (OOM-affected only)")
+    sys.stderr.write(f"# {header} — {scope}\n")
+    render_text(history, args.logs, args.tail, grep_re, args.all)
 
 
 if __name__ == "__main__":
