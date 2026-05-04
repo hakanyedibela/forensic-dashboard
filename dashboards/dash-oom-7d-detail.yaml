@@ -8,15 +8,15 @@ metadata:
 data:
   oom-7d-detail.json: |
     {
-      "title": "OOMKilled — 7d Detail + Drilldown",
+      "title": "OOMKilled — Detail + Drilldown",
       "uid": "oom-7d-detail",
       "schemaVersion": 39,
-      "version": 1,
-      "tags": ["oom","memory","kubernetes","forensics","7d"],
+      "version": 2,
+      "tags": ["oom","memory","kubernetes","forensics"],
       "timezone": "browser",
       "time": { "from": "now-7d", "to": "now" },
       "refresh": "5m",
-      "description": "OOMKilled-Übersicht über 7 Tage (Tabelle mit Namespace, Workload, Pod, Node, OOM-Anzahl, Peak/Limit, Restarts) plus Drilldown unten: Klick auf einen Pod in der Tabelle setzt die Variablen $namespace und $pod, sodass die Detail-Panels (Memory-Peak, Network, CPU, Loki-Logs) sofort den passenden Verlauf zeigen.",
+      "description": "OOMKilled-Übersicht über das oben rechts gewählte Zeitfenster (Standard: 7 Tage). Tabelle mit Namespace, Workload, Pod, Node, OOM-Anzahl, Peak/Limit, Restarts plus Drilldown unten: Klick auf einen Pod in der Tabelle setzt die Variablen $namespace und $pod, sodass die Detail-Panels (Memory-Peak, Network, CPU, Loki-Logs) sofort den passenden Verlauf zeigen. Alle Range-Queries verwenden $__range — den Zeitraum aus dem Time-Picker.",
       "templating": {
         "list": [
           {
@@ -67,16 +67,16 @@ data:
       },
       "panels": [
 
-        { "type": "row", "title": "Overview — last 7d", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false },
+        { "type": "row", "title": "Overview — selected range ($__range)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false },
 
         {
           "type": "stat",
-          "title": "Total OOMKills (7d)",
-          "description": "**Summe aller OOMKill-Ereignisse in den letzten 7 Tagen** über alle ausgewählten Namespaces.\n\n`sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\"}[7d]))`",
+          "title": "Total OOMKills",
+          "description": "**Summe aller OOMKill-Ereignisse im ausgewählten Zeitraum** ($__range, oben rechts wählbar) über alle ausgewählten Namespaces.\n\n`sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\"}[$__range]))`",
           "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
-            "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[7d]))"
+            "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[$__range]))"
           }],
           "options": { "colorMode": "value", "graphMode": "area" },
           "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute",
@@ -84,34 +84,34 @@ data:
         },
         {
           "type": "stat",
-          "title": "Distinct pods OOMKilled (7d)",
-          "description": "**Anzahl unterschiedlicher Pods, die in 7d mindestens einmal OOMKilled wurden.**\n\n- Zahl ≈ Total-OOM → jeder Kill betrifft einen anderen Pod (verteiltes Problem)\n- Zahl ≪ Total-OOM → wenige Pods crashen wiederholt (Leak / zu enges Limit)",
+          "title": "Distinct pods OOMKilled",
+          "description": "**Anzahl unterschiedlicher Pods, die im ausgewählten Zeitraum ($__range) mindestens einmal OOMKilled wurden.**\n\n- Zahl ≈ Total-OOM → jeder Kill betrifft einen anderen Pod (verteiltes Problem)\n- Zahl ≪ Total-OOM → wenige Pods crashen wiederholt (Leak / zu enges Limit)",
           "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
             "instant": true,
-            "expr": "count(count by (namespace,pod) (max_over_time(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[7d]) == 1))"
+            "expr": "count(count by (namespace,pod) (max_over_time(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[$__range]) == 1))"
           }]
         },
         {
           "type": "stat",
-          "title": "Distinct namespaces affected (7d)",
-          "description": "**Anzahl Namespaces mit mindestens einem OOMKill in 7d.**\n\nViele Namespaces gleichzeitig betroffen → eher Knoten-/Plattform-Druck. Nur ein Namespace → App-Problem.",
+          "title": "Distinct namespaces affected",
+          "description": "**Anzahl Namespaces mit mindestens einem OOMKill im ausgewählten Zeitraum ($__range).**\n\nViele Namespaces gleichzeitig betroffen → eher Knoten-/Plattform-Druck. Nur ein Namespace → App-Problem.",
           "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
             "instant": true,
-            "expr": "count(count by (namespace) (max_over_time(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[7d]) == 1))"
+            "expr": "count(count by (namespace) (max_over_time(kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[$__range]) == 1))"
           }]
         },
         {
           "type": "stat",
-          "title": "Worst single container (7d)",
-          "description": "**Höchste Anzahl an OOMKills für einen einzelnen Container in 7 Tagen.**\n\n`max(sum by (namespace,pod,container) (increase(...[7d])))`\n\nHohe Zahl → ein Container loopt im OOM-Restart-Zyklus → Pattern A (Leak) oder Pattern E (Startup > Limit) — Drilldown unten verwenden.",
+          "title": "Worst single container",
+          "description": "**Höchste Anzahl an OOMKills für einen einzelnen Container im ausgewählten Zeitraum ($__range).**\n\n`max(sum by (namespace,pod,container) (increase(...[$__range])))`\n\nHohe Zahl → ein Container loopt im OOM-Restart-Zyklus → Pattern A (Leak) oder Pattern E (Startup > Limit) — Drilldown unten verwenden.",
           "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
-            "expr": "max(sum by (namespace,pod,container) (increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[7d])))"
+            "expr": "max(sum by (namespace,pod,container) (increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\"}[$__range])))"
           }],
           "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute",
             "steps": [{"color":"green","value":null},{"color":"orange","value":3},{"color":"red","value":10}] } } }
@@ -119,8 +119,8 @@ data:
 
         {
           "type": "table",
-          "title": "OOMKilled containers — last 7 days (click pod to drill down)",
-          "description": "**Tabelle aller Container, die in den letzten 7 Tagen mindestens einmal OOMKilled wurden.**\n\nSpalten:\n- `namespace` / `workload` / `pod` / `container` / `node`\n- `OOM count (7d)` — Anzahl Kills im Zeitfenster\n- `Restarts (total)` — Container-Restart-Zähler kumulativ\n- `Memory limit` — konfiguriertes `resources.limits.memory`\n- `Peak (7d)` — höchster `working_set_bytes` im Zeitfenster\n- `Peak / limit` — Verhältnis Peak zu Limit (rot = OOM-bestätigt)\n\n**Drilldown:** Klick auf den Pod-Namen setzt die Dashboard-Variablen `namespace` und `pod` und füllt die Detail-Panels weiter unten (Memory-Verlauf, Network, CPU, Loki-Logs).\n\nDie `workload`-Spalte wird per Regex aus dem Pod-Namen abgeleitet (Deployment-Pattern `<name>-<rshash>-<podhash>`); für StatefulSets/DaemonSets bleibt sie ggf. leer.",
+          "title": "OOMKilled containers — selected range ($__range, click pod to drill down)",
+          "description": "**Tabelle aller Container, die im ausgewählten Zeitraum ($__range, Time-Picker oben rechts) mindestens einmal OOMKilled wurden.**\n\nSpalten:\n- `namespace` / `workload` / `pod` / `container` / `node`\n- `OOM count` — Anzahl Kills im gewählten Zeitfenster\n- `Restarts (total)` — Container-Restart-Zähler kumulativ\n- `Memory limit` — konfiguriertes `resources.limits.memory`\n- `Peak` — höchster `working_set_bytes` im gewählten Zeitfenster\n- `Peak / limit` — Verhältnis Peak zu Limit (rot = OOM-bestätigt)\n\n**Drilldown:** Klick auf den Pod-Namen setzt die Dashboard-Variablen `namespace` und `pod` und füllt die Detail-Panels weiter unten (Memory-Verlauf, Network, CPU, Loki-Logs).\n\nDie `workload`-Spalte wird per Regex aus dem Pod-Namen abgeleitet (Deployment-Pattern `<name>-<rshash>-<podhash>`); für StatefulSets/DaemonSets bleibt sie ggf. leer.",
           "gridPos": { "h": 14, "w": 24, "x": 0, "y": 5 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [
@@ -128,7 +128,7 @@ data:
               "refId": "A",
               "format": "table",
               "instant": true,
-              "expr": "label_replace(\n  sum by (namespace, pod, container, node) (\n    (\n      sum by (namespace, pod, container) (\n        increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\", namespace=~\"$namespace\"}[7d])\n      ) > 0\n    )\n    * on (namespace, pod) group_left(node)\n      max by (namespace, pod, node) (kube_pod_info{namespace=~\"$namespace\"})\n  ),\n  \"workload\", \"$1\", \"pod\", \"^(.+?)(?:-[a-f0-9]{6,10})?-[a-z0-9]{5}$\"\n)"
+              "expr": "label_replace(\n  sum by (namespace, pod, container, node) (\n    (\n      sum by (namespace, pod, container) (\n        increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\", namespace=~\"$namespace\"}[$__range])\n      ) > 0\n    )\n    * on (namespace, pod) group_left(node)\n      max by (namespace, pod, node) (kube_pod_info{namespace=~\"$namespace\"})\n  ),\n  \"workload\", \"$1\", \"pod\", \"^(.+?)(?:-[a-f0-9]{6,10})?-[a-z0-9]{5}$\"\n)"
             },
             {
               "refId": "B",
@@ -146,13 +146,13 @@ data:
               "refId": "D",
               "format": "table",
               "instant": true,
-              "expr": "max by (namespace, pod, container) (max_over_time(container_memory_working_set_bytes{namespace=~\"$namespace\", container!=\"\", container!=\"POD\"}[7d]))"
+              "expr": "max by (namespace, pod, container) (max_over_time(container_memory_working_set_bytes{namespace=~\"$namespace\", container!=\"\", container!=\"POD\"}[$__range]))"
             },
             {
               "refId": "E",
               "format": "table",
               "instant": true,
-              "expr": "max by (namespace, pod, container) (\n  max_over_time(container_memory_working_set_bytes{namespace=~\"$namespace\", container!=\"\", container!=\"POD\"}[7d])\n  / on (namespace, pod, container) group_left()\n  max by (namespace, pod, container) (kube_pod_container_resource_limits{resource=\"memory\", namespace=~\"$namespace\"})\n)"
+              "expr": "max by (namespace, pod, container) (\n  max_over_time(container_memory_working_set_bytes{namespace=~\"$namespace\", container!=\"\", container!=\"POD\"}[$__range])\n  / on (namespace, pod, container) group_left()\n  max by (namespace, pod, container) (kube_pod_container_resource_limits{resource=\"memory\", namespace=~\"$namespace\"})\n)"
             }
           ],
           "transformations": [
@@ -171,10 +171,10 @@ data:
                   "endpoint": true, "instance": true, "service": true, "prometheus": true
                 },
                 "renameByName": {
-                  "A": "OOM count (7d)",
+                  "A": "OOM count",
                   "B": "Restarts (total)",
                   "C": "Memory limit",
-                  "D": "Peak (7d)",
+                  "D": "Peak",
                   "E": "Peak / limit"
                 },
                 "indexByName": {
@@ -221,7 +221,7 @@ data:
                 ]
               },
               {
-                "matcher": { "id": "byName", "options": "OOM count (7d)" },
+                "matcher": { "id": "byName", "options": "OOM count" },
                 "properties": [
                   { "id": "unit", "value": "short" },
                   { "id": "decimals", "value": 0 },
@@ -235,7 +235,7 @@ data:
                 "properties": [{ "id": "unit", "value": "bytes" }]
               },
               {
-                "matcher": { "id": "byName", "options": "Peak (7d)" },
+                "matcher": { "id": "byName", "options": "Peak" },
                 "properties": [{ "id": "unit", "value": "bytes" }]
               },
               {
@@ -265,8 +265,8 @@ data:
 
         {
           "type": "timeseries",
-          "title": "OOMKill events over time (7d, by namespace)",
-          "description": "**OOMKill-Ereignisse pro Namespace im Zeitverlauf (7 Tage).**\n\nGestapelte Balken pro `$__rate_interval`-Bucket.\n\n- Tägliche Spitzen zur gleichen Uhrzeit → Cron / Backup / Batch\n- Cluster-weite gleichzeitige Spikes → Knoten-Memory-Druck\n- Nur ein Namespace → App-Problem",
+          "title": "OOMKill events over time (by namespace, selected range)",
+          "description": "**OOMKill-Ereignisse pro Namespace im Zeitverlauf** über den oben rechts gewählten Zeitraum ($__range).\n\nGestapelte Balken pro `$__rate_interval`-Bucket.\n\n- Tägliche Spitzen zur gleichen Uhrzeit → Cron / Backup / Batch\n- Cluster-weite gleichzeitige Spikes → Knoten-Memory-Druck\n- Nur ein Namespace → App-Problem",
           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 19 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
@@ -280,12 +280,12 @@ data:
 
         {
           "type": "stat",
-          "title": "Max memory peak (7d) — selected pod",
-          "description": "**Höchster `container_memory_working_set_bytes` für den ausgewählten Pod über 7 Tage.**\n\nDas ist der Wert, an dem der Kernel-OOM-Killer die Entscheidung trifft.",
+          "title": "Max memory peak — selected pod",
+          "description": "**Höchster `container_memory_working_set_bytes` für den ausgewählten Pod im gewählten Zeitraum ($__range).**\n\nDas ist der Wert, an dem der Kernel-OOM-Killer die Entscheidung trifft.",
           "gridPos": { "h": 5, "w": 6, "x": 0, "y": 28 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
-            "expr": "max(max_over_time(container_memory_working_set_bytes{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[7d]))"
+            "expr": "max(max_over_time(container_memory_working_set_bytes{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[$__range]))"
           }],
           "fieldConfig": { "defaults": { "unit": "bytes" } }
         },
@@ -303,12 +303,12 @@ data:
         },
         {
           "type": "stat",
-          "title": "Peak / limit (7d) — selected pod",
-          "description": "**Verhältnis Peak zu Limit über 7 Tage.**\n\n| Wert | Bedeutung |\n|------|-----------|\n| > 100 % | OOM hat stattgefunden |\n| 95–100 % | Limit zu eng → erhöhen |\n| 80–95 % | Headroom hinzufügen |\n| < 50 % und dennoch OOM | Knoten-Druck oder Kernel-OOM, nicht das Container-Limit |",
+          "title": "Peak / limit — selected pod",
+          "description": "**Verhältnis Peak zu Limit im gewählten Zeitraum ($__range).**\n\n| Wert | Bedeutung |\n|------|-----------|\n| > 100 % | OOM hat stattgefunden |\n| 95–100 % | Limit zu eng → erhöhen |\n| 80–95 % | Headroom hinzufügen |\n| < 50 % und dennoch OOM | Knoten-Druck oder Kernel-OOM, nicht das Container-Limit |",
           "gridPos": { "h": 5, "w": 6, "x": 12, "y": 28 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
-            "expr": "max(\n  max_over_time(container_memory_working_set_bytes{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[7d])\n  / on (namespace, pod, container) group_left()\n  kube_pod_container_resource_limits{resource=\"memory\",namespace=~\"$namespace\",pod=~\"$pod\"}\n)"
+            "expr": "max(\n  max_over_time(container_memory_working_set_bytes{namespace=~\"$namespace\",pod=~\"$pod\",container!=\"\",container!=\"POD\"}[$__range])\n  / on (namespace, pod, container) group_left()\n  kube_pod_container_resource_limits{resource=\"memory\",namespace=~\"$namespace\",pod=~\"$pod\"}\n)"
           }],
           "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1.5,
             "thresholds": { "mode": "absolute",
@@ -316,12 +316,12 @@ data:
         },
         {
           "type": "stat",
-          "title": "OOMKills (7d) — selected pod",
-          "description": "**Anzahl OOMKill-Ereignisse für den ausgewählten Pod in 7 Tagen.**",
+          "title": "OOMKills — selected pod",
+          "description": "**Anzahl OOMKill-Ereignisse für den ausgewählten Pod im gewählten Zeitraum ($__range).**",
           "gridPos": { "h": 5, "w": 6, "x": 18, "y": 28 },
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "targets": [{
-            "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\",pod=~\"$pod\"}[7d]))"
+            "expr": "sum(increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\",namespace=~\"$namespace\",pod=~\"$pod\"}[$__range]))"
           }],
           "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute",
             "steps": [{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":5}] } } }

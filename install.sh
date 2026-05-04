@@ -65,7 +65,7 @@ Access Alertmanager:
   kubectl -n ${NS} port-forward svc/kps-kube-prometheus-stack-alertmanager 9093
 
 Dashboards:
-  - OOMKilled — 7d Detail + Drilldown             [uid: oom-7d-detail]
+  - OOMKilled — Detail + Drilldown                [uid: oom-7d-detail]
   - OOMKilled — Combined (Overview + Forensics)   [uid: oom-combined]
   - OOMKilled — Thanos Deep Dive                  [uid: oomkilled-thanos]
   - OOM Forensics — Metrics + Logs + Network      [uid: oom-forensics]
