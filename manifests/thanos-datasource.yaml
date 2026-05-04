@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thanos-datasource
+  namespace: monitoring
+  labels:
+    grafana_datasource: "1"
+data:
+  thanos.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Thanos
+        uid: Thanos
+        type: prometheus
+        access: proxy
+        url: http://thanos-query.monitoring.svc.cluster.local:9090
+        isDefault: false
+        jsonData:
+          # Match Prometheus block compaction (2h); higher values reduce request count
+          # but lose recent-data resolution — leave at 30s for live dashboards.
+          timeInterval: "30s"
+          # Querier handles the dedup via replicaLabel in values-thanos.yaml; nothing
+          # to set here, just don't disable it.
+          httpMethod: POST
+        editable: false

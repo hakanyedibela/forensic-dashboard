@@ -1,0 +1,53 @@
+# Overlay applied on top of values-kps.yaml when Thanos is enabled.
+#
+# Usage:
+#   helm upgrade --install kps prometheus-community/kube-prometheus-stack \
+#     -n monitoring \
+#     -f helm/values-kps.yaml \
+#     -f helm/values-kps-thanos.yaml
+#
+# The secret `thanos-objstore-config` (with key `objstore.yml`) must exist in the
+# `monitoring` namespace before the upgrade — see manifests/thanos-objstore.md.
+# Without the secret, Prometheus pods will fail to start because the sidecar
+# refuses to load.
+
+prometheus:
+  prometheusSpec:
+    # The sidecar runs in the Prometheus pod and uploads completed TSDB blocks
+    # to object storage. Local Prometheus retention can stay short
+    # (values-kps.yaml: retention=15d) because long-term data is in object
+    # storage and served by Thanos Store Gateway.
+    thanos:
+      image: quay.io/thanos/thanos:v0.36.1
+      version: v0.36.1
+      objectStorageConfig:
+        existingSecret:
+          name: thanos-objstore-config
+          key: objstore.yml
+      resources:
+        requests: { cpu: 50m, memory: 128Mi }
+        limits:   { memory: 512Mi }
+
+    # External labels are required for Thanos so blocks from different replicas
+    # / clusters can be deduplicated and identified in object storage.
+    externalLabels:
+      cluster: rke2-local
+      prometheus_replica: $(POD_NAME)
+
+    # Optional: turn on additional replica for HA. Thanos Querier dedupes via
+    # the `prometheus_replica` external label.
+    # replicas: 2
+
+  # Headless Service that the Thanos Querier uses for sidecar gRPC discovery
+  # via DNS SRV. The bitnami/thanos chart's `query.dnsDiscovery.sidecarsService`
+  # references this name.
+  thanosService:
+    enabled: true
+    type: ClusterIP
+    clusterIP: None
+    portName: grpc
+    port: 10901
+    targetPort: 10901
+
+  thanosServiceMonitor:
+    enabled: true

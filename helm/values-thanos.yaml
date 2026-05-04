@@ -1,0 +1,95 @@
+# Values for the bitnami/thanos chart (release name: thanos, namespace: monitoring).
+#
+# Components enabled here:
+#   - query        — PromQL endpoint, fan-out to Sidecar (live) + Store Gateway (history)
+#   - storegateway — serves historical blocks from object storage
+#   - compactor    — compacts + downsamples blocks (5m / 1h resolution)
+#   - minio        — bundled S3-compatible object store (lab/dev only)
+#
+# Disabled (opt in if you need them):
+#   - queryFrontend — caching layer in front of query (useful at scale)
+#   - ruler         — evaluates recording/alerting rules over Thanos data
+#   - receive       — push-based remote_write target (alternative topology)
+#   - bucketweb     — bucket inspector UI
+#
+# Object storage:
+# `manifests/thanos-objstore.md` shows how to create the `thanos-objstore-config`
+# secret. With the bundled MinIO below, the secret points at `thanos-minio.monitoring`.
+# For production, set `minio.enabled: false` and create a secret with real S3 / GCS
+# / Azure / Ceph credentials.
+
+existingObjstoreSecret: thanos-objstore-config
+existingObjstoreSecretItems:
+  - key: objstore.yml
+    path: objstore.yml
+
+query:
+  enabled: true
+  replicaCount: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { memory: 512Mi }
+  # Fan-out targets:
+  #   - Prometheus sidecars via DNS SRV on the headless thanos discovery svc
+  #     (the kps chart creates kps-kube-prometheus-stack-thanos-discovery)
+  #   - Store Gateway (added automatically by the chart when storegateway.enabled=true)
+  dnsDiscovery:
+    enabled: true
+    sidecarsService: kps-kube-prometheus-stack-thanos-discovery
+    sidecarsNamespace: monitoring
+  # Replica-label dedup: matches the `prometheus_replica` external label set on
+  # Prometheus in values-kps-thanos.yaml. Lets Querier collapse HA replicas before
+  # PromQL — fixes the `many-to-many matching not allowed` failures the dashboards
+  # otherwise have to defend against.
+  replicaLabel: prometheus_replica
+  service:
+    type: ClusterIP
+
+storegateway:
+  enabled: true
+  replicaCount: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { memory: 1Gi }
+  persistence:
+    enabled: true
+    storageClass: cassandra-storage          # match values-kps.yaml; change if your SC differs
+    size: 10Gi
+
+compactor:
+  enabled: true
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { memory: 1Gi }
+  retentionResolutionRaw: 30d
+  retentionResolution5m: 90d
+  retentionResolution1h: 1y
+  persistence:
+    enabled: true
+    storageClass: cassandra-storage
+    size: 20Gi
+
+queryFrontend:
+  enabled: false
+ruler:
+  enabled: false
+receive:
+  enabled: false
+bucketweb:
+  enabled: false
+
+# Bundled MinIO — fine for lab/dev. For production, disable and point
+# thanos-objstore-config at real S3 / GCS / Azure / Ceph.
+minio:
+  enabled: true
+  auth:
+    rootUser: admin
+    rootPassword: "ChangeMe123!"             # change for anything beyond a lab
+  defaultBuckets: thanos
+  persistence:
+    enabled: true
+    storageClass: cassandra-storage
+    size: 20Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { memory: 1Gi }

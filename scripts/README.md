@@ -12,6 +12,7 @@ Helper scripts for working with the OOM observability stack from the command lin
 | [`oom-logs.py`](#oom-logspy) | Dump the **pre-OOM** (and optionally current / sibling) container logs for every OOMKilled container in a namespace. |
 | [`oom-usage.py`](#oom-usagepy) | Recover **memory and CPU usage at OOM time** by querying Prometheus/Thanos for each OOMKilled container's last terminated timestamp. |
 | [`oom-history.py`](#oom-historypy) | Walk each Deployment's **rollout history** (revisions / ReplicaSets) and report OOM status + pre-OOM logs per revision — answers "which version of the deployment started OOMing?". |
+| [`oom-rootcause.py`](#oom-rootcausepy) | **Deep root-cause report per OOMKilled pod** in one shot: workload, node, neighbors, events, PVCs, HPA/VPA, services, NetworkPolicies, LimitRanges, ResourceQuotas, Prometheus memory/CPU/network/storage trends, pre-OOM logs, and a verdict (Pattern A/B/C/D/E) with concrete remediation commands. Use this when you need to answer **why** an OOM happened — leak vs spike vs under-provisioned vs node-pressure vs startup. |
 
 ---
 
@@ -470,6 +471,220 @@ Non-OOM Deployments and non-OOM revisions of OOM-affected Deployments are filter
 - `0` — completed (output may be empty if no Deployments / no OOMs)
 - `2` — `oc` / `kubectl` not on `PATH`
 - non-zero — underlying CLI command failed; stderr is forwarded
+
+---
+
+## `oom-rootcause.py`
+
+Built for the question **"why did this OOM happen — leak, traffic spike, undersized limit, noisy node, or startup overrun?"** It pulls every Kubernetes resource that could explain an OOM in a single bulk fetch (one `get` per resource type, regardless of how many pods OOMed), correlates them with Prometheus memory / CPU / network / storage signal at the OOM timestamp, and prints a verdict per pod with concrete remediation commands.
+
+The verdict maps directly onto the patterns documented in the project's main `README.md` and the dashboard `oom-7d-detail`:
+
+| Pattern | Trigger condition |
+|---|---|
+| **A — Memory leak** | Memory `deriv(1h)` > +1 MiB/min sustained AND peak/limit ≥ 85% |
+| **B — Spike / large request** | Network rx 1m ≥ 3× the 30-minute baseline rate |
+| **C — Under-provisioned limit** | peak/limit ≥ 95% AND `deriv` flat (no leak) |
+| **D — Node pressure / noisy neighbor** | ≥ 2 other pods OOMed on the same node within 1h |
+| **E — Startup overrun** | Pod lifetime before OOM < 60 s AND restart count ≥ 2 |
+| **? — Indeterminate** | None of the above match with confidence (Prometheus missing or signal ambiguous) |
+
+Patterns are evaluated **in priority order** (E → D → A → B → C). The first match wins, so a pod that boots and OOMs in 30 s gets diagnosed as E even if its peak is also at the limit.
+
+### What gets fetched
+
+Per pod, in one bulk pass per resource type:
+
+| Source | Used for |
+|---|---|
+| `pods` | OOM target discovery (`lastState.terminated.reason == "OOMKilled"`); spec (image, resources, probes, args, QoS); restart count; OOM timestamps |
+| `replicasets`, `deployments`, `statefulsets`, `daemonsets` | Workload resolution (Deployment via RS lookup); rollout revision number |
+| `nodes` | Node `MemoryPressure` / `DiskPressure` / `PIDPressure` conditions; capacity / allocatable |
+| `events` (filtered to last 1h) | Recent `OOMKilling`, `BackOff`, `Failed`, etc. for the pod |
+| `services` | Services whose selector matches the pod's labels (so you can see who's calling it) |
+| `networkpolicies` | NetworkPolicies that target the pod |
+| `pvcs` | Mounted PersistentVolumeClaims, status, capacity, storage class |
+| `hpa` (autoscaling/v2) | Horizontal autoscaler targeting the workload, current min/max/metrics |
+| `vpa` (autoscaling.k8s.io/v1, optional) | Vertical autoscaler recommendation if installed |
+| `limitranges`, `resourcequotas` | Namespace-level limits that may be capping memory/CPU |
+| Prometheus | `WSS@OOM`, `WSS peak 5m / 1h`, `deriv(1h)`, memory limit, CPU usage + throttling, network rx/tx (with replica dedup), 30-minute rx baseline, container fs read/write rate |
+| Loki — *no*, this script doesn't query Loki | (use `oom-logs.py` or the Grafana drilldown for full log search) |
+| `oc logs --previous` | Last 30 lines, filtered by `--grep` regex (default: `error\|oom\|killed\|out ?of ?memory\|fatal\|exception`) |
+
+### Requirements
+
+- Python 3.6.8+
+- `oc` (or `kubectl` with `--kubectl`)
+- An active session (`oc login`)
+- A reachable Prometheus / Thanos endpoint (optional, but the verdict is much weaker without it)
+- RBAC: `get pods`, `replicasets`, `deployments`, `statefulsets`, `daemonsets`, `events`, `services`, `pvcs`, `hpa`, `vpa`, `limitranges`, `resourcequotas`, `networkpolicies`, `nodes`, `pods/log` in the target scope
+
+### Usage
+
+```bash
+# full per-pod report for every OOMKilled container in the current namespace,
+# expects a Prometheus port-forward at localhost:9090
+./oom-rootcause.py
+
+# specific namespace
+./oom-rootcause.py -n my-app
+
+# one specific pod (useful when several have OOMed)
+./oom-rootcause.py -n my-app --pod leak-app-84d95bfcd6-8qlgh
+
+# include filtered pre-OOM logs at the bottom of each report
+./oom-rootcause.py -n my-app --logs
+
+# custom log filter (case-insensitive regex)
+./oom-rootcause.py -n my-app --logs --grep "OutOfMemoryError|GC|allocation failed"
+
+# one-line-per-OOM triage summary across the whole cluster
+./oom-rootcause.py -A --summary
+
+# OpenShift Thanos as the Prometheus source
+./oom-rootcause.py -A \
+  --prometheus-url "https://$(oc -n openshift-monitoring get route thanos-querier -o jsonpath='{.spec.host}')" \
+  --insecure
+
+# JSON output for archiving / piping into jq
+./oom-rootcause.py -A --json > rootcause.json
+
+# run without Prometheus (verdict will be limited but still useful)
+./oom-rootcause.py -n my-app --no-prometheus
+```
+
+### Example output (one pod, abbreviated)
+
+```
+================================================================================
+OOM ROOT-CAUSE ANALYSIS — oom-test/leak-app-84d95bfcd6-8qlgh/leak
+================================================================================
+
+CONTEXT
+  Workload:        Deployment/leak-app  (rev 4, ReplicaSet leak-app-84d95bfcd6)
+  Node:            worker-2
+  OOM at:          2026-05-04T08:12:33Z  (3m ago)
+  Started:         2026-05-04T08:00:11Z
+  Lifetime:        742s before OOM
+  Exit code:       137   (137 = OOMKilled)
+  Restart count:   12
+
+CONFIGURATION
+  Image:           registry/leak-app:v0.4.0
+  Memory limit:    256Mi   request: 128Mi
+  CPU limit:       200m    request: 100m
+  QoS class:       Burstable
+  Probes:          livenessProbe, readinessProbe
+
+MEMORY (Prometheus)
+  WSS at OOM:      254.1Mi
+  Peak (last 5m):  255.9Mi
+  Peak (last 1h):  256.0Mi
+  Slope (deriv 1h):+12.4 MiB/min
+  Memory limit:    256.0Mi
+
+CPU (Prometheus)
+  Usage (5m avg):  0.420 cores
+  Throttle (5m):   0.078 cores-equivalent
+
+NETWORK (Prometheus)
+  Rx 5m avg:       125.3KiB/s
+  Tx 5m avg:       82.0KiB/s
+  Rx 1m (recent):  130.1KiB/s
+  Rx baseline 30m: 122.4KiB/s
+
+STORAGE
+  PVC pvc-leak-data: status=Bound, capacity=10Gi, sc=cassandra-storage, access=ReadWriteOnce
+
+NODE
+  Name:            worker-2
+  Capacity:        memory=16265564Ki, cpu=8
+  Allocatable:     memory=15871420Ki, cpu=7900m
+  MemoryPressure  False  (KubeletHasSufficientMemory)
+  Ready           True   (KubeletReady)
+
+NEIGHBOR PODS — OOMs on the same node (worker-2) within 1h
+  (none — no node-pressure pattern at this timestamp)
+
+AUTOSCALING
+  (no HPA targets this workload)
+  (no VPA targets this workload — install in recommender mode for right-sizing hints)
+
+SERVICES & NETWORK POLICY
+  Service leak-app: type=ClusterIP, ports=8080
+
+NAMESPACE CONSTRAINTS
+  (no LimitRange / ResourceQuota in this namespace)
+
+RECENT EVENTS — pod, last 1h (2 entries)
+  [2026-05-04T08:12:33Z] Warning/OOMKilling (x2): Memory cgroup out of memory: ...
+  [2026-05-04T08:09:48Z] Warning/OOMKilling (x1): Memory cgroup out of memory: ...
+
+VERDICT
+  Most likely cause:  A - MEMORY LEAK
+  Evidence:
+    - memory deriv (1h): +12.4 MiB/min sustained → leak signature
+    - peak/limit: 100.0% — limit is the ceiling, not the cause
+  Recommended action:
+    Memory grows steadily without releasing — limit reached → OOM → restart → repeat.
+    Capture a heap dump while memory is high (BEFORE the OOM):
+      oc exec leak-app-84d95bfcd6-8qlgh -c leak -- jcmd 1 GC.heap_dump /tmp/heap.hprof   # JVM
+      oc exec leak-app-84d95bfcd6-8qlgh -c leak -- curl localhost:6060/debug/pprof/heap > heap.out   # Go
+    Don't just raise the limit — the leak will eat any new ceiling.
+================================================================================
+```
+
+For a long list of OOMs, prefer `--summary`:
+
+```
+NAMESPACE  POD                          CONTAINER  PATTERN                     OOM AGE
+oom-test   leak-app-84d95bfcd6-8qlgh    leak       A - MEMORY LEAK             3m ago
+oom-test   spike-app-7d4b5c6789-q9k2p   app        B - SPIKE / LARGE REQUEST   42m ago
+oom-test   startup-app-58f65dd8c9-bv..  startup    E - STARTUP OVERRUN         5m ago
+```
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `-n, --namespace NS` | Specific namespace (default: current `oc project`). |
+| `-A, --all-namespaces` | Walk every namespace's pods. |
+| `--pod NAME` | Restrict to a single pod by name. Useful when several OOMed and you want the deep view of one. |
+| `--summary` | One-line-per-OOM table (namespace, pod, container, pattern, OOM age) instead of the full per-pod report. Run this first on a busy cluster. |
+| `--logs` | Append the filtered pre-OOM container logs (`oc logs --previous --tail=30`) to each report. |
+| `--grep PATTERN` | Case-insensitive regex applied to log lines when `--logs` is on. Default: `error\|oom\|killed\|out ?of ?memory\|fatal\|exception`. |
+| `--prometheus-url URL` | Prometheus / Thanos base URL. Default: `http://localhost:9090`. |
+| `--token TOKEN` | Bearer token for Prometheus. Default: `oc whoami -t` if available. |
+| `--insecure` | Skip TLS verification (self-signed Prometheus / OpenShift Thanos route). |
+| `--no-prometheus` | Skip Prometheus entirely. The verdict will only see Kubernetes-side signal (lifetime, restart count, neighbor OOMs); patterns A / B / C become unreachable but D and E still work. |
+| `--json` | Structured JSON output. Pod / Service / NetworkPolicy / etc. raw objects are stripped (they're huge); the verdict, target identifiers, metrics, and event summaries are kept. |
+| `--kubectl` | Use `kubectl` instead of `oc`. |
+
+### When to use which script
+
+| You want… | Use |
+|---|---|
+| A 7-day cluster-wide list of OOMs in Grafana with click-through detail | dashboard `oom-7d-detail` |
+| A current-state table (one row per OOM) | `oom-extract.py` |
+| Just the pre-OOM container logs | `oom-logs.py` |
+| The exact memory/CPU values at OOM time from Prometheus | `oom-usage.py` |
+| Did the OOM start with a specific Deployment revision? | `oom-history.py` |
+| **Why did it OOM — leak / spike / under-sized / noisy node / startup?** | **`oom-rootcause.py`** |
+
+### Behaviour notes
+
+- **One bulk fetch per resource type.** Even on a cluster with 100 OOMed pods across 50 namespaces, the script makes ~13 `oc get` calls total. All correlation is in-memory.
+- **Prometheus failure is non-fatal.** If the endpoint is unreachable the script writes one warning to stderr and continues with K8s-only signal — patterns D and E still work, A/B/C become best-effort.
+- **HA replica dedup is built in.** Every PromQL expression that crosses replicas wraps `max by (namespace,pod,container) (...)` or `max without (prometheus_replica) (...)`, so the script works on Thanos with HA Prometheus pairs without `many-to-many matching not allowed` errors.
+- **VPA queries are tried, missing CRD is silent.** If your cluster has no VerticalPodAutoscaler, the `oc get vpa` call returns empty and the verdict skips that block — no failure.
+- **Verdicts are heuristic, not gospel.** The thresholds (1 MiB/min for leaks, 3× rx burst for spikes, 95% for under-provisioning) are conservative defaults that match the behaviour patterns documented in the project README. Read the `Evidence:` block under the verdict — it always shows the numbers that triggered the classification, so you can decide if the heuristic fits.
+- **The "?" verdict isn't a failure.** If signal is ambiguous (slow climb but limit not yet reached, or no Prometheus, or only one prior OOM with no time series), the script prints `? - INDETERMINATE` and points you at the longer-window dashboards / scripts.
+
+### Exit codes
+
+- `0` — completed (output may be empty if nothing OOMed)
+- `2` — `oc` / `kubectl` not on `PATH`
+- non-zero — a non-Prometheus underlying CLI command failed; stderr is forwarded
 
 ---
 

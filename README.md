@@ -7,12 +7,16 @@ Prometheus + Alertmanager + Loki + Promtail + Grafana on RKE2, with Thanos-compa
 ```
 rke2-observability/
 ├── README.md
-├── install.sh                      # runs helm installs in order
+├── install.sh                      # runs helm installs in order; THANOS=1 enables long-term metrics
 ├── helm/
 │   ├── values-kps.yaml             # kube-prometheus-stack values
+│   ├── values-kps-thanos.yaml      # overlay enabling the Thanos sidecar (opt-in)
+│   ├── values-thanos.yaml          # bitnami/thanos values (Querier + Store + Compactor + bundled MinIO)
 │   └── values-loki.yaml            # Loki single-binary values
 ├── manifests/
 │   ├── loki-datasource.yaml        # Grafana datasource for Loki
+│   ├── thanos-datasource.yaml      # Grafana datasource for Thanos Querier (opt-in)
+│   ├── thanos-objstore.md          # object-store secret for Thanos (MinIO / S3 / GCS / Azure)
 │   ├── prometheusrules-custom.yaml # pod health + log error alerts
 │   ├── oom-alerts.yaml             # OOM-specific PrometheusRule
 │   └── alertmanager-secrets.md     # how to create the secrets
@@ -20,6 +24,7 @@ rke2-observability/
 │   ├── dash-loki-logs.yaml         # Loki log overview dashboard
 │   ├── dash-oomkilled-thanos.yaml  # OOMKilled deep-dive dashboard
 │   └── dash-oom-forensics.yaml     # per-pod metrics + logs + network on one timeline
+├── scripts/                        # CLI tools for OOM forensics (oc/kubectl-driven)
 └── samples/                        # OOM simulation apps for dashboard testing
     ├── README.md
     ├── namespace.yaml
@@ -109,6 +114,83 @@ Or flip Grafana service to `NodePort` in `helm/values-kps.yaml` for LAN access.
 ## Configure alerting
 
 See `manifests/alertmanager-secrets.md` for Slack / Teams / SMTP setup.
+
+## Long-term metrics with Thanos (opt-in)
+
+Default install keeps Prometheus retention at 15d (`helm/values-kps.yaml`). For 30d / 90d / 1y views — which the dashboard `oom-7d-detail` and the `oom-usage.py` script can reach — enable Thanos:
+
+```bash
+THANOS=1 ./install.sh
+```
+
+What that adds, side-by-side with the existing Prometheus:
+
+```
+                       ┌──────────────────────┐
+                       │  Prometheus pod      │
+                       │  ┌────────────────┐  │           ┌──────────────────────┐
+   scrape ─────────────┼─►│ Prometheus     │──┼──────────►│  Grafana             │
+                       │  │ (15d local)    │  │ live      │  - Prometheus DS     │
+                       │  └────────────────┘  │           │  - Thanos DS         │
+                       │  ┌────────────────┐  │           └──────────▲───────────┘
+                       │  │ Thanos sidecar │  │                      │
+                       │  └───────┬────────┘  │                      │ history
+                       └──────────┼───────────┘                      │
+                                  │ upload blocks                    │
+                                  ▼                                  │
+                          ┌───────────────┐    fan-out:    ┌─────────┴──────────┐
+                          │  MinIO bucket │◄──────────────►│   Thanos Querier   │
+                          │  (S3 in prod) │   read history │   (PromQL endpoint)│
+                          └───────┬───────┘                └─────────▲──────────┘
+                                  │                                  │
+                          ┌───────▼───────┐                          │
+                          │ Store Gateway │──────────────────────────┘
+                          └───────────────┘
+                          ┌───────────────┐
+                          │   Compactor   │  compacts + downsamples old blocks
+                          └───────────────┘
+```
+
+Components installed (all in the `monitoring` namespace, helm release `thanos`):
+
+| Component | What it does | Service |
+|---|---|---|
+| Prometheus sidecar (in the kps Prometheus pod) | Uploads finalised TSDB blocks to object storage every ~2h | gRPC: `kps-kube-prometheus-stack-thanos-discovery:10901` (headless, used for SD by the Querier) |
+| Thanos Querier | PromQL endpoint, fans out to live Sidecar + historical Store Gateway, dedupes HA replicas via `prometheus_replica` external label | HTTP: `thanos-query:9090`, gRPC: `thanos-query-grpc:10901` |
+| Thanos Store Gateway | Reads historical blocks from object storage and serves them to the Querier | gRPC: `thanos-storegateway:10901` |
+| Thanos Compactor | Compacts and downsamples blocks (5m + 1h resolutions) — required for fast long-range queries | none (worker only) |
+| Bundled MinIO (lab/dev) | S3-compatible object store, single replica | API: `thanos-minio:9000`, console: `thanos-minio:9001` |
+
+Dashboards stay backwards-compatible: every panel still works against the original Prometheus datasource. Switch the datasource picker (or set the dashboard variable `datasource` to `Thanos`) to query the long-range view.
+
+### Verify
+
+```bash
+# Sidecar uploading blocks?
+kubectl -n monitoring logs -l app.kubernetes.io/name=prometheus -c thanos-sidecar --tail=50
+
+# Querier sees both sources?
+kubectl -n monitoring port-forward svc/thanos-query 9090
+# open http://localhost:9090/stores → expect one Sidecar entry + one Store Gateway entry
+
+# Bucket has data?
+kubectl -n monitoring run -it --rm mc --image=minio/mc --restart=Never -- \
+  sh -c 'mc alias set local http://thanos-minio:9000 admin ChangeMe123! && mc ls local/thanos/'
+```
+
+### Real S3 / GCS / Azure / Ceph
+
+The bundled MinIO is fine for a lab; for production swap it out: set `minio.enabled: false` in `helm/values-thanos.yaml` and recreate the `thanos-objstore-config` secret with the real credentials. Backend-specific snippets live in `manifests/thanos-objstore.md`.
+
+### Sizing
+
+Defaults in `helm/values-thanos.yaml` are lab-sized: ~3–5 GiB memory across 4 pods, ~50 GiB of PVCs (Store Gateway 10G, Compactor 20G, MinIO 20G) on the same `cassandra-storage` StorageClass that Prometheus uses. Adjust there for production retention.
+
+### How it interacts with the rest of the project
+
+- **Dashboards** — the `oom-7d-detail`, `oomkilled-thanos`, and `oom-combined` dashboards now reach data older than Prometheus's local 15d once you switch the `datasource` variable to `Thanos`.
+- **`scripts/oom-usage.py`** — point `--prometheus-url http://localhost:9090` at a `kubectl port-forward svc/thanos-query 9090` and recover memory/CPU even for OOMs that happened weeks ago. The dedup label is already set; no extra flags needed.
+- **HA-replica defenses in dashboards** — the `max by (namespace,pod,container)` wrappers added in `dash-oom-7d-detail.yaml` keep working both with and without Thanos. With Thanos's `replicaLabel: prometheus_replica` (set in `values-thanos.yaml`), the Querier already dedupes; the wrappers become no-ops on already-unique series.
 
 ## OOM analysis
 
