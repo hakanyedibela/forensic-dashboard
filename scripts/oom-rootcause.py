@@ -1027,8 +1027,14 @@ def main():
     p.add_argument("--grep",
                    help="regex applied to log lines when --logs is set "
                         "(default: error|oom|killed|out ?of ?memory|fatal|exception)")
-    p.add_argument("--prometheus-url", default="http://localhost:9090",
-                   help="Prometheus / Thanos base URL (default: http://localhost:9090)")
+    p.add_argument("--prometheus-url",
+                   help="Prometheus / Thanos base URL "
+                        "(default: http://localhost:<--prometheus-port>)")
+    p.add_argument("--prometheus-port", default=9090, type=int,
+                   help="local port for Prometheus (default: 9090). "
+                        "Use this when port 9090 is taken — e.g. start your "
+                        "port-forward on another port and pass --prometheus-port "
+                        "<port>. Ignored if --prometheus-url is set.")
     p.add_argument("--token", help="bearer token (default: try `oc whoami -t`)")
     p.add_argument("--insecure", action="store_true", help="skip TLS verification")
     p.add_argument("--no-prometheus", action="store_true",
@@ -1045,14 +1051,17 @@ def main():
         sys.stderr.write(f"{CLI} not found in PATH\n")
         sys.exit(2)
 
+    prom_url = args.prometheus_url or f"http://localhost:{args.prometheus_port}"
+
     if args.diagnose:
-        prom = Prom(args.prometheus_url,
+        prom = Prom(prom_url,
                     token=args.token or auto_token(),
                     insecure=args.insecure)
         if not prom.probe():
             sys.stderr.write(
-                f"cannot reach Prometheus at {args.prometheus_url}\n"
-                "Start a port-forward, or pass --prometheus-url / --token / --insecure.\n")
+                f"cannot reach Prometheus at {prom_url}\n"
+                "Start a port-forward, or pass --prometheus-url / "
+                "--prometheus-port / --token / --insecure.\n")
             sys.exit(3)
         diagnose_metrics(prom)
         return
@@ -1078,15 +1087,15 @@ def main():
 
     prom = None
     if not args.no_prometheus:
-        prom = Prom(args.prometheus_url,
+        prom = Prom(prom_url,
                     token=args.token or auto_token(),
                     insecure=args.insecure)
         if not prom.probe():
             sys.stderr.write(
-                f"# Prometheus not reachable at {args.prometheus_url} — "
+                f"# Prometheus not reachable at {prom_url} — "
                 "verdict will be based on K8s data only.\n"
-                "# (rerun with --prometheus-url <URL> [--insecure] [--token TOKEN], "
-                "or --no-prometheus to silence this)\n")
+                "# (rerun with --prometheus-url <URL> or --prometheus-port <port> "
+                "[--insecure] [--token TOKEN], or --no-prometheus to silence this)\n")
 
     log_grep = re.compile(
         args.grep or r"error|oom|killed|out ?of ?memory|fatal|exception",
