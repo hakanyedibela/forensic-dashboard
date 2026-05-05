@@ -310,41 +310,134 @@ def collect_usage(targets, prom, window):
     return rows
 
 
-# (metric, label) — label is what we display under "Memory working set:" etc.
+# Each entry probes a PromQL expression and attributes it to a scrape source.
+# Optional fields:
+#   bare              — bare metric name to probe if the selector returns nothing
+#                       (lets us tell "metric family present, 0 series matching the
+#                       label filter" apart from "metric truly missing").
+#   absent_ok_reason  — when set: an expected-absent state. The metric will show as
+#                       "absent — <reason>" instead of "missing", and its absence
+#                       does NOT mark its scrape source as missing.
 DIAGNOSTIC_PROBES = [
-    ("Memory working set (cAdvisor)",       "container_memory_working_set_bytes"),
-    ("Memory working set (recording rule)", "node_namespace_pod_container:container_memory_working_set_bytes"),
-    ("Memory RSS (cAdvisor)",               "container_memory_rss"),
-    ("Memory RSS (recording rule)",         "node_namespace_pod_container:container_memory_rss"),
-    ("Memory limit (kube-state-metrics)",   'kube_pod_container_resource_limits{resource="memory"}'),
-    ("Memory limit (KSM legacy)",           "kube_pod_container_resource_limits_memory_bytes"),
-    ("Memory limit (cAdvisor)",             "container_spec_memory_limit_bytes"),
-    ("CPU usage counter (cAdvisor)",        "container_cpu_usage_seconds_total"),
-    ("CPU usage (recording, irate)",        "node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate"),
-    ("CPU usage (recording, rate)",         "node_namespace_pod_container:container_cpu_usage_seconds_total:sum_rate"),
-    ("OOM event counter (cAdvisor)",        "container_oom_events_total"),
-    ("Pod terminated reason (KSM)",         'kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}'),
+    {"label": "Memory working set (cAdvisor)",
+     "query": "container_memory_working_set_bytes",
+     "source": "kubelet /metrics/cadvisor scrape"},
+    {"label": "Memory working set (recording rule)",
+     "query": "node_namespace_pod_container:container_memory_working_set_bytes",
+     "source": "kube-prometheus-stack recording rules"},
+    {"label": "Memory RSS (cAdvisor)",
+     "query": "container_memory_rss",
+     "source": "kubelet /metrics/cadvisor scrape"},
+    {"label": "Memory RSS (recording rule)",
+     "query": "node_namespace_pod_container:container_memory_rss",
+     "source": "kube-prometheus-stack recording rules"},
+    {"label": "Memory limit (kube-state-metrics)",
+     "query": 'kube_pod_container_resource_limits{resource="memory"}',
+     "bare":  "kube_pod_container_resource_limits",
+     "source": "kube-state-metrics deployment"},
+    {"label": "Memory limit (KSM legacy)",
+     "query": "kube_pod_container_resource_limits_memory_bytes",
+     "source": "kube-state-metrics deployment",
+     "absent_ok_reason": 'legacy KSM (≤1.3); modern KSM uses kube_pod_container_resource_limits{resource}'},
+    {"label": "Memory limit (cAdvisor)",
+     "query": "container_spec_memory_limit_bytes",
+     "source": "kubelet /metrics/cadvisor scrape",
+     "absent_ok_reason": "dropped by kps default relabel; fallback handles it"},
+    {"label": "CPU usage counter (cAdvisor)",
+     "query": "container_cpu_usage_seconds_total",
+     "source": "kubelet /metrics/cadvisor scrape"},
+    {"label": "CPU usage (recording, irate)",
+     "query": "node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate",
+     "source": "kube-prometheus-stack recording rules"},
+    {"label": "CPU usage (recording, rate)",
+     "query": "node_namespace_pod_container:container_cpu_usage_seconds_total:sum_rate",
+     "source": "kube-prometheus-stack recording rules"},
+    {"label": "OOM event counter (cAdvisor)",
+     "query": "container_oom_events_total",
+     "source": "kubelet /metrics/cadvisor scrape"},
+    {"label": "Pod terminated reason (KSM)",
+     "query": 'kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}',
+     "bare":  "kube_pod_container_status_last_terminated_reason",
+     "source": "kube-state-metrics deployment"},
 ]
 
 
 def diagnose(prom):
-    print(f"Probing Prometheus at {prom.base_url} for known OOM-relevant metrics.\n"
-          "An 'OK' line means the metric exists and returns at least one series.\n"
-          "Use the OK names below; the script will pick the first OK variant per kind.\n")
-    width = max(len(name) for _, name in DIAGNOSTIC_PROBES)
+    """Probe Prometheus for every metric this script depends on. Distinguishes:
+       - OK                            — selector returns N series
+       - family present, 0 with selector — bare metric exists, no series match the filter
+                                        (e.g. no current OOMKilled events; not a problem)
+       - absent — <reason>             — expected absent (relabel-dropped, legacy form, etc.)
+       - missing                       — neither selector nor bare returns anything
+    A scrape source is flagged as truly missing only when every metric it provides
+    is in the 'missing' state — a single OK / family-present entry proves the source is up.
+    'absent — <reason>' rows do not count as missing."""
+    print(f"# Probing Prometheus at {prom.base_url} for OOM-relevant metrics.\n")
+    width = max(len(p["query"]) for p in DIAGNOSTIC_PROBES)
     now = time.time()
-    for label, metric in DIAGNOSTIC_PROBES:
-        count = prom.query(f"count({metric})", now)
-        if count is None:
-            mark = "missing"
+    rows = []
+    source_state = {}  # source -> {"any_ok": bool, "any_missing": bool}
+
+    for entry in DIAGNOSTIC_PROBES:
+        v = prom.query(f"count({entry['query']})", now)
+        bare_v = None
+        if v is None and entry.get("bare"):
+            bare_v = prom.query(f"count({entry['bare']})", now)
+
+        if v is not None and v > 0:
+            kind, status = "ok", f"OK ({int(v)} series)"
+        elif bare_v is not None and bare_v > 0:
+            kind, status = "family", f"family present ({int(bare_v)} series), 0 with selector"
+        elif entry.get("absent_ok_reason"):
+            kind, status = "absent_ok", f"absent — {entry['absent_ok_reason']}"
         else:
-            mark = f"OK ({int(count)} series)"
-        print(f"  {metric:<{width}}  {mark:<24}  # {label}")
+            kind, status = "missing", "missing"
+
+        rows.append((entry, kind, status))
+        st = source_state.setdefault(entry["source"], {"any_ok": False, "any_missing": False})
+        if kind in ("ok", "family"):
+            st["any_ok"] = True
+        if kind == "missing":
+            st["any_missing"] = True
+
+    for entry, _kind, status in rows:
+        print(f"  {entry['query']:<{width}}  {status:<70}  # {entry['label']}")
     print()
-    print("If everything is missing: Prometheus has no cAdvisor / kube-state-metrics scrape job.")
-    print("If only the cAdvisor names are missing but recording rules exist: OK, the script falls back.")
-    print("If `kube_pod_container_status_last_terminated_reason` is missing: KSM is not deployed —")
-    print("  the dashboards in this repo and the OOM detection PromQL won't work either.")
+
+    truly_missing = sorted(
+        src for src, st in source_state.items()
+        if st["any_missing"] and not st["any_ok"]
+    )
+    if not truly_missing:
+        print("All required scrape sources are healthy.")
+        print()
+        print("If oom-usage columns still show '-' for some pods, the cause is one of:")
+        print("  - the OOM is older than Prometheus retention (then use Thanos)")
+        print("  - kps default relabel drops `container_spec_memory_limit_bytes` —")
+        print("    the script's fallback chain already routes through")
+        print("    `kube_pod_container_resource_limits{resource=\"memory\"}` instead")
+        print("  - label mismatch — your scrape may rename `pod` → `pod_name` or drop `container`.")
+        print(f"    Verify with: curl -sG '{prom.base_url}/api/v1/series' \\")
+        print("      --data-urlencode 'match[]=container_memory_working_set_bytes{namespace=\"<ns>\"}'")
+        return
+
+    print("Truly missing scrape sources:")
+    for src in truly_missing:
+        print(f"  - {src}")
+    print()
+    print("Install hints:")
+    if "kube-state-metrics deployment" in truly_missing:
+        print("  helm upgrade --install kube-state-metrics \\")
+        print("    prometheus-community/kube-state-metrics -n monitoring \\")
+        print("    --set prometheus.monitor.enabled=true")
+    if "kubelet /metrics/cadvisor scrape" in truly_missing:
+        print("  Add a ServiceMonitor scraping kubelet :10250/metrics/cadvisor — easiest")
+        print("  is to install the full kube-prometheus-stack from this repo:")
+        print("    ./install.sh")
+    if "kube-prometheus-stack recording rules" in truly_missing:
+        print("  (only an issue if the cAdvisor scrape is also missing — recording rules")
+        print("   are derived from cAdvisor metrics; the script's fallback chain means")
+        print("   either of the two is enough)")
 
 
 def render_table(rows):

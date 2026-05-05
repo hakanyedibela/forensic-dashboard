@@ -616,6 +616,7 @@ oom-test   startup-app-58f65dd8c9-bv..  startup    E - STARTUP OVERRUN         5
 | `--token TOKEN` | Bearer-Token. Standard: `oc whoami -t`, falls verfügbar. |
 | `--insecure` | TLS-Validierung überspringen (Self-signed / OpenShift-Thanos-Route). |
 | `--no-prometheus` | Prometheus komplett überspringen. Verdict sieht nur K8s-Signale (Lifetime, Restart-Count, Nachbar-OOMs); Patterns A/B/C werden unerreichbar, D und E funktionieren weiter. |
+| `--diagnose` | Probt Prometheus auf jede Metrik, die das Skript braucht, listet welche Daten zurückgeben, identifiziert fehlende Scrape-Quellen (kubelet/cAdvisor vs. kube-state-metrics), gibt Install-Hinweise aus und beendet sich. Nutzen, wenn das Verdict überall `-` zeigt oder „INDETERMINATE — Prometheus not reachable" meldet. |
 | `--json` | Strukturierte JSON-Ausgabe. Pod / Service / NetworkPolicy / etc. Raw-Objekte werden entfernt (riesig); Verdict, Target-IDs, Metriken und Event-Zusammenfassungen bleiben. |
 | `--kubectl` | Verwendet `kubectl` statt `oc`. |
 

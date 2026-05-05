@@ -168,6 +168,148 @@ class Prom:
         return self.available
 
 
+# Each entry probes a PromQL expression and attributes it to a scrape source.
+# Optional fields:
+#   bare     — bare metric name to probe if the selector returns nothing
+#              (lets us distinguish "metric family exists, 0 series with this label
+#              filter" from "metric truly missing"). Useful for {reason="OOMKilled"}
+#              probes that are empty when no container has actually OOMed recently.
+#   dropped_by_default_kps — kube-prometheus-stack's stock cAdvisor ServiceMonitor
+#              has metric_relabel_configs that drop these specific names. Showing
+#              them as "missing" misleads the user into thinking the scrape is
+#              broken; mark them so the verdict is "dropped (kps relabel) — OK,
+#              fallback handles it" instead.
+DIAGNOSTIC_METRICS = [
+    {"label": "Memory working set (cAdvisor)",
+     "query": "container_memory_working_set_bytes",
+     "source": "kubelet /metrics/cadvisor scrape"},
+    {"label": "Memory working set (recording rule)",
+     "query": "node_namespace_pod_container:container_memory_working_set_bytes",
+     "source": "kube-prometheus-stack recording rules"},
+    {"label": "Memory RSS (cAdvisor)",
+     "query": "container_memory_rss",
+     "source": "kubelet /metrics/cadvisor scrape"},
+    {"label": "Memory limit (kube-state-metrics)",
+     "query": 'kube_pod_container_resource_limits{resource="memory"}',
+     "bare":  "kube_pod_container_resource_limits",
+     "source": "kube-state-metrics deployment"},
+    {"label": "Memory limit (cAdvisor fallback)",
+     "query": "container_spec_memory_limit_bytes",
+     "source": "kubelet /metrics/cadvisor scrape",
+     "dropped_by_default_kps": True},
+    {"label": "CPU usage counter (cAdvisor)",
+     "query": "container_cpu_usage_seconds_total",
+     "source": "kubelet /metrics/cadvisor scrape"},
+    {"label": "CPU throttle counter (cAdvisor)",
+     "query": "container_cpu_cfs_throttled_seconds_total",
+     "source": "kubelet /metrics/cadvisor scrape",
+     "dropped_by_default_kps": True},
+    {"label": "Network rx (cAdvisor)",
+     "query": "container_network_receive_bytes_total",
+     "source": "kubelet /metrics/cadvisor scrape"},
+    {"label": "Network tx (cAdvisor)",
+     "query": "container_network_transmit_bytes_total",
+     "source": "kubelet /metrics/cadvisor scrape"},
+    {"label": "FS reads (cAdvisor)",
+     "query": "container_fs_reads_bytes_total",
+     "source": "kubelet /metrics/cadvisor scrape"},
+    {"label": "FS writes (cAdvisor)",
+     "query": "container_fs_writes_bytes_total",
+     "source": "kubelet /metrics/cadvisor scrape"},
+    {"label": "OOM events counter (cAdvisor)",
+     "query": "container_oom_events_total",
+     "source": "kubelet /metrics/cadvisor scrape"},
+    {"label": "Pod terminated reason (KSM)",
+     "query": 'kube_pod_container_status_terminated_reason{reason="OOMKilled"}',
+     "bare":  "kube_pod_container_status_terminated_reason",
+     "source": "kube-state-metrics deployment"},
+    {"label": "Pod last terminated reason (KSM)",
+     "query": 'kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}',
+     "bare":  "kube_pod_container_status_last_terminated_reason",
+     "source": "kube-state-metrics deployment"},
+]
+
+
+def diagnose_metrics(prom):
+    """Probe Prometheus for every metric this script depends on. Distinguishes:
+       - OK                                    — selector returns N series
+       - family present, 0 with selector       — bare metric exists but no series match the filter
+       - dropped (kps relabel) — OK            — kps' default cAdvisor relabel drops this name
+       - missing                               — neither selector nor bare returns anything
+    A scrape source is reported as 'truly missing' only when every metric it
+    provides is in the 'missing' state — a single OK or 'family present' entry
+    proves the source is up."""
+    import time as _time
+    print(f"# Probing Prometheus at {prom.base_url} for OOM-relevant metrics.\n")
+
+    width = max(len(m["query"]) for m in DIAGNOSTIC_METRICS)
+    now = _time.time()
+    rows = []
+    source_state = {}  # source -> {"any_ok": bool, "any_missing": bool}
+
+    for entry in DIAGNOSTIC_METRICS:
+        v = prom.query(f"count({entry['query']})", now)
+        bare_v = None
+        if v is None and entry.get("bare"):
+            bare_v = prom.query(f"count({entry['bare']})", now)
+
+        if v is not None and v > 0:
+            kind, status = "ok", f"OK ({int(v)} series)"
+        elif bare_v is not None and bare_v > 0:
+            kind, status = "family", f"family present ({int(bare_v)} series), 0 with selector"
+        elif entry.get("dropped_by_default_kps"):
+            kind, status = "dropped", "dropped (kps default relabel) — OK, fallback handles it"
+        else:
+            kind, status = "missing", "missing"
+
+        rows.append((entry, kind, status))
+        src = entry["source"]
+        st = source_state.setdefault(src, {"any_ok": False, "any_missing": False})
+        if kind in ("ok", "family"):
+            st["any_ok"] = True
+        if kind == "missing":
+            st["any_missing"] = True
+
+    for entry, _kind, status in rows:
+        print(f"  {entry['query']:<{width}}  {status:<58}  # {entry['label']}")
+    print()
+
+    truly_missing = sorted(
+        src for src, st in source_state.items()
+        if st["any_missing"] and not st["any_ok"]
+    )
+    if not truly_missing:
+        print("All required scrape sources are healthy.")
+        print()
+        print("If the rootcause report still shows '-' for some columns, the cause is one of:")
+        print("  - no current series match {reason=\"OOMKilled\"} (nothing has OOMed recently — normal)")
+        print("  - a couple of cAdvisor metrics dropped by kube-prometheus-stack's default relabel")
+        print("    rules (container_spec_*, container_cpu_cfs_throttled_seconds_total) — the script's")
+        print("    fallback chain already routes around these")
+        print("  - label mismatch — your scrape may rename `pod` → `pod_name` or drop `container`.")
+        print(f"    Verify with: curl -sG '{prom.base_url}/api/v1/series' \\")
+        print("      --data-urlencode 'match[]=container_memory_working_set_bytes{namespace=\"<ns>\"}'")
+        return
+
+    print("Truly missing scrape sources:")
+    for src in truly_missing:
+        print(f"  - {src}")
+    print()
+    print("Install hints (see scripts/README.md → oom-rootcause.py for more):")
+    if "kube-state-metrics deployment" in truly_missing:
+        print("  helm upgrade --install kube-state-metrics \\")
+        print("    prometheus-community/kube-state-metrics -n monitoring \\")
+        print("    --set prometheus.monitor.enabled=true")
+    if "kubelet /metrics/cadvisor scrape" in truly_missing:
+        print("  Add a ServiceMonitor scraping kubelet :10250/metrics/cadvisor — easiest")
+        print("  is to install the full kube-prometheus-stack from this repo:")
+        print("    ./install.sh")
+    if "kube-prometheus-stack recording rules" in truly_missing:
+        print("  (only an issue if the cAdvisor scrape is also missing — recording rules")
+        print("   are derived from cAdvisor metrics; the script's fallback chain means")
+        print("   either of the two is enough)")
+
+
 def auto_token():
     if CLI != "oc":
         return None
@@ -891,6 +1033,9 @@ def main():
     p.add_argument("--insecure", action="store_true", help="skip TLS verification")
     p.add_argument("--no-prometheus", action="store_true",
                    help="don't query Prometheus (verdict will be limited)")
+    p.add_argument("--diagnose", action="store_true",
+                   help="probe Prometheus for the metrics this script depends on, "
+                        "print which scrape sources are missing, and exit")
     p.add_argument("--json", action="store_true", help="emit JSON instead of text")
     p.add_argument("--kubectl", action="store_true", help="use kubectl instead of oc")
     args = p.parse_args()
@@ -899,6 +1044,18 @@ def main():
     if not shutil.which(CLI):
         sys.stderr.write(f"{CLI} not found in PATH\n")
         sys.exit(2)
+
+    if args.diagnose:
+        prom = Prom(args.prometheus_url,
+                    token=args.token or auto_token(),
+                    insecure=args.insecure)
+        if not prom.probe():
+            sys.stderr.write(
+                f"cannot reach Prometheus at {args.prometheus_url}\n"
+                "Start a port-forward, or pass --prometheus-url / --token / --insecure.\n")
+            sys.exit(3)
+        diagnose_metrics(prom)
+        return
 
     if args.all_namespaces:
         ns_args = ["-A"]
