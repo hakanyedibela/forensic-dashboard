@@ -23,6 +23,7 @@ rke2-observability/
 ├── dashboards/
 │   ├── dash-loki-logs.yaml         # Loki log overview dashboard
 │   ├── dash-oomkilled-thanos.yaml  # OOMKilled deep-dive dashboard
+│   ├── dash-oom-metrics.yaml       # pure-metrics OOMKilled view (no logs/network/storage) + top-peak summary
 │   └── dash-oom-forensics.yaml     # per-pod metrics + logs + network on one timeline
 ├── scripts/                        # CLI tools for OOM forensics (oc/kubectl-driven)
 └── samples/                        # OOM simulation apps for dashboard testing
@@ -526,6 +527,21 @@ Multiple pods OOMing on the same node → oversubscription / noisy neighbor.
 kubectl get vpa -A
 kubectl get vpa <name> -o jsonpath='{.status.recommendation}' | jq
 ```
+
+## OOM Metrics dashboard (pure metrics)
+
+`dashboards/dash-oom-metrics.yaml` is a focused, **metrics-only** view for OOMKilled investigation — no Loki logs, no network, no storage panels. Use it when you want a fast Grafana view that loads cleanly even on clusters where Loki/network metrics aren't installed.
+
+Variables (top-of-dashboard filters): `datasource`, `namespace`, `pod`, `container`. Time range is the standard Grafana time picker.
+
+Layout:
+
+- **Summary row** — OOMKills in range, distinct pods OOMKilled, containers currently >90 % limit, top peak workload (with name).
+- **Top peaked OOMKilled workloads** — table with namespace/pod/container, peak (working_set), limit, peak/limit ratio, OOM count in range; companion bargauge of top 15 by peak/limit; OOMKill events timeline by namespace.
+- **Memory** — working_set vs limit (with red OOM annotations), deriv leak detector, % of memory limit consumed, P95/P99 peak per workload.
+- **CPU & restarts** — CPU usage, CPU throttling, container restart rate.
+
+Open via `http://localhost:3000/d/oom-metrics`. The dashboard links to the Thanos deep-dive and to the forensics view for the currently selected pod.
 
 ## OOM Forensics dashboard
 
