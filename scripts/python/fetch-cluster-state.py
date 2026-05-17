@@ -102,6 +102,19 @@ def oc(*args, check=False):
             universal_newlines=True,
             check=check,
         )
+        # With check=False, subprocess.run does NOT raise on non-zero exit
+        # -- it silently returns the CompletedProcess. Without this block,
+        # any oc error (RBAC, missing API resource, wrong namespace) would
+        # look exactly like "no resources found": empty stdout, empty list
+        # downstream. Surface the stderr so it shows up in run.log.
+        if result.returncode != 0:
+            err = (result.stderr or "").strip()
+            sys.stderr.write(
+                "oc {} exited {}{}\n".format(
+                    " ".join(args), result.returncode,
+                    ": " + err if err else "",
+                )
+            )
         return result.stdout
     except FileNotFoundError:
         sys.stderr.write("error: oc is not installed or not on PATH\n")
