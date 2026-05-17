@@ -85,6 +85,15 @@ PROJECT_PREFIX = "pid-"
 # ---------------------------------------------------------------------------
 
 def oc(*args, check=False):
+    """Fuehrt einen `oc`-Befehl aus und gibt dessen stdout als String zurueck.
+
+    Beispiel: oc("get", "pods", "-n", "default") -> Roh-Ausgabe von oc get pods.
+
+    Wenn check=True ist und der Befehl mit Exit != 0 endet, wird eine
+    Exception weitergereicht. Mit check=False (Default) wird die Fehlermeldung
+    nach stderr geschrieben und ein leerer String zurueckgegeben -- das
+    macht das Aufrufen in JSON-Parsern stabiler (leerer String -> '{}').
+    """
     try:
         result = subprocess.run(
             ["oc"] + list(args),
@@ -105,6 +114,12 @@ def oc(*args, check=False):
 
 
 def oc_get_single(kind, name, ns=None):
+    """Holt eine einzelne K8s-Ressource als geparstes JSON-Dict.
+
+    Beispiel: oc_get_single("namespace", "default")
+    Liefert None, wenn die Ressource nicht existiert oder die Antwort nicht
+    parsebar ist -- der Aufrufer kann mit 'if obj is None' einfach pruefen.
+    """
     args = ["get", kind, name, "-o", "json"]
     if ns:
         args += ["-n", ns]
@@ -118,6 +133,12 @@ def oc_get_single(kind, name, ns=None):
 
 
 def oc_get_list(kind, ns):
+    """Holt eine Liste K8s-Ressourcen aus einem Namespace.
+
+    Gibt die '.items'-Liste zurueck -- also direkt das was man iterieren
+    moechte. Bei Fehler/leerer Antwort eine leere Liste, damit
+    `for obj in oc_get_list(...)` immer sicher ist.
+    """
     out = oc("get", kind, "-n", ns, "-o", "json")
     if not out.strip():
         return []
@@ -128,6 +149,12 @@ def oc_get_list(kind, ns):
 
 
 def list_pid_projects():
+    """Liefert alle OpenShift-Projekte, deren Name mit 'pid-' beginnt.
+
+    Wird verwendet, wenn der User keine expliziten --project-Flags setzt:
+    dann scannt der Snapshotter automatisch alle pid-*-Namespaces.
+    Die Liste ist alphabetisch sortiert, damit Ausgaben stabil bleiben.
+    """
     out = oc("get", "projects", "-o", "name")
     names = []
     for line in out.splitlines():
@@ -143,6 +170,12 @@ def list_pid_projects():
 # ---------------------------------------------------------------------------
 
 def detect_stage(ns):
+    """Bestimmt die Stage (ref/prod/test/phase/pnext/other) aus dem Namespace.
+
+    Konvention: pid-<id>-<app>-<STAGE>-<num>-<suffix>. Zuerst wird Position 3
+    geprueft (dort steht die Stage), dann als Fallback jedes weitere Segment.
+    Findet sich nichts: 'other'. Identische Logik wie in den bash-Loops.
+    """
     parts = ns.lower().split("-")
     if len(parts) > 3 and parts[3] in STAGE_KEYWORDS:
         return parts[3]
@@ -153,6 +186,11 @@ def detect_stage(ns):
 
 
 def parse_cpu_millis(v):
+    """Wandelt eine K8s-CPU-Angabe in Millicores (int) um.
+
+    '500m' -> 500, '0.5' -> 500, '1' -> 1000. Leerer/None/ungueltiger
+    Input liefert 0, damit Summen einfach mit '+' gebildet werden koennen.
+    """
     if v in (None, "", "<none>"):
         return 0
     s = str(v).strip()
@@ -180,6 +218,12 @@ _MEM_UNITS = {
 
 
 def parse_mem_mib(v):
+    """Wandelt eine K8s-Memory-Angabe in MiB (int) um.
+
+    Versteht binaere (Ki/Mi/Gi/Ti) und dezimale (K/M/G/T) Suffixe.
+    Ohne Suffix wird der Wert als Bytes interpretiert. Liefert 0 fuer
+    leeren/None/ungueltigen Input.
+    """
     if v in (None, "", "<none>"):
         return 0
     s = str(v).strip()
@@ -196,7 +240,11 @@ def parse_mem_mib(v):
 
 
 def parse_storage_gib(v):
-    """PVC storage in Gi (float)."""
+    """Wandelt eine PVC-Storage-Angabe in GiB (float, 2 Nachkommastellen) um.
+
+    Delegiert an parse_mem_mib und teilt durch 1024 -- so funktionieren
+    alle Suffixe automatisch (z. B. '10Gi', '5000Mi', '1Ti').
+    """
     mib = parse_mem_mib(v)
     return round(mib / 1024, 2)
 
@@ -220,6 +268,13 @@ _STRIP_ANNOTATION_PREFIXES = (
 
 
 def _clean_metadata(meta):
+    """Entfernt server-injizierte Felder aus einem metadata-Block.
+
+    Felder wie 'resourceVersion', 'uid', 'managedFields' und der
+    'last-applied-configuration'-Annotations-Eintrag werden vom Cluster
+    erzeugt und sind beim Re-Apply stoerend (oder unmoeglich neu zu
+    setzen). Wird beim Schreiben der 'desired/'-YAMLs verwendet.
+    """
     if not isinstance(meta, dict):
         return meta
     clean = {k: v for k, v in meta.items() if k not in _STRIP_METADATA_FIELDS}
@@ -236,6 +291,15 @@ def _clean_metadata(meta):
 
 
 def to_desired(obj):
+    """Reduziert ein K8s-Live-Objekt auf eine 'desired'-Form, die wiederapplybar ist.
+
+    Behaelt: apiVersion, kind, bereinigte metadata, spec, data, stringData,
+    type. Wirft alles weg, was 'status' / 'runtime' ist (z. B. assigned
+    NodePorts, readyReplicas, condition timestamps).
+
+    Ergebnis kann via `oc apply -f` zurueck in den Cluster gepushed werden
+    und ist gut zum Diffen gegen Git geeignet.
+    """
     if not isinstance(obj, dict):
         return obj
     out = {
@@ -254,6 +318,16 @@ def to_desired(obj):
 # ---------------------------------------------------------------------------
 
 def workload_dimensions(workload):
+    """Extrahiert die wichtigen Kennzahlen aus einem Deployment/StatefulSet.
+
+    Liefert:
+      replicas, readyReplicas, availableReplicas, containers (Anzahl), images,
+      cpu_req_millis, mem_req_mib, cpu_lim_millis, mem_lim_mib
+
+    Wichtig: CPU/Memory sind PRO POD summiert (alle Container zusammen),
+    NICHT pro Pod mal Replicas. Den Cluster-Footprint berechnet erst der
+    Aggregator durch Multiplikation mit replicas.
+    """
     spec = workload.get("spec") or {}
     tmpl_spec = ((spec.get("template") or {}).get("spec") or {})
     containers = tmpl_spec.get("containers") or []
@@ -287,6 +361,12 @@ def workload_dimensions(workload):
 # ---------------------------------------------------------------------------
 
 def _metric_summary(m):
+    """Verdichtet einen HPA-Metric-Eintrag auf {type, name, target}.
+
+    Eine HPA-Spec kann verschiedene Metric-Typen haben ('Resource', 'Pods',
+    'Object', 'External', 'ContainerResource'). Diese Funktion vereinheitlicht
+    die Struktur, damit der Reporter sie ueberall gleich darstellen kann.
+    """
     t = m.get("type")
     if t == "Resource":
         r = m.get("resource") or {}
@@ -301,6 +381,20 @@ def _metric_summary(m):
 
 
 def validate_hpas(hpas, workloads_by_kind):
+    """Prueft jeden HPA gegen seinen Ziel-Workload und liefert ein Findings-Dict pro HPA.
+
+    Gefundene Probleme landen in einer 'issues'-Liste pro HPA. Geprueft wird:
+      - scaleTargetRef.name nicht leer
+      - scaleTargetRef.kind ist Deployment oder StatefulSet
+      - referenziertes Workload existiert im Namespace
+      - minReplicas / maxReplicas gesetzt und min <= max
+      - mindestens eine Metric konfiguriert
+      - bei Resource-Metric: Ziel-Container muessen resources.requests haben
+        (sonst bleibt der HPA inaktiv)
+      - ScalingActive / AbleToScale = False werden als Issues uebernommen
+
+    'ok' im Ergebnis ist True genau dann, wenn issues leer ist.
+    """
     results = []
     for hpa in hpas:
         meta = hpa.get("metadata") or {}
@@ -376,6 +470,12 @@ def validate_hpas(hpas, workloads_by_kind):
 
 
 def _target_has_requests(target):
+    """True, wenn ALLE Container des Targets resources.requests gesetzt haben.
+
+    Wichtig fuer HPA-Validierung: ein Resource-Metric-HPA braucht
+    requests auf jedem Container, sonst kann er die Utilization nicht
+    berechnen und bleibt inaktiv.
+    """
     containers = (((target.get("spec") or {}).get("template") or {})
                   .get("spec") or {}).get("containers") or []
     if not containers:
@@ -388,6 +488,13 @@ def _target_has_requests(target):
 # ---------------------------------------------------------------------------
 
 def fetch_namespace(ns):
+    """Holt alle relevanten K8s-Ressourcen eines Namespaces in einem Aufruf.
+
+    Liefert ein Dict mit Listen der Ressourcen-Typen (deployments, statefulsets,
+    hpas, services, pvcs, resourcequotas, limitranges, networkpolicies) plus
+    dem Namespace-Objekt selbst. Wird einmal pro Namespace aufgerufen und
+    dient als Eingabe fuer alle weiteren Per-Namespace-Verarbeitungsschritte.
+    """
     return {
         "namespace_obj":   oc_get_single("namespace", ns),
         "deployments":     oc_get_list("deployments", ns),
@@ -402,6 +509,14 @@ def fetch_namespace(ns):
 
 
 def build_snapshot(ns, stage, raw, bindings):
+    """Verdichtet die Roh-K8s-Objekte zu einem schlanken snapshot.json-Dict.
+
+    Aus dem (potentiell sehr grossen) Rohformat von 'oc get -o json' wird
+    eine flache Darstellung gebaut: pro Ressource nur die Felder, die in
+    Reports und Aggregationen tatsaechlich gebraucht werden. Wird sowohl
+    als per-Namespace snapshot.json gespeichert als auch in das Excel-
+    Workbook eingespeist.
+    """
     ns_obj = raw["namespace_obj"] or {}
     labels = ((ns_obj.get("metadata") or {}).get("labels")) or {}
 
@@ -466,6 +581,14 @@ def build_snapshot(ns, stage, raw, bindings):
 
 
 def write_desired(desired_dir, raw):
+    """Schreibt 'desired/'-YAML-Files (wiederapplybar) pro Ressourcen-Typ.
+
+    Dateinamen sind numerisch praefixiert (00, 10, 20, ...), damit
+    `oc apply -f desired/` sie in der richtigen Reihenfolge anwendet
+    (Namespace zuerst, danach Quota/LimitRange/NetPol, danach Workloads,
+    am Ende HPAs). Leere Listen werden uebersprungen, also keine
+    leeren YAML-Files.
+    """
     desired_dir.mkdir(parents=True, exist_ok=True)
     files = [
         ("00-namespace.yaml",       [raw["namespace_obj"]] if raw["namespace_obj"] else []),
@@ -488,6 +611,18 @@ def write_desired(desired_dir, raw):
 
 
 def process_namespace(ns, stage, out_root):
+    """Komplette Per-Namespace-Pipeline: fetch -> validate -> snapshot -> write.
+
+    Schritte:
+      1. fetch_namespace() holt alle Ressourcen
+      2. validate_hpas() prueft jeden HPA -> hpa-bindings.json
+      3. build_snapshot() macht die schlanke Darstellung -> snapshot.json
+      4. write_desired() schreibt die wiederapplybaren YAMLs
+
+    Wird (im Parallel-Modus) gleichzeitig fuer mehrere Namespaces aufgerufen.
+    Liefert ein Aggregate-Dict, das main() spaeter fuer cluster-weite CSVs
+    und den Excel-Report nutzt.
+    """
     ns_dir = out_root / "by-stage" / stage / ns
     ns_dir.mkdir(parents=True, exist_ok=True)
 
@@ -519,6 +654,12 @@ def process_namespace(ns, stage, out_root):
 # ---------------------------------------------------------------------------
 
 def write_hpa_csv(path, rows):
+    """Schreibt die aggregierte _hpa-validation.csv (eine Zeile pro HPA, clusterweit).
+
+    Spalten-Reihenfolge ist fest -- so bleiben Filter und Pivots in
+    Excel stabil. 'issues' ist semikolongetrennt, damit man in der
+    Tabellen-Software danach filtern kann ('contains: not found').
+    """
     fields = [
         "stage", "namespace", "hpa", "ok",
         "targetKind", "targetName", "targetFound", "targetSpecReplicas",
@@ -534,6 +675,12 @@ def write_hpa_csv(path, rows):
 
 
 def write_dimensions_csv(path, rows):
+    """Schreibt die aggregierte _dimensions.csv (eine Zeile pro Workload).
+
+    Pro Deployment/StatefulSet eine Zeile mit den von workload_dimensions()
+    extrahierten Kennzahlen plus Stage/Namespace/Kind/Name. Eignet sich
+    fuer Capacity-Reviews und Sizing-Pivots.
+    """
     fields = [
         "stage", "namespace", "kind", "name",
         "replicas", "readyReplicas", "containers", "images",
@@ -558,11 +705,16 @@ _ROW_OK      = "E2EFDA"      # light green — clean rows
 
 
 def _parse_quota_amount(dim, val):
-    """Normalize a quota value to a comparable scalar.
+    """Normalisiert einen ResourceQuota-Wert auf eine vergleichbare Zahl.
 
-    - dimensions containing 'cpu'    → CPU millis
-    - dimensions containing 'memory' or 'storage' → MiB
-    - everything else (pods, count/*, services, ...) → plain float
+    Eine Quota hat unterschiedliche Dimensionen mit unterschiedlichen
+    Einheiten:
+      - 'requests.cpu' / 'limits.cpu'       -> Millicores
+      - 'requests.memory' / 'storage'       -> MiB
+      - 'pods', 'services', 'count/*', ...  -> Stueckzahl (float)
+
+    Anhand des Dimensions-Namens wird die richtige Einheit gewaehlt --
+    so kann 'used / hard' als Prozentsatz berechnet werden.
     """
     if val in (None, ""):
         return 0.0
@@ -578,6 +730,12 @@ def _parse_quota_amount(dim, val):
 
 
 def _style_header(ws, ncols):
+    """Stylt die erste Zeile eines Excel-Sheets als Header.
+
+    Blauer Hintergrund + weiss + bold, plus 'freeze pane' (Header bleibt
+    beim Scrollen sichtbar) und ein Auto-Filter auf der ganzen
+    Header-Zeile. Wird auf jedes Sheet im Workbook angewendet.
+    """
     fill = PatternFill("solid", fgColor=_HEADER_FILL)
     font = Font(bold=True, color=_HEADER_FONT)
     align = Alignment(vertical="center")
@@ -591,6 +749,12 @@ def _style_header(ws, ncols):
 
 
 def _autosize(ws, max_width=60):
+    """Setzt die Spaltenbreite jedes Excel-Sheets auf den laengsten Inhalt.
+
+    Begrenzt auf max_width (Default 60 Zeichen), damit eine lange
+    Issue-Liste die Tabelle nicht ungenutzt breit macht. Mindestbreite
+    10, damit die Header lesbar bleiben.
+    """
     for col_cells in ws.columns:
         letter = col_cells[0].column_letter
         width = 0
@@ -605,12 +769,24 @@ def _autosize(ws, max_width=60):
 
 
 def _fill_row(ws, row_idx, ncols, color):
+    """Faerbt eine komplette Zeile in einem Excel-Sheet ein.
+
+    Wird fuer 'conditional formatting' verwendet: rote Zeile bei HPA-Issue
+    oder PVC unbound, Amber bei Quota 80-95%, Gruen bei sauberen HPAs.
+    """
     fill = PatternFill("solid", fgColor=color)
     for c in range(1, ncols + 1):
         ws.cell(row=row_idx, column=c).fill = fill
 
 
 def _write_rows(ws, headers, rows, row_colors=None):
+    """Schreibt Header + Datenzeilen in ein Excel-Sheet und stylt es.
+
+    Wird von jeder _build_*_sheet()-Funktion verwendet, damit das Layout
+    (Header-Styling, Auto-Size, optionale Zeilenfarbe) ueberall gleich
+    ist. row_colors ist eine Liste in derselben Reihenfolge wie rows;
+    None pro Zeile bedeutet 'nicht einfaerben'.
+    """
     ws.append(headers)
     for i, row in enumerate(rows):
         ws.append(row)
@@ -621,6 +797,15 @@ def _write_rows(ws, headers, rows, row_colors=None):
 
 
 def _format_ports(ports):
+    """Formatiert eine Service-ports-Liste als kompakten String.
+
+    Beispiele:
+      [{port:80, protocol:'TCP'}]                   -> '80/TCP'
+      [{name:'http', port:80, targetPort:8080}]     -> 'http:80/TCP->8080'
+
+    Wird im Excel-Services-Sheet verwendet, damit alle Ports in einer
+    Zelle stehen.
+    """
     out = []
     for p in ports or []:
         name = p.get("name") or ""
@@ -635,6 +820,13 @@ def _format_ports(ports):
 
 
 def _build_overview_sheet(wb, overview):
+    """Baut das erste Sheet 'Overview' im Excel-Workbook.
+
+    Enthaelt Metadaten (Generierungszeit, Cluster-URL, Namespace-Anzahl)
+    und eine Per-Stage-Zusammenfassung (namespaces, deployments,
+    statefulsets, hpas, hpaIssues, pvcs). Rot eingefaerbt fuer Stages
+    mit HPA-Issues.
+    """
     ws = wb.create_sheet("Overview")
     ws["A1"] = "Cluster forensic snapshot"
     ws["A1"].font = Font(bold=True, size=14)
@@ -680,6 +872,12 @@ def _build_overview_sheet(wb, overview):
 
 
 def _build_namespaces_sheet(wb, results):
+    """Sheet 'Namespaces': eine Zeile pro Namespace mit Counts pro Ressource.
+
+    Spalten: stage, namespace, env, deployments, statefulsets, hpas,
+    hpaIssues, pvcs, services, resourceQuotas, limitRanges,
+    networkPolicies. Rot, wenn der Namespace HPA-Issues hat.
+    """
     ws = wb.create_sheet("Namespaces")
     headers = ["stage", "namespace", "env",
                "deployments", "statefulsets", "hpas", "hpaIssues",
@@ -703,6 +901,12 @@ def _build_namespaces_sheet(wb, results):
 
 
 def _build_hpa_sheet(wb, results):
+    """Sheet 'HPAs': eine Zeile pro HorizontalPodAutoscaler.
+
+    Die fehlerhaften HPAs werden NACH OBEN sortiert (False vor True),
+    damit man die Probleme zuerst sieht. Rot bei issues, Gruen bei
+    sauberen HPAs.
+    """
     ws = wb.create_sheet("HPAs")
     headers = ["stage", "namespace", "hpa", "ok",
                "targetKind", "targetName", "targetFound",
@@ -732,6 +936,12 @@ def _build_hpa_sheet(wb, results):
 
 
 def _build_quotas_sheet(wb, results):
+    """Sheet 'ResourceQuotas': eine Zeile pro Quota-Dimension.
+
+    used%-Spalte zeigt die Auslastung. Rot bei >=95%, Amber bei >=80%,
+    sonst neutral. Hilft beim Aufspueren von Namespaces, die kurz vorm
+    Quota-Limit stehen.
+    """
     ws = wb.create_sheet("ResourceQuotas")
     headers = ["stage", "namespace", "quota", "dimension",
                "hard", "used", "used %"]
@@ -765,6 +975,12 @@ def _build_quotas_sheet(wb, results):
 
 
 def _build_limitranges_sheet(wb, results):
+    """Sheet 'LimitRanges': eine Zeile pro LimitRange-Constraint x Ressource.
+
+    Zeigt die Default/Min/Max-Werte fuer cpu, memory, ... pro LimitRange.
+    Hilfreich um zu pruefen, ob ein Namespace ueberhaupt Default-Limits
+    setzt.
+    """
     ws = wb.create_sheet("LimitRanges")
     headers = ["stage", "namespace", "limitRange", "type", "resource",
                "min", "max", "default", "defaultRequest",
@@ -792,6 +1008,13 @@ def _build_limitranges_sheet(wb, results):
 
 
 def _build_workloads_sheet(wb, results):
+    """Sheet 'Workloads': eine Zeile pro Deployment/StatefulSet.
+
+    Zeigt Replicas, Ready, Container-Anzahl, Images und CPU/Mem
+    Requests+Limits. Amber, wenn ein Workload weder cpu_req noch
+    mem_req gesetzt hat (hat Folgen fuer HPAs und Scheduler-
+    Reservierungen).
+    """
     ws = wb.create_sheet("Workloads")
     headers = ["stage", "namespace", "kind", "name",
                "replicas", "readyReplicas", "availableReplicas",
@@ -823,6 +1046,11 @@ def _build_workloads_sheet(wb, results):
 
 
 def _build_pvcs_sheet(wb, results):
+    """Sheet 'PVCs': eine Zeile pro PersistentVolumeClaim.
+
+    Rot, wenn der PVC nicht 'Bound' ist (z. B. 'Pending' wegen falscher
+    StorageClass). Storage-Groesse in GiB.
+    """
     ws = wb.create_sheet("PVCs")
     headers = ["stage", "namespace", "pvc", "status",
                "storage_gib", "storageClass", "accessModes"]
@@ -842,6 +1070,11 @@ def _build_pvcs_sheet(wb, results):
 
 
 def _build_services_sheet(wb, results):
+    """Sheet 'Services': eine Zeile pro Service.
+
+    Zeigt type (ClusterIP/NodePort/LoadBalancer/Headless), clusterIP und
+    eine kompakte Ports-Darstellung (via _format_ports).
+    """
     ws = wb.create_sheet("Services")
     headers = ["stage", "namespace", "service", "type",
                "clusterIP", "ports"]
@@ -857,6 +1090,16 @@ def _build_services_sheet(wb, results):
 
 
 def write_excel(path, results, overview):
+    """Baut das _cluster-state.xlsx-Workbook mit allen Sheets.
+
+    Sheets: Overview, Namespaces, HPAs, ResourceQuotas, LimitRanges,
+    Workloads, PVCs, Services. Jeder Tab hat formatierte Header
+    (Auto-Filter, Freeze-Pane) und farbliche Markierung der Probleme.
+
+    Wenn openpyxl nicht installiert ist, wird eine Warnung nach stderr
+    geschrieben und das Workbook ausgelassen (kein Abbruch -- CSV und
+    JSON-Reports werden trotzdem geschrieben).
+    """
     if not _HAS_OPENPYXL:
         sys.stderr.write(
             "warning: openpyxl not installed — skipping .xlsx export "
@@ -882,6 +1125,19 @@ def write_excel(path, results, overview):
 # ---------------------------------------------------------------------------
 
 def main():
+    """Einstiegspunkt des Snapshotters.
+
+    Parst CLI-Argumente, ermittelt die zu verarbeitenden Namespaces
+    (entweder die per --project gelistet wurden, oder alle pid-*), und
+    fuehrt process_namespace() parallel via ThreadPoolExecutor aus.
+
+    Am Ende werden die aggregierten Files (_hpa-validation.csv,
+    _dimensions.csv, _overview.json, _cluster-state.xlsx) geschrieben.
+
+    Rueckgabe: 0 bei Erfolg (oder wenn keine Projekte gefunden wurden).
+    Nicht-fatale Fehler einzelner Namespaces werden auf stderr gemeldet
+    und der Lauf geht weiter.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--output-dir", default=None,

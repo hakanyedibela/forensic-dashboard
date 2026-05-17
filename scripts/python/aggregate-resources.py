@@ -47,6 +47,16 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 def parse_cpu_millis(v):
+    """Wandelt eine Kubernetes-CPU-Angabe in Millicores (int) um.
+
+    Akzeptiert beide Schreibweisen:
+      "500m"     -> 500
+      "0.5"      -> 500
+      "1"        -> 1000
+
+    Liefert 0 fuer leere/None/ungueltige Werte. So koennen Summen ueber
+    viele Container/Pods einfach mit '+' gebildet werden, ohne Sonderfaelle.
+    """
     if v in (None, "", "<none>"):
         return 0
     s = str(v).strip()
@@ -74,6 +84,20 @@ _MEM_UNITS = {
 
 
 def parse_mem_mib(v):
+    """Wandelt eine Kubernetes-Memory-Angabe in MiB (int) um.
+
+    Versteht binaere Suffixe (Ki/Mi/Gi/Ti) und dezimale (K/M/G/T)
+    sowie die Bytes-only-Schreibweise ohne Suffix. Alles wird intern auf
+    MiB normalisiert, damit summiert werden kann.
+
+    Beispiele:
+      "512Mi" -> 512
+      "1Gi"   -> 1024
+      "500M"  -> 476 (1 MB = 10^6 Byte, 1 MiB = 2^20 Byte)
+      "100"   -> 0   (100 Byte sind weniger als 1 MiB)
+
+    Liefert 0 bei leerem/None/ungueltigem Input.
+    """
     if v in (None, "", "<none>"):
         return 0
     s = str(v).strip()
@@ -90,6 +114,18 @@ def parse_mem_mib(v):
 
 
 def quota_amount(dim, val):
+    """Normalisiert einen ResourceQuota-Wert auf eine vergleichbare Zahl.
+
+    Eine Quota hat unterschiedliche Dimensionen mit unterschiedlichen
+    Einheiten:
+      - 'requests.cpu' / 'limits.cpu' -> Millicores
+      - 'requests.memory' / 'storage' -> MiB
+      - 'pods', 'services', 'count/*' -> Stueckzahl (float)
+
+    Diese Funktion erkennt anhand des Namens (`dim`), welche Einheit
+    gemeint ist, und liefert immer einen float zurueck -- so kann
+    'used / hard' als Prozentsatz berechnet werden.
+    """
     if val in (None, ""):
         return 0.0
     d = dim.lower()
@@ -108,6 +144,14 @@ def quota_amount(dim, val):
 # ---------------------------------------------------------------------------
 
 def fmt_cpu(millis):
+    """Formatiert CPU in Millicores menschenfreundlich.
+
+    < 1000 Millicores: '200m'
+    >= 1000:           '1.5' oder '2' (Cores, ohne 'm')
+
+    Wird in der Tabellen-Ausgabe verwendet, damit grosse Werte nicht
+    'kilo-millicores' wirken (z. B. '4000m' lieber als '4').
+    """
     if millis is None:
         return "-"
     if millis >= 1000:
@@ -119,6 +163,13 @@ def fmt_cpu(millis):
 
 
 def fmt_mem(mib):
+    """Formatiert Memory in MiB menschenfreundlich.
+
+    < 1024 MiB: '512Mi'
+    >= 1024:    '1.5Gi' oder '2Gi'
+
+    Dieselbe Idee wie fmt_cpu: ab GiB-Bereich auf Gi umsteigen.
+    """
     if mib is None:
         return "-"
     if mib >= 1024:
@@ -130,6 +181,11 @@ def fmt_mem(mib):
 
 
 def fmt_storage(gib):
+    """Formatiert PVC-Storage in GiB.
+
+    0 wird als '0' angezeigt (statt '0Gi'), damit leere Namespaces in
+    der Tabelle ruhiger wirken.
+    """
     if gib is None:
         return "-"
     if gib == 0:
@@ -140,6 +196,10 @@ def fmt_storage(gib):
 
 
 def fmt_pct(pct):
+    """Formatiert einen Prozentsatz ohne Nachkommastellen: '85%'.
+
+    Liefert '-' bei None (z. B. wenn keine Quota existiert).
+    """
     if pct is None:
         return "-"
     return "{:.0f}%".format(pct)
@@ -150,6 +210,22 @@ def fmt_pct(pct):
 # ---------------------------------------------------------------------------
 
 def rollup_namespace(snap):
+    """Aggregiert einen snapshot.json zu einer Zeile fuer die Resources-Uebersicht.
+
+    Berechnet pro Namespace:
+      pods           Summe der replicas ueber alle Deployments+StatefulSets
+      cpu_req/lim    Summe (replicas * container_request_or_limit) -- das
+                     ist der tatsaechliche Cluster-Footprint, nicht der
+                     Per-Pod-Wert.
+      mem_req/lim    Dasselbe fuer Memory in MiB
+      storage_gib    Summe ueber alle PVC-Groessen
+      qmax_pct       Hoechster used/hard-Anteil ueber alle Quota-Dimensionen
+                     (zeigt, wie nah der Namespace am Quota-Limit ist)
+      counts         Anzahl PVCs, Quotas, LimitRanges, Services, NetPols
+
+    Zurueckgabe: ein dict mit allen Spalten, die der Textreport und die
+    CSV brauchen.
+    """
     deployments = snap.get("deployments") or []
     statefulsets = snap.get("statefulsets") or []
     pvcs = snap.get("pvcs") or []
@@ -210,9 +286,21 @@ def rollup_namespace(snap):
 # ---------------------------------------------------------------------------
 
 def find_snapshots(root):
-    """Find one snapshot.json per namespace, handling the loop's
-    double-nesting by deduping on (stage, namespace) and preferring the
-    deepest match (which is the one Python actually wrote)."""
+    """Sammelt alle snapshot.json-Dateien unter <root>.
+
+    Der bash-Loop legt die Snapshots im verschachtelten Pfad
+    'by-stage/<stage>/<ns>/by-stage/<stage>/<ns>/snapshot.json' ab
+    (Layout-Detail von fetch-cluster-state.py + dem Loop-Wrapper).
+    Damit nicht versehentlich dieselbe Datei doppelt gezaehlt wird,
+    wird auf (stage, namespace) dedupliziert.
+
+    Bei mehreren Treffern fuer denselben Namespace wird der mit dem
+    tiefsten Pfad bevorzugt -- das ist der, den Python tatsaechlich
+    geschrieben hat. Defensiv: in der Praxis liefert die Suche meistens
+    nur einen Treffer pro Namespace.
+
+    Rueckgabe: Liste von Snapshot-Dicts (geparsed aus JSON).
+    """
     found = {}
     for path in sorted(root.rglob("snapshot.json")):
         try:
@@ -250,6 +338,13 @@ _CSV_FIELDS = [
 
 
 def write_csv(path, rows):
+    """Schreibt eine Zeile pro Namespace mit Roh-Zahlen in eine CSV.
+
+    Im Unterschied zur Textausgabe werden hier KEINE Einheiten formatiert:
+    CPU bleibt in Millicores, Memory in MiB, Storage in GiB. So kann das
+    File direkt in Excel/Google Sheets gepivoted werden, ohne erst Strings
+    wie '1.5Gi' parsen zu muessen.
+    """
     with path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
         w.writeheader()
@@ -289,6 +384,12 @@ _HEADERS = ("STAGE", "NAMESPACE", "PODS", "WL",
 
 
 def render_row(r):
+    """Formatiert ein Namespace-Dict (aus rollup_namespace) als Tabellen-Zeile.
+
+    Verwendet _HEAD_FMT mit festen Spaltenbreiten, damit Header und
+    Daten sauber untereinander stehen. Einheiten kommen ueber die
+    fmt_*-Helper.
+    """
     return _HEAD_FMT.format(
         r["stage"], r["namespace"],
         r["pods"],
@@ -308,8 +409,15 @@ def render_row(r):
 
 
 def render_stage_totals(rows):
-    """Per-stage aggregation rows (slightly different formatter -- no
-    namespace column, no QMAX%, with a NS count instead)."""
+    """Summiert pro Stage und liefert den Text-Block fuer 'Per-stage totals'.
+
+    Gleiche Spalten wie die Hauptzeile, aber:
+      - keine NAMESPACE-Spalte (stattdessen 'NS' = Anzahl Namespaces)
+      - kein QMAX% (Quota-Maximum laesst sich ueber mehrere Namespaces
+        nicht sinnvoll summieren)
+
+    Sortiert nach Stage-Name, damit Diffs zwischen zwei Runs stabil sind.
+    """
     fmt = ("{:<8} {:>4} {:>4} {:>5} "
            "{:>8} {:>8} {:>8} {:>8} "
            "{:>4} {:>8} {:>6} {:>3} "
@@ -360,6 +468,16 @@ def render_stage_totals(rows):
 
 
 def write_text(path, rows, input_dir):
+    """Schreibt die menschenlesbare _resources-overview.txt.
+
+    Aufbau:
+      - Kopf (Quelle, Anzahl Namespaces, Legende fuer Einheiten/Spalten)
+      - Tabelle pro Namespace (sortiert nach stage, dann namespace)
+      - Per-Stage-Rollup unten
+
+    Sortierung sorgt fuer stabile Outputs -- nuetzlich, wenn man zwei
+    Runs gegeneinander diffen will.
+    """
     rows_sorted = sorted(rows, key=lambda r: (r["stage"], r["namespace"]))
     header = _HEAD_FMT.format(*_HEADERS)
     sep = "-" * len(header)
@@ -393,6 +511,19 @@ def write_text(path, rows, input_dir):
 # ---------------------------------------------------------------------------
 
 def main():
+    """Einstiegspunkt des Aggregators.
+
+    Liest --input-dir, ruft find_snapshots() + rollup_namespace() pro
+    Namespace auf und schreibt zwei Dateien an den Root des Ordners:
+
+      _resources-overview.txt  menschenlesbare Tabelle + Stage-Totals
+      _resources-overview.csv  Rohwerte (Millicores, MiB, GiB) zum Pivoten
+
+    Rueckgabewerte:
+      0  alles geschrieben
+      1  keine Snapshots gefunden
+      2  --input-dir existiert nicht
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input-dir", required=True,

@@ -136,6 +136,19 @@ fi
 # Helpers (same stage detection as fetch-cluster-state-loop.sh)
 # ---------------------------------------------------------------------------
 
+# detect_stage NAMESPACE
+#
+# Ermittelt die Stage aus dem Namespace-Namen -- identische Logik wie in
+# fetch-cluster-state-loop.sh. Konvention:
+#
+#   pid-<id>-<app>-<STAGE>-<num>-<suffix>
+#
+# Erst wird Position 3 geprueft, dann als Fallback jedes Segment, sonst
+# "other". Wird dupliziert (statt importiert), damit beide Loops
+# eigenstaendig laufen.
+#
+# Parameter: $1 = Namespace-Name
+# Ausgabe:   Stage-Name auf stdout.
 detect_stage() {
     local ns="$1"
     local lower="${ns,,}"
@@ -154,8 +167,17 @@ detect_stage() {
     echo "other"
 }
 
+# count_ooms_in_json JSON_PATH
+#
+# Zaehlt, wie viele OOM-Findings in der uebergebenen JSON-Datei stehen.
+# fetch-cluster-oom.py schreibt eine Liste von Reports (eines pro
+# OOMKilled-Container). Ein leeres File bedeutet "keine OOMs". Der
+# Python-Einzeiler ist absichtlich tolerant: jede Exception (leere
+# Datei, ungueltiges JSON, kein File) liefert 0.
+#
+# Parameter: $1 = Pfad zur report.json
+# Ausgabe:   Anzahl OOM-Findings als Integer auf stdout.
 count_ooms_in_json() {
-    # Robust to invalid / empty JSON: returns 0 then.
     python3 - "$1" <<'PY' 2>/dev/null || echo 0
 import json, sys
 try:

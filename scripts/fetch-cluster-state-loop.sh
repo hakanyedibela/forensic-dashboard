@@ -91,6 +91,21 @@ fi
 # Helpers
 # ---------------------------------------------------------------------------
 
+# detect_stage NAMESPACE
+#
+# Ermittelt die "Stage" (ref / prod / test / phase / pnext / other) aus
+# dem Namespace-Namen. Konvention im Projekt:
+#
+#   pid-<id>-<app>-<STAGE>-<num>-<suffix>
+#
+# Zuerst wird das 4. Dash-Segment (Index 3) geprueft -- das ist die
+# kanonische Position der Stage. Wird dort kein bekanntes Keyword
+# gefunden, wird jedes weitere Segment geprueft (Fallback fuer
+# Namespaces, die sich nicht ganz an die Konvention halten). Findet sich
+# nichts, gilt der Namespace als "other".
+#
+# Parameter: $1 = vollstaendiger Namespace-Name (z. B. pid-1000-akte-ref-100-x).
+# Ausgabe:   der Stage-Name (lowercase) auf stdout.
 detect_stage() {
     local ns="$1"
     local lower="${ns,,}"

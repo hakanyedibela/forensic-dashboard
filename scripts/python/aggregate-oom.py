@@ -34,8 +34,22 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 def discover(root):
-    """Yield (stage, namespace, report_path, findings_list) for every
-    namespace report.json under <root>/by-stage/<stage>/<ns>/."""
+    """Findet alle Per-Namespace-Reports unter <root>/by-stage/<stage>/<ns>/.
+
+    fetch-cluster-oom-loop.sh legt fuer jeden Namespace mit OOMKills eine
+    report.json an. Diese Funktion durchlaeuft die Verzeichnis-Struktur
+    und gibt pro Namespace ein Tupel zurueck:
+
+        (stage, namespace, path-to-report.json, findings_list)
+
+    findings_list ist eine Liste von Dicts (so wie fetch-cluster-oom.py
+    sie via --json schreibt) -- leer, wenn die Datei leer oder defekt
+    ist. So koennen weitere Schritte einfach iterieren, ohne sich um
+    fehlende Dateien zu kuemmern.
+
+    Stage wird hier aus dem Pfad gelesen (nicht aus dem Namespace-Namen),
+    weil der Loop die Stage bereits in die Ordner-Struktur kodiert hat.
+    """
     base = root / "by-stage"
     if not base.is_dir():
         return
@@ -75,7 +89,16 @@ _PATTERN_PREFIX = re.compile(r"^([A-Z?])\s*-")
 
 
 def short_pattern(p):
-    """'A - MEMORY LEAK' -> 'A'. 'E - STARTUP OVERRUN' -> 'E'. '? - ...' -> '?'."""
+    """Kuerzt einen Verdict-String auf seinen Pattern-Buchstaben.
+
+    Beispiele:
+        'A - MEMORY LEAK'    -> 'A'
+        'E - STARTUP OVERRUN'-> 'E'
+        '? - INDETERMINATE'  -> '?'
+
+    Wird gebraucht, um in der Uebersicht die Patterns kompakt
+    aufzuzaehlen (z. B. 'A x2, C x1').
+    """
     if not p:
         return "?"
     m = _PATTERN_PREFIX.match(p)
@@ -83,7 +106,13 @@ def short_pattern(p):
 
 
 def join_patterns(patterns):
-    """['A', 'C', 'C'] -> 'A x1, C x2'."""
+    """Zaehlt eine Liste von Pattern-Kuerzeln und formatiert sie kompakt.
+
+    Beispiel: ['A', 'C', 'C']  ->  'A x1, C x2'
+
+    Sortiert alphabetisch, damit derselbe Input immer denselben Output
+    erzeugt (wichtig fuer Diff-Vergleiche und stabile Reports).
+    """
     if not patterns:
         return "-"
     c = Counter(patterns)
@@ -91,6 +120,12 @@ def join_patterns(patterns):
 
 
 def parse_iso(ts):
+    """Parst einen ISO-8601-Zeitstempel zu einem timezone-bewussten datetime.
+
+    Akzeptiert sowohl '...Z' (UTC-Zulu) als auch '+02:00'-Suffixe. Microsekunden
+    sind optional. Liefert None bei leerem oder unparsbarem Input -- so kann der
+    Aufrufer die Pruefung leicht mit 'if not when' machen.
+    """
     if not ts:
         return None
     s = ts.strip()
@@ -107,6 +142,16 @@ def parse_iso(ts):
 
 
 def age(ts):
+    """Formatiert das Alter eines Zeitstempels als kompakten String.
+
+    Beispiele:
+        '45s'  (Sekunden)
+        '12m'  (Minuten)
+        '3h'   (Stunden)
+        '2d'   (Tage)
+
+    Praktisch fuer die CSV-Spalte 'age' im Findings-Report.
+    """
     when = parse_iso(ts)
     if not when:
         return "?"
@@ -135,6 +180,12 @@ _FINDINGS_FIELDS = [
 
 
 def write_findings_csv(path, rows):
+    """Schreibt eine Zeile pro OOMKilled-Container in eine CSV-Datei.
+
+    Spalten siehe _FINDINGS_FIELDS oben -- diese Reihenfolge wird strikt
+    eingehalten, damit Spreadsheet-Filter und Pivot-Tabellen stabil
+    bleiben.
+    """
     with path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=_FINDINGS_FIELDS)
         w.writeheader()
@@ -147,6 +198,16 @@ _OVR_FMT = "{:<8} {:<40} {:<8} {:>5}  {}"
 
 
 def render_overview(per_ns_rows, root, prom_args_hint=None):
+    """Baut den Text-Inhalt fuer _oom-overview.txt zusammen.
+
+    Aufbau:
+      - Kopf mit Quelle, Anzahl Namespaces, kurzer Legende
+      - Tabelle pro Namespace (STAGE / NAMESPACE / STATUS / OOMS / PATTERNS)
+      - Per-Stage-Rollup am Ende (ein Block pro Stage mit Summen)
+
+    Wird nur aufgerufen, wenn ueberhaupt OOMs gefunden wurden; der Aufrufer
+    schreibt das Ergebnis selbst in die Datei.
+    """
     header = _OVR_FMT.format(*_OVR_HEADERS)
     sep = "-" * max(len(header), 78)
 
@@ -200,6 +261,20 @@ def render_overview(per_ns_rows, root, prom_args_hint=None):
 # ---------------------------------------------------------------------------
 
 def main():
+    """Einstiegspunkt des Aggregators.
+
+    Liest den per --input-dir uebergebenen Reportordner, sammelt alle
+    Per-Namespace-Findings und schreibt zwei Dateien an den Root des
+    Ordners:
+
+      _oom-overview.txt    menschenlesbare Uebersicht
+      _oom-findings.csv    eine Zeile pro OOMKilled-Container
+
+    Rueckgabewerte:
+      0  alles geschrieben
+      1  keine Reports gefunden
+      2  --input-dir existiert nicht
+    """
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)

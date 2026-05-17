@@ -78,6 +78,16 @@ echo
 echo "########################################################"
 echo "# Done. Combined report at: ${REPORT_DIR}"
 echo "#"
+# maybe LABEL PATH
+#
+# Hilfs-Funktion fuer das Schluss-Echo: gibt eine formatierte Zeile mit
+# LABEL und PATH aus, aber nur wenn die Datei unter PATH tatsaechlich
+# existiert. So tauchen im Abschluss-Block nur Pfade auf, die wirklich
+# geschrieben wurden -- z. B. fehlt _oom-overview.txt, wenn der Cluster
+# keine OOMKills hatte.
+#
+# Parameter: $1 = Label-Text, $2 = absoluter/relativer Pfad
+# Ausgabe:   eine "# <label>  <path>"-Zeile auf stdout, oder nichts.
 maybe() {
     local label="$1" path="$2"
     if [[ -f "${path}" ]]; then

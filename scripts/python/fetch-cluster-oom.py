@@ -19,6 +19,12 @@ CLI = "oc"
 # ---------------------------------------------------------------- subprocess
 
 def _exec(args, check):
+    """Low-Level-Wrapper um subprocess.run([CLI] + args).
+
+    Faengt stdout/stderr ein und gibt das CompletedProcess-Objekt zurueck.
+    Wenn check=True und der Befehl mit Exit != 0 endet, wird stderr
+    nach sys.stderr geschrieben und sys.exit(rc) aufgerufen.
+    """
     proc = subprocess.run([CLI, *args],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           universal_newlines=True)
@@ -29,10 +35,21 @@ def _exec(args, check):
 
 
 def run(*args, check=True):
+    """Komfort-Wrapper: fuehrt `oc/kubectl ARGS...` aus und liefert stdout als String.
+
+    Beispiel: run("get", "pods", "-n", "default")
+    Default check=True -- Fehler beenden das Programm.
+    """
     return _exec(list(args), check).stdout
 
 
 def get_json(*args):
+    """Wie run(), aber parst stdout als JSON und ist absichtlich tolerant.
+
+    Liefert {"items": []}, wenn der Befehl nichts ausgibt oder das JSON
+    nicht parsebar ist. So koennen aufrufende Loops mit
+    `get_json(...).get("items", [])` immer arbeiten, ohne Sonderfaelle.
+    """
     raw = run(*args, check=False)
     if not raw.strip():
         return {"items": []}
@@ -43,6 +60,13 @@ def get_json(*args):
 
 
 def current_namespace():
+    """Ermittelt den aktuellen Default-Namespace.
+
+    Bei `oc` ueber `oc project -q`. Bei kubectl ueber den kubeconfig-
+    Context. Faellt zurueck auf 'default', wenn nichts gefunden wird.
+    Wird genutzt, wenn der User weder --namespace noch --all-namespaces
+    angegeben hat.
+    """
     if CLI == "oc":
         out = subprocess.run([CLI, "project", "-q"],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -59,6 +83,11 @@ def current_namespace():
 # ------------------------------------------------------------ misc helpers
 
 def parse_iso(ts):
+    """Parst einen ISO-8601-Zeitstempel zu einem timezone-bewussten datetime.
+
+    Akzeptiert '...Z' (UTC-Zulu) und '+02:00'-Suffixe. Microsekunden
+    optional. None bei leerem/unparsbarem Input.
+    """
     if not ts:
         return None
     s = ts.strip()
@@ -75,6 +104,10 @@ def parse_iso(ts):
 
 
 def fmt_age(ts):
+    """Formatiert das Alter eines Zeitstempels kompakt: '45s', '12m', '3h', '2d'.
+
+    '?' bei leerem/unparsbarem Input. Im Report angezeigt als 'X ago'.
+    """
     when = parse_iso(ts)
     if not when:
         return "?"
@@ -89,6 +122,11 @@ def fmt_age(ts):
 
 
 def parse_mem(s):
+    """Wandelt eine Memory-Angabe in Bytes (int) um.
+
+    Versteht binaere (Ki/Mi/Gi/Ti) und dezimale (K/M/G/T) Suffixe sowie
+    Zahlen ohne Suffix (= Bytes). None bei ungueltigem/None Input.
+    """
     if s is None:
         return None
     if isinstance(s, (int, float)):
@@ -108,6 +146,11 @@ def parse_mem(s):
 
 
 def fmt_bytes(n):
+    """Formatiert Bytes als kurze Einheit: '1.5Mi', '512Ki', '2.0Gi', '-'.
+
+    Schreitet stufenweise B -> Ki -> Mi -> Gi -> Ti -> Pi voran, bis der
+    Wert < 1024 ist. Eine Nachkommastelle.
+    """
     if n is None:
         return "-"
     v = float(n)
@@ -119,12 +162,24 @@ def fmt_bytes(n):
 
 
 def fmt_rate_bps(n):
+    """Formatiert eine Byte-Rate als '1.5Mi/s' (haengt '/s' an fmt_bytes)."""
     return "-" if n is None else f"{fmt_bytes(n)}/s"
 
 
 # ------------------------------------------------------------ Prometheus
 
 class Prom:
+    """Minimaler Prometheus-HTTP-Client fuer den Snapshot-Zeitpunkt-Query.
+
+    Wir wollen pro OOM-Event einen Wert zu einem bestimmten Zeitstempel --
+    deshalb reicht 'instant query' (api/v1/query?time=...) statt
+    Range-Queries. Token-Authentifizierung wird unterstuetzt (z. B.
+    OpenShift `oc whoami -t`), TLS-Pruefung kann fuer Selfsigned-
+    Cluster mit insecure=True deaktiviert werden.
+
+    Nicht verfuegbar (probe() == False) -> der Caller nutzt nur die
+    K8s-Daten und verzichtet auf Metric-basierte Verdicts.
+    """
     def __init__(self, base_url, token=None, insecure=False):
         self.base_url = base_url.rstrip("/")
         self.token = token
@@ -135,6 +190,11 @@ class Prom:
         self.available = False
 
     def _request(self, path):
+        """Sendet GET an base_url + path und liefert das JSON zurueck.
+
+        Setzt einen Bearer-Token-Header, wenn token gesetzt ist. Verwendet
+        den (ggf. unsicheren) SSL-Context aus __init__.
+        """
         req = urllib.request.Request(f"{self.base_url}{path}")
         if self.token:
             req.add_header("Authorization", f"Bearer {self.token}")
@@ -142,6 +202,13 @@ class Prom:
             return json.load(r)
 
     def query(self, expr, ts):
+        """Fuehrt eine PromQL-instant-query zum Zeitpunkt ts (Unix-Sekunden) aus.
+
+        Liefert nur den ERSTEN Skalar-Wert des ersten Result-Eintrags --
+        praktisch fuer einzeilige Werte wie `max(...)` oder `rate(...)`.
+        None bei Fehler oder leerem Ergebnis, damit der Caller einfach
+        defaults setzen kann.
+        """
         try:
             payload = self._request(
                 "/api/v1/query?" +
@@ -159,6 +226,12 @@ class Prom:
             return None
 
     def probe(self):
+        """Pingt Prometheus mit der Trivialquery `1`.
+
+        Setzt self.available True/False und gibt denselben Wert zurueck.
+        Wird einmal beim Start aufgerufen -- spaetere query()-Aufrufe
+        koennen schnell mit `if not prom.available: return None` aussteigen.
+        """
         try:
             payload = self._request(
                 "/api/v1/query?" + urllib.parse.urlencode({"query": "1"}))
@@ -231,14 +304,26 @@ DIAGNOSTIC_METRICS = [
 
 
 def diagnose_metrics(prom):
-    """Probe Prometheus for every metric this script depends on. Distinguishes:
-       - OK                                    — selector returns N series
-       - family present, 0 with selector       — bare metric exists but no series match the filter
-       - dropped (kps relabel) — OK            — kps' default cAdvisor relabel drops this name
-       - missing                               — neither selector nor bare returns anything
-    A scrape source is reported as 'truly missing' only when every metric it
-    provides is in the 'missing' state — a single OK or 'family present' entry
-    proves the source is up."""
+    """Diagnose-Modus: prueft, ob alle benoetigten Prometheus-Metriken erreichbar sind.
+
+    Fuer jeden Eintrag aus DIAGNOSTIC_METRICS wird `count(<expr>)` ausgefuehrt
+    und in eine von vier Kategorien einsortiert:
+      - OK                       Selector liefert N Serien
+      - family present           Metric-Familie existiert, aber 0 Serien
+                                 erfuellen den Selector (z. B. weil aktuell
+                                 nichts OOMed wurde)
+      - dropped (kps relabel)    kube-prometheus-stack droppt diese Metric
+                                 per Default-Relabel-Rule -- OK, da der
+                                 Fallback funktioniert
+      - missing                  weder Selector noch bare Metric existieren
+
+    Eine Scrape-Source gilt nur dann als 'truly missing', wenn ALLE ihre
+    Metriken im Status 'missing' sind. So loest der Diagnose-Modus den
+    Unterschied auf zwischen "Cluster scraped nicht" und "es gibt einfach
+    aktuell keine passenden Series".
+
+    Druckt das Ergebnis direkt nach stdout und endet ohne Rueckgabewert.
+    """
     import time as _time
     print(f"# Probing Prometheus at {prom.base_url} for OOM-relevant metrics.\n")
 
@@ -311,6 +396,12 @@ def diagnose_metrics(prom):
 
 
 def auto_token():
+    """Versucht, einen Bearer-Token via `oc whoami -t` zu holen.
+
+    Liefert None bei kubectl-Modus oder wenn oc nicht im PATH ist. Praktisch
+    fuer OpenShift, wo der eingeloggte User automatisch einen Token hat,
+    der auch fuer Prometheus akzeptiert wird.
+    """
     if CLI != "oc":
         return None
     try:
@@ -323,7 +414,13 @@ def auto_token():
 
 
 def metric_first(prom, candidates, ts):
-    """Try expressions in order, return first non-None value."""
+    """Versucht mehrere PromQL-Expressions der Reihe nach -- liefert den ersten Treffer.
+
+    Wird genutzt, wenn dieselbe Information aus mehreren Quellen kommen
+    kann (cAdvisor primary, recording-rule fallback, kube-state-metrics
+    secondary). So bleibt der Snapshot auch dann nuetzlich, wenn eine
+    Scrape-Source fehlt.
+    """
     for expr in candidates:
         v = prom.query(expr, ts)
         if v is not None:
@@ -334,7 +431,16 @@ def metric_first(prom, candidates, ts):
 # ------------------------------------------------------------ bulk fetch
 
 def fetch_cluster_data(ns_args):
-    """One-shot bulk fetch. Cluster-scoped resources (`nodes`) are always all-namespaces."""
+    """Holt in einem Rutsch alle K8s-Ressourcen, die der Report braucht.
+
+    ns_args ist z. B. ["-n", "my-ns"] oder ["-A"] -- wird an jeden
+    `oc get`-Aufruf angehaengt. `nodes` werden IMMER cluster-weit geholt
+    (sie sind nicht namespaced), unabhaengig von ns_args.
+
+    Liefert ein Dict mit Listen pro Ressourcen-Typ. Wird einmal pro Run
+    aufgerufen; alle weiteren Resolver (workload_for, services_targeting,
+    ...) operieren auf diesem Dict ohne weitere oc-Aufrufe.
+    """
     return {
         "pods": get_json("get", "pods", *ns_args, "-o", "json").get("items", []),
         "rs": get_json("get", "rs", *ns_args, "-o", "json").get("items", []),
@@ -356,6 +462,19 @@ def fetch_cluster_data(ns_args):
 # --------------------------------------------------- relationship resolution
 
 def workload_for(pod, rs_index):
+    """Findet den 'logischen' Workload zu einem Pod (Deployment/StatefulSet/...).
+
+    Ein Pod hat `ownerReferences[*].controller == True` auf seinen direkten
+    Owner -- typischerweise ein ReplicaSet. Der ReplicaSet wiederum gehoert
+    einem Deployment. Diese Funktion folgt der Owner-Kette einmal weiter,
+    damit der Report 'Deployment/web' statt 'ReplicaSet/web-abc123' zeigt.
+
+    rs_index ist ein vorgefertigter (ns, name) -> ReplicaSet-Lookup, damit
+    wir nicht pro Pod ueber alle RS iterieren muessen.
+
+    Rueckgabe: (kind, name, rs_or_None). Leere Strings, wenn der Pod keinen
+    Controller-Owner hat (selten -- z. B. statisch erzeugte Pods).
+    """
     ns = pod["metadata"]["namespace"]
     for owner in pod.get("metadata", {}).get("ownerReferences", []):
         if not owner.get("controller"):
@@ -373,6 +492,12 @@ def workload_for(pod, rs_index):
 
 
 def services_targeting(pod, all_services):
+    """Liefert alle Services im selben Namespace, deren Selector auf diesen Pod passt.
+
+    Ein Service ohne Selector wird ignoriert (das sind 'externalName' oder
+    handgebackene Services ohne automatische Endpoint-Verwaltung). Sonst
+    muss JEDER Selector-Key matchen.
+    """
     pod_labels = pod.get("metadata", {}).get("labels", {}) or {}
     matched = []
     for svc in all_services:
@@ -387,6 +512,12 @@ def services_targeting(pod, all_services):
 
 
 def pvcs_for_pod(pod, all_pvcs):
+    """Liefert die PVC-Objekte, die dieser Pod ueber persistentVolumeClaim mountet.
+
+    Iteriert ueber spec.volumes, sammelt die claimName-Werte und matched
+    sie gegen all_pvcs im selben Namespace. PVCs, die der Pod nicht
+    mountet, werden ignoriert.
+    """
     refs = []
     for vol in pod.get("spec", {}).get("volumes", []) or []:
         claim = vol.get("persistentVolumeClaim") or {}
@@ -398,6 +529,12 @@ def pvcs_for_pod(pod, all_pvcs):
 
 
 def hpa_for_workload(kind, name, ns, all_hpas):
+    """Findet den HPA, der einen bestimmten Workload skaliert (oder None).
+
+    Match ueber scaleTargetRef.kind + scaleTargetRef.name + Namespace.
+    Pro Workload existiert in der Regel hoechstens ein HPA -- der erste
+    Treffer wird zurueckgegeben.
+    """
     for h in all_hpas:
         if h["metadata"]["namespace"] != ns:
             continue
@@ -408,6 +545,11 @@ def hpa_for_workload(kind, name, ns, all_hpas):
 
 
 def vpa_for_workload(kind, name, ns, all_vpas):
+    """Wie hpa_for_workload, aber fuer VerticalPodAutoscaler.
+
+    VPA zeigt CPU/Mem-Recommendations -- nuetzlich beim Verdict 'C -
+    UNDER-PROVISIONED', um die Right-Sizing-Empfehlung im Report zu zeigen.
+    """
     for v in all_vpas:
         if v["metadata"]["namespace"] != ns:
             continue
@@ -418,7 +560,12 @@ def vpa_for_workload(kind, name, ns, all_vpas):
 
 
 def network_policies_for_pod(pod, all_nps):
-    """NetworkPolicies whose podSelector matches this pod's labels."""
+    """Liefert die NetworkPolicies, die diesen Pod betreffen.
+
+    Ein leerer podSelector matched ALLE Pods im Namespace (so funktioniert
+    die K8s-Semantik) -- diese werden hier auch zurueckgegeben. So sieht
+    der Report, ob der Pod ueberhaupt Netzwerk-Restrictions hat.
+    """
     pod_labels = pod.get("metadata", {}).get("labels", {}) or {}
     matched = []
     for np in all_nps:
@@ -433,6 +580,16 @@ def network_policies_for_pod(pod, all_nps):
 
 
 def neighbor_ooms_on_node(node_name, target_pod, target_finished_at, all_pods, window_s=3600):
+    """Sucht andere Pods auf dem selben Node, die im Zeitfenster auch OOMed wurden.
+
+    Beweis fuer Verdict 'D - NODE PRESSURE / NOISY NEIGHBOR': wenn auf
+    derselben Node innerhalb +/- window_s Sekunden mehrere Pods OOMed
+    sind, ist der Node ueberbucht (Memory) und nicht der einzelne Pod
+    fehlerhaft.
+
+    target_pod selbst wird natuerlich ausgeschlossen. Liefert eine Liste
+    von Dicts {pod, container, finished_at}.
+    """
     when = parse_iso(target_finished_at)
     if not when:
         return []
@@ -457,6 +614,14 @@ def neighbor_ooms_on_node(node_name, target_pod, target_finished_at, all_pods, w
 
 
 def events_for_pod(pod_name, ns, all_events, since_seconds=3600):
+    """Filtert die Pod-bezogenen K8s-Events der letzten `since_seconds`.
+
+    Events werden vom Cluster nur ~1 Stunde lang vorgehalten -- deshalb
+    der Default. Sortiert nach Zeitstempel absteigend, damit das
+    neueste oben steht.
+
+    Liefert eine Liste von Dicts {type, reason, message, ts, count}.
+    """
     cutoff = datetime.now(timezone.utc).timestamp() - since_seconds
     out = []
     for ev in all_events:
@@ -480,6 +645,16 @@ def events_for_pod(pod_name, ns, all_events, since_seconds=3600):
 
 
 def fetch_logs(ns, pod, container, tail=30, grep_re=None):
+    """Holt die Pre-OOM-Logs (`oc logs --previous`) der letzten N Zeilen.
+
+    `--previous` liefert die Logs der VORHER beendeten Container-Instanz
+    -- das ist genau die, die OOMed wurde. Optional via grep_re
+    (kompilierte Regex) gefiltert, damit der Report nur die relevanten
+    Zeilen (z. B. error/oom/fatal) zeigt.
+
+    Liefert None, wenn oc fehlschlaegt (z. B. weil keine 'previous'-
+    Instanz existiert -- noch nie restarted).
+    """
     proc = subprocess.run(
         [CLI, "logs", pod, "-c", container, "-n", ns, "--previous", f"--tail={tail}"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -493,7 +668,15 @@ def fetch_logs(ns, pod, container, tail=30, grep_re=None):
 
 
 def find_oom_targets(cluster):
-    """Pods whose lastState.terminated.reason == OOMKilled."""
+    """Sammelt alle Container, deren lastState.terminated.reason == 'OOMKilled' ist.
+
+    Pro OOM ein Target-Dict mit allen Stammdaten, die der Reporter
+    spaeter braucht (namespace, pod, container, node, workload, restart_count,
+    finished_at, started_at, exit_code, plus Referenzen aufs Pod-Objekt und
+    den Container-Status).
+
+    Sortiert nach finished_at absteigend -- der juengste OOM steht oben.
+    """
     rs_index = {(rs["metadata"]["namespace"], rs["metadata"]["name"]): rs
                 for rs in cluster["rs"]}
     targets = []
@@ -529,6 +712,11 @@ def find_oom_targets(cluster):
 # ------------------------------------------------------- per-target enrich
 
 def container_spec(pod, container_name):
+    """Liefert das spec.containers[]-Dict eines bestimmten Containers im Pod.
+
+    Leeres Dict, wenn der Container nicht in der Spec steht (sollte bei
+    'echten' Pods nicht passieren, ist aber defensiv).
+    """
     for c in pod.get("spec", {}).get("containers", []) or []:
         if c["name"] == container_name:
             return c
@@ -536,6 +724,19 @@ def container_spec(pod, container_name):
 
 
 def metric_summary(prom, ns, pod, container, finished_at):
+    """Sammelt alle Prometheus-Metriken zum Zeitpunkt des OOM-Events.
+
+    Holt zum Zeitstempel 'finished_at' (= wann der Container gestorben ist):
+      wss_at, wss_peak_5m, wss_peak_1h   Memory-Working-Set + Peaks
+      deriv_1h                           Slope (Bytes/s) -- Leak-Indikator
+      limit                              Memory-Limit (KSM oder cAdvisor)
+      cpu_rate_5m, cpu_throttle_5m       CPU-Auslastung und Throttling
+      rx/tx_5m, rx_1m, rx_baseline_30m   Netzwerk (Spike-Indikator)
+      fs_reads_5m, fs_writes_5m          Storage-Throughput
+
+    Liefert None, wenn Prometheus nicht erreichbar ist oder finished_at nicht
+    parsebar -- der Verdict-Pfad faellt dann auf K8s-only-Heuristik zurueck.
+    """
     if not prom or not prom.available:
         return None
     when = parse_iso(finished_at)
@@ -597,7 +798,22 @@ LEAK_THRESHOLD_BPS = 1 * 1024 * 1024 / 60  # ~17.5 KiB/s ≈ +1 MiB/min
 
 
 def diagnose(target, metrics, neighbors_on_node):
-    """Apply A/B/C/D/E heuristics in priority order. Returns (label, evidence, fixes)."""
+    """Wendet die A/B/C/D/E-Heuristiken in fester Prioritaet an.
+
+    Reihenfolge der Pruefungen:
+      E - STARTUP OVERRUN           lifetime < 60s und restarts >= 2
+                                    (App schafft Initialisierung nicht im Limit)
+      D - NODE PRESSURE / NEIGHBOR  >= 2 weitere OOMs auf demselben Node
+                                    in der letzten Stunde
+      A - MEMORY LEAK               deriv > Threshold UND peak/limit >= 85%
+                                    (Memory waechst stetig, Limit ist Decke)
+      B - SPIKE / LARGE REQUEST     Netzwerk-Rx-Burst (1m >= 3x baseline)
+      C - UNDER-PROVISIONED LIMIT   peak/limit >= 95% UND deriv flach
+      ? - INDETERMINATE             keines der Patterns matched eindeutig
+
+    Liefert (label, evidence_list, fixes_list). evidence sind kurze Saetze,
+    fixes sind konkrete Naechste-Schritte mit oc-Befehlen.
+    """
     started = parse_iso(target.get("started_at"))
     finished = parse_iso(target.get("finished_at"))
     lifetime_s = int((finished - started).total_seconds()) if (started and finished) else None
@@ -707,10 +923,21 @@ def diagnose(target, metrics, neighbors_on_node):
 # ------------------------------------------------------------- rendering
 
 def hr(char="=", width=80):
+    """Trennlinie fuer Text-Reports -- z. B. hr('=', 80) -> 80x '='."""
     return char * width
 
 
 def render_text(report, with_logs):
+    """Druckt einen vollstaendigen Per-OOM-Report im menschenlesbaren Format.
+
+    Sektionen: CONTEXT, CONFIGURATION, MEMORY, CPU, NETWORK, STORAGE,
+    NODE, NEIGHBOR PODS, AUTOSCALING, SERVICES & NETWORKPOLICY,
+    NAMESPACE CONSTRAINTS, RECENT EVENTS, PRE-OOM LOGS (optional),
+    VERDICT.
+
+    with_logs=True fuegt die Pre-OOM-Logs ein (sonst ausgelassen, damit
+    der Report ohne `oc logs --previous` schneller ist).
+    """
     print()
     print(hr("="))
     print(f"OOM ROOT-CAUSE ANALYSIS — {report['namespace']}/{report['pod']}/{report['container']}")
@@ -912,7 +1139,11 @@ def render_text(report, with_logs):
 
 
 def render_summary(reports):
-    """One-line per OOM, for quick triage."""
+    """Eine Zeile pro OOM -- fuer schnelle Triage.
+
+    Spalten: NAMESPACE, POD, CONTAINER, PATTERN, OOM AGE. Spaltenbreiten
+    werden dynamisch an die laengsten Werte angepasst.
+    """
     if not reports:
         print("# no OOMKilled containers found")
         return
@@ -935,6 +1166,22 @@ def render_summary(reports):
 # ----------------------------------------------------------------- main
 
 def build_report(target, cluster, prom, with_logs, log_grep):
+    """Komplette Per-OOM-Pipeline: sammelt ALLE Informationen rund um EINEN OOM.
+
+    Schritte:
+      1. Container-Spec aus dem Pod ziehen
+      2. Prometheus-Metriken zum OOM-Zeitpunkt holen
+      3. PVCs, Services, NetworkPolicies, HPA, VPA aufloesen
+      4. Node-Objekt finden
+      5. Neighbor-OOMs auf dem Node sammeln (fuer Verdict D)
+      6. Pod-Events der letzten Stunde
+      7. Optional Pre-OOM-Logs holen + grep-filtern
+      8. LimitRanges + ResourceQuotas des Namespaces
+      9. diagnose() anwenden -> Verdict (label, evidence, fixes)
+
+    Liefert ein grosses Report-Dict, das render_text() oder report_for_json()
+    weiterverarbeiten.
+    """
     pod = target["pod_obj"]
     spec = container_spec(pod, target["container"])
     metrics = metric_summary(prom, target["namespace"], target["pod"],
@@ -990,7 +1237,15 @@ def build_report(target, cluster, prom, with_logs, log_grep):
 
 
 def report_for_json(r):
-    """Strip non-serialisable fields (Pod / RS objects) for --json output."""
+    """Bereinigt ein Report-Dict so, dass es per json.dump serialisierbar ist.
+
+    Entfernt die raw K8s-Objekte (Pod, Node, Service, ...) -- die sind zwar
+    Dicts, blaehen das JSON aber massiv auf. Was bleibt: namespace, pod,
+    container, target-Stammdaten, Prometheus-metrics, events, logs und der
+    Verdict (umgewandelt zu {pattern, evidence, fixes}).
+
+    So bleibt die JSON-Datei kompakt und vom Aggregator gut auswertbar.
+    """
     pruned = dict(r)
     target = dict(r["target"])
     target.pop("pod_obj", None)
@@ -1012,6 +1267,19 @@ def report_for_json(r):
 
 
 def main():
+    """Einstiegspunkt: CLI-Args parsen, Cluster + Prometheus pollen, Reports rendern.
+
+    Modi:
+      --diagnose       Probe-Modus: zeigt fehlende Scrape-Sources und endet
+      --summary        Einzeiler-Tabelle pro OOM
+      --json           Strukturiertes JSON (wird vom Aggregator gelesen)
+      (Default)        Voller Text-Report pro OOM
+
+    Wenn keine OOMs gefunden werden, schreibt main() nichts nach stdout
+    (nur eine `# no OOMKilled containers found ...` Meldung nach stderr).
+    Der Loop-Wrapper nutzt das, um leere Reports gar nicht erst auf Platte
+    zu schreiben.
+    """
     global CLI
     p = argparse.ArgumentParser(
         description="Per-pod OOM root-cause report. Pulls workload + node + neighbors + "
