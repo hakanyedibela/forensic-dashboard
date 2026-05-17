@@ -1102,6 +1102,145 @@ def _build_services_sheet(wb, results):
     _write_rows(ws, headers, rows)
 
 
+# ---------------------------------------------------------------------------
+# Text inspector (--text mode)
+#
+# Druckt einen einzelnen Namespace menschenlesbar nach stdout. Gedacht
+# fuer Debugging: zeigt, wieviel oc tatsaechlich geliefert hat, und ob
+# das im Snapshot landet. Wenn die Excel-Sheets oder die CSVs leer sind,
+# sieht man hier auf welcher Stufe die Daten verschwinden.
+# ---------------------------------------------------------------------------
+
+def _text_hr(char="=", width=78):
+    return char * width
+
+
+def render_namespace_text(res):
+    """Druckt einen einzelnen process_namespace()-Result als Text-Report."""
+    snap = res.get("snapshot") or {}
+    bindings = res.get("bindings") or []
+    deployments = res.get("deployments") or []
+    statefulsets = res.get("statefulsets") or []
+
+    print()
+    print(_text_hr("="))
+    print("NAMESPACE  {}   (stage={})".format(res["namespace"], res["stage"]))
+    print(_text_hr("="))
+
+    # --- Section 1: raw fetch counts -------------------------------------
+    # The first place to look when sheets are empty: how much did oc
+    # actually return? If anything here is 0 unexpectedly, the problem
+    # is at the oc/fetch layer, not in the renderers.
+    counts = [
+        ("deployments",     len(deployments)),
+        ("statefulsets",    len(statefulsets)),
+        ("hpas",            len(bindings)),
+        ("services",        len(snap.get("services") or [])),
+        ("pvcs",            len(snap.get("pvcs") or [])),
+        ("resourceQuotas",  len(snap.get("resourceQuotas") or [])),
+        ("limitRanges",     len(snap.get("limitRanges") or [])),
+        ("networkPolicies", len(snap.get("networkPolicies") or [])),
+    ]
+    print()
+    print("FETCH COUNTS  (what `oc get <kind> -n {} -o json` returned)".format(res["namespace"]))
+    for name, n in counts:
+        marker = "  <-- 0; the corresponding sheet/CSV WILL be empty" if n == 0 else ""
+        print("  {:<18} {:>4}{}".format(name + ":", n, marker))
+
+    # --- Section 2: per-kind details -------------------------------------
+    print()
+    print("DEPLOYMENTS ({})".format(len(deployments)))
+    if not deployments:
+        print("  (none)")
+    for d in deployments:
+        dims = workload_dimensions(d)
+        print("  - {}".format(d["metadata"]["name"]))
+        print("      replicas={}  ready={}  containers={}".format(
+            dims.get("replicas"), dims.get("readyReplicas"), dims.get("containers")))
+        print("      requests cpu={}m mem={}Mi   limits cpu={}m mem={}Mi".format(
+            dims.get("cpu_req_millis"), dims.get("mem_req_mib"),
+            dims.get("cpu_lim_millis"), dims.get("mem_lim_mib")))
+        for img in (dims.get("images") or []):
+            print("      image: {}".format(img))
+
+    print()
+    print("STATEFULSETS ({})".format(len(statefulsets)))
+    if not statefulsets:
+        print("  (none)")
+    for s in statefulsets:
+        dims = workload_dimensions(s)
+        print("  - {}  replicas={}  containers={}".format(
+            s["metadata"]["name"], dims.get("replicas"), dims.get("containers")))
+
+    print()
+    print("HPAs ({})".format(len(bindings)))
+    if not bindings:
+        print("  (none) -- the _hpa-validation.csv and the HPAs sheet WILL be empty.")
+    for b in bindings:
+        print("  - {}  ok={}".format(b["hpa"], b["ok"]))
+        print("      target:   {}/{}  (found={})".format(
+            b["targetKind"], b["targetName"], b["targetFound"]))
+        print("      replicas: min={}  max={}  current={}  desired={}".format(
+            b["minReplicas"], b["maxReplicas"],
+            b["currentReplicas"], b["desiredReplicas"]))
+        print("      metrics:  {}".format(len(b.get("metrics") or [])))
+        if b.get("issues"):
+            print("      issues:")
+            for iss in b["issues"]:
+                print("        - {}".format(iss))
+
+    print()
+    print("SERVICES ({})".format(len(snap.get("services") or [])))
+    for svc in snap.get("services") or []:
+        ports = ",".join(str(p.get("port")) for p in (svc.get("ports") or []))
+        print("  - {}  type={}  ports={}".format(svc["name"], svc.get("type"), ports))
+
+    print()
+    print("PVCs ({})".format(len(snap.get("pvcs") or [])))
+    for p in snap.get("pvcs") or []:
+        print("  - {}  status={}  size={}Gi  class={}".format(
+            p["name"], p.get("status"), p.get("storage_gib"), p.get("storageClass")))
+
+    print()
+    print("RESOURCEQUOTAS ({})".format(len(snap.get("resourceQuotas") or [])))
+    for q in snap.get("resourceQuotas") or []:
+        print("  - {}".format(q["name"]))
+        for k in sorted((q.get("hard") or {}).keys()):
+            hard = (q.get("hard") or {}).get(k)
+            used = (q.get("used") or {}).get(k, "?")
+            print("      {}: used={} / hard={}".format(k, used, hard))
+
+    print()
+    print("LIMITRANGES ({})".format(len(snap.get("limitRanges") or [])))
+    for lr in snap.get("limitRanges") or []:
+        print("  - {}".format(lr["name"]))
+        for limit in (lr.get("limits") or []):
+            print("      type={}  default={}  defaultRequest={}".format(
+                limit.get("type"), limit.get("default"), limit.get("defaultRequest")))
+
+    print()
+    print("NETWORKPOLICIES ({})".format(len(snap.get("networkPolicies") or [])))
+    for nm in snap.get("networkPolicies") or []:
+        print("  - {}".format(nm))
+
+    # --- Section 3: would-be CSV row counts ------------------------------
+    # If these are 0 but FETCH COUNTS above are non-zero, the bug is
+    # downstream of the fetch (in validate_hpas/build_snapshot/the
+    # renderer). If both are 0, the bug is in the fetch.
+    print()
+    print("CSV ROW PREVIEW  (what would be written to the aggregate CSVs)")
+    print("  _hpa-validation.csv:  {} data row(s)".format(len(bindings)))
+    print("  _dimensions.csv:      {} data row(s)  (deployments + statefulsets)".format(
+        len(deployments) + len(statefulsets)))
+    print()
+    if all(n == 0 for _, n in counts):
+        print("WARNING: every fetch returned 0 items. Either the namespace is")
+        print("genuinely empty, or `oc` is failing silently. Re-run the loop")
+        print("after the stderr-surfacing patch and check run.log for lines")
+        print("like 'oc get ... exited <N>: ...'.")
+    print(_text_hr("="))
+
+
 def write_excel(path, results, overview):
     """Baut das _cluster-state.xlsx-Workbook mit allen Sheets.
 
@@ -1161,10 +1300,32 @@ def main():
                     help="Limit to specific pid-* projects (repeatable)")
     ap.add_argument("--workers", type=int, default=4,
                     help="Parallel oc workers (default: 4)")
+    ap.add_argument("--text", action="store_true",
+                    help="Single-namespace debug mode. Requires exactly one "
+                         "--project. Prints a plain-text report to stdout "
+                         "(fetch counts, per-kind details, would-be CSV row "
+                         "counts) so you can see where the data drops out "
+                         "when the Excel/CSV come back empty. Writes the "
+                         "normal artifacts to a temp dir if --output-dir is "
+                         "not given.")
     args = ap.parse_args()
 
+    # --text precondition: one namespace, sequential, no surprises.
+    if args.text:
+        if not args.project or len(args.project) != 1:
+            sys.stderr.write(
+                "error: --text requires exactly one --project NS\n")
+            return 2
+        args.workers = 1
+
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_root = Path(args.output_dir or f"./state-{ts}")
+    if args.text and not args.output_dir:
+        import tempfile
+        out_root = Path(tempfile.mkdtemp(prefix="fetch-cluster-state-text-"))
+        sys.stderr.write(
+            "# --text mode: writing artifacts to {} (temp)\n".format(out_root))
+    else:
+        out_root = Path(args.output_dir or f"./state-{ts}")
     out_root.mkdir(parents=True, exist_ok=True)
 
     projects = args.project or list_pid_projects()
@@ -1179,7 +1340,8 @@ def main():
         print("No projects match the --stage filter.")
         return 0
 
-    print(f"Processing {len(targets)} projects with {args.workers} workers...")
+    if not args.text:
+        print(f"Processing {len(targets)} projects with {args.workers} workers...")
 
     results = []
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -1191,10 +1353,23 @@ def main():
             ns = future_to_ns[fut]
             try:
                 res = fut.result()
-                print(f"  [ok] {ns}  [stage={res['stage']}]")
+                if not args.text:
+                    print(f"  [ok] {ns}  [stage={res['stage']}]")
                 results.append(res)
             except Exception as e:
                 print(f"  [ERR] {ns}: {e}", file=sys.stderr)
+
+    # --text mode: print the human-readable report and stop.
+    # The CSV/Excel/overview steps below assume "cluster-wide aggregate"
+    # output which makes no sense for a single-namespace debug run.
+    if args.text:
+        if not results:
+            sys.stderr.write(
+                "error: no result for {} -- see stderr above for the cause.\n"
+                .format(args.project[0]))
+            return 1
+        render_namespace_text(results[0])
+        return 0
 
     # Aggregate CSVs
     hpa_rows = []
