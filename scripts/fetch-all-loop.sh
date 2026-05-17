@@ -7,7 +7,7 @@
 #
 #   1. fetch-cluster-state-loop.sh  — cluster state + HPA validation +
 #                                     resource footprint
-#   2. fetch-oom-loop.sh            — OOM root-cause per namespace
+#   2. fetch-cluster-oom-loop.sh    — OOM root-cause per namespace
 #
 # Layout (under ./reports/state-loop-<timestamp>/):
 #
@@ -49,7 +49,7 @@ REPORT_DIR="./reports/state-loop-${TIMESTAMP}"
 mkdir -p "${REPORT_DIR}"
 
 STATE_LOOP="${SCRIPT_DIR}/fetch-cluster-state-loop.sh"
-OOM_LOOP="${SCRIPT_DIR}/fetch-oom-loop.sh"
+OOM_LOOP="${SCRIPT_DIR}/fetch-cluster-oom-loop.sh"
 
 for s in "${STATE_LOOP}" "${OOM_LOOP}"; do
     if [[ ! -x "${s}" ]]; then

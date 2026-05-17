@@ -37,7 +37,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PY_SCRIPT="${SCRIPT_DIR}/python/fetch-cluster-state.py"
 
 # --report-dir DIR overrides the default of ./reports/state-loop-<ts>/.
-# Used by fetch-all-loop.sh to point this script and fetch-oom-loop.sh at
+# Used by fetch-all-loop.sh to point this script and fetch-cluster-oom-loop.sh at
 # the same shared report directory so their artifacts coexist.
 REPORT_DIR=""
 while [[ $# -gt 0 ]]; do

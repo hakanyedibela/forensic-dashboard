@@ -2,7 +2,7 @@
 """
 aggregate-oom.py
 
-Reads every report.json produced by fetch-oom-loop.sh and produces:
+Reads every report.json produced by fetch-cluster-oom-loop.sh and produces:
 
   * _oom-overview.txt -- per-namespace + per-stage rollup
                          (STATUS, OOM count, distinct verdict patterns)
@@ -52,7 +52,7 @@ def discover(root):
                     print("warning: cannot read {}: {}".format(report_path, e),
                           file=sys.stderr)
                     raw = ""
-                # oom-rootcause.py prints nothing when there are zero OOMs in
+                # fetch-cluster-oom.py prints nothing when there are zero OOMs in
                 # the namespace, so an empty file means "no findings", not a
                 # parse error -- treat it as []. A non-empty but malformed
                 # file is a real problem and is warned about.
@@ -152,7 +152,7 @@ def render_overview(per_ns_rows, root, prom_args_hint=None):
 
     lines = [
         "=" * max(len(header), 78),
-        "OOM overview - fetch-oom-loop",
+        "OOM overview - fetch-cluster-oom-loop",
         "Source: {}".format(root),
         "Total namespaces: {}".format(len(per_ns_rows)),
         "Patterns: A=leak  B=spike  C=under-provisioned  D=node-pressure  "
@@ -205,7 +205,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input-dir", required=True,
                     help="oom-loop-<ts>/ directory produced by "
-                         "fetch-oom-loop.sh")
+                         "fetch-cluster-oom-loop.sh")
     args = ap.parse_args()
 
     root = Path(args.input_dir)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# fetch-oom-loop.sh
+# fetch-cluster-oom-loop.sh
 #
 # Requires bash 4+ (uses mapfile, declare -A, ${var,,}). On macOS the
 # system /bin/bash is 3.2; install a newer bash via `brew install bash`
@@ -9,7 +9,7 @@
 #
 # Iterates over every OpenShift project whose name starts with "pid-"
 # (same discovery + stage detection as fetch-cluster-state-loop.sh) and
-# invokes oom-rootcause.py once per namespace. Per-namespace output is
+# invokes fetch-cluster-oom.py once per namespace. Per-namespace output is
 # saved as JSON (for the aggregator) and as text (for humans). The
 # aggregator then produces a cluster-wide OOM overview and a findings CSV.
 #
@@ -31,7 +31,7 @@
 # Outputs (under ${REPORT_DIR}) when OOMs are found:
 #   by-stage/<stage>/<ns>/                only for namespaces with OOMs
 #       oom-run.log     stdout/stderr of the python invocations
-#       report.json     full structured report (oom-rootcause.py --json)
+#       report.json     full structured report (fetch-cluster-oom.py --json)
 #       report.txt      human-readable per-namespace report
 #   _oom-overview.txt   per-namespace + per-stage rollup (STATUS, OOMS, PATTERNS)
 #   _oom-findings.csv   one row per OOMKilled container across the cluster
@@ -46,12 +46,12 @@
 # stays fast and self-contained. Enable Prometheus when you want metric-
 # based verdicts (A/B/C/D/E patterns).
 #
-# Requires: oc (logged in), python3, oom-rootcause.py (under scripts/python/).
+# Requires: oc (logged in), python3, fetch-cluster-oom.py (under scripts/python/).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PY_SCRIPT="${SCRIPT_DIR}/python/oom-rootcause.py"
+PY_SCRIPT="${SCRIPT_DIR}/python/fetch-cluster-oom.py"
 AGGREGATOR="${SCRIPT_DIR}/python/aggregate-oom.py"
 
 # --report-dir DIR overrides the default of ./reports/state-loop-<ts>/.

@@ -295,7 +295,7 @@ def diagnose_metrics(prom):
     for src in truly_missing:
         print(f"  - {src}")
     print()
-    print("Install hints (see scripts/README.md → oom-rootcause.py for more):")
+    print("Install hints (see scripts/README.md → fetch-cluster-oom.py for more):")
     if "kube-state-metrics deployment" in truly_missing:
         print("  helm upgrade --install kube-state-metrics \\")
         print("    prometheus-community/kube-state-metrics -n monitoring \\")
