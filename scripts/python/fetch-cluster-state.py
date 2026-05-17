@@ -68,6 +68,25 @@ except ImportError:
     sys.stderr.write("error: PyYAML is required (pip install pyyaml)\n")
     sys.exit(1)
 
+# PyYAML 5.1+ accepts `sort_keys=` in dump/dump_all. Older PyYAML (e.g.
+# the 3.13 that ships in RHEL 7 / Python 3.6.8 base packages) raises
+# TypeError on that kwarg, which used to take down write_desired() and
+# silently abort the whole per-namespace pipeline -- producing empty
+# CSVs across the cluster. Detect support once here and pass the right
+# kwargs dict everywhere we dump YAML.
+try:
+    import io as _io
+    yaml.safe_dump_all([{"a": 1}], _io.StringIO(), sort_keys=False)
+    _YAML_DUMP_KWARGS = {"sort_keys": False}
+except TypeError:
+    sys.stderr.write(
+        "warning: installed PyYAML does not support sort_keys -- "
+        "desired/*.yaml will be alphabetically sorted instead of "
+        "API-field-ordered. Functionally identical. "
+        "(pip install --upgrade pyyaml to silence this.)\n"
+    )
+    _YAML_DUMP_KWARGS = {}
+
 try:
     import openpyxl
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -630,8 +649,11 @@ def write_desired(desired_dir, raw):
         if not items:
             continue
         with (desired_dir / filename).open("w") as f:
-            yaml.safe_dump_all((to_desired(it) for it in items), f,
-                               sort_keys=False)
+            # Materialise the generator before dumping so the file isn't
+            # left half-written if dumping raises (small benefit: a
+            # cleaner desired/ directory when something goes wrong).
+            docs = [to_desired(it) for it in items]
+            yaml.safe_dump_all(docs, f, **_YAML_DUMP_KWARGS)
 
 
 def process_namespace(ns, stage, out_root):
