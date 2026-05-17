@@ -1,28 +1,41 @@
-# fetch-cluster-state
+# fetch-cluster-state + fetch-cluster-oom
 
-Zwei zusammengehörige Skripte, die den aktuellen Zustand aller OpenShift-
-Projekte mit Präfix `pid-` erfassen, die HPA-Bindings validieren und ein
-wiederanwendbares „Desired State"-YAML erzeugen.
+Zwei Pipelines, die den forensischen Zustand aller OpenShift-Projekte
+mit Präfix `pid-` erfassen, plus ein kombinierter Wrapper, der beide
+hintereinander ausführt:
+
+- **fetch-cluster-state** — Cluster-State, HPA-Validierung, Ressourcen-
+  Footprint, wiederanwendbare „Desired State"-YAML-Manifeste.
+- **fetch-cluster-oom** — Root-Cause-Reports pro OOMKilled-Container
+  inklusive Verdict (Pattern A/B/C/D/E) plus cluster-weiter Rollup.
 
 | Skript                                  | Aufgabe                                                              |
 |-----------------------------------------|----------------------------------------------------------------------|
-| `scripts/python/fetch-cluster-state.py` | Eigentlicher Worker. Läuft cluster-weit in einem einzigen Aufruf mit eingebauter Parallelisierung — oder gezielt für einzelne Projekte. |
-| `scripts/fetch-cluster-state-loop.sh`   | Bash-Wrapper. Verwendet das gleiche Schleifenschema wie `lean-inspector-loop.sh` / `check-bind-resources.sh`: ermittelt `pid-*` Projekte, erkennt die Stage, ruft das Python-Skript einmal pro Namespace auf und fasst die CSVs zusammen. |
+| `scripts/python/fetch-cluster-state.py` | Der State-Worker. Läuft cluster-weit in einem Aufruf mit eingebauter Parallelisierung — oder gezielt für einzelne Projekte. |
+| `scripts/fetch-cluster-state-loop.sh`   | Bash-Wrapper um den State-Worker. Ermittelt `pid-*` Projekte, erkennt die Stage, ruft das Python-Skript einmal pro Namespace auf und fasst die CSVs zusammen. |
+| `scripts/python/fetch-cluster-oom.py`   | Der OOM-Worker. Baut pro OOMKilled-Container einen vollständigen Root-Cause-Report (Workload, Node, Nachbarn, Events, Autoscaling, Prometheus-Metriken, Pre-OOM-Logs, Verdict). |
+| `scripts/fetch-cluster-oom-loop.sh`     | Bash-Wrapper um den OOM-Worker. Gleiche `pid-*`-Erkennung; schreibt Per-Namespace-JSON+Text nur dann, wenn tatsächlich OOMs gefunden werden. |
+| `scripts/python/aggregate-resources.py` | Cluster-weiter Ressourcen-Rollup über die State-Loop-Ausgabe (Pods, CPU/Mem, PVCs, Quota %). |
+| `scripts/python/aggregate-oom.py`       | Cluster-weiter OOM-Rollup (Pattern-Zählung, Findings-CSV) über die OOM-Loop-Ausgabe. |
+| `scripts/fetch-all-loop.sh`             | Einmal-Wrapper: führt beide Loops in einen einzigen gemeinsamen Report-Ordner. **Nimm das, wenn du nicht weißt, wo du anfangen sollst.** |
 
-Nimm das Python-Skript für einen schnellen cluster-weiten Snapshot. Nimm
-den Bash-Loop, wenn jeder Namespace isoliert verarbeitet werden soll
-(eigene Output-Verzeichnisse, eigene `run.log`-Datei je Namespace,
-robust gegenüber Einzel-Fehlern).
+Nimm die Python-Skripte für einen schnellen cluster-weiten Snapshot.
+Nimm einen Bash-Loop, wenn jeder Namespace isoliert verarbeitet werden
+soll (eigene Output-Verzeichnisse, eigene `run.log` je Namespace,
+robust gegen Einzel-Fehler). Nimm `fetch-all-loop.sh`, wenn du einen
+kombinierten Report über State und OOMs willst.
 
 ## Voraussetzungen
 
 - `oc` (OpenShift CLI), am Ziel-Cluster eingeloggt
-- Python 3.6.8+
-- `pip install pyyaml` (Pflicht) und `pip install openpyxl` (optional, aktiviert die `.xlsx`-Datei)
-- Für den Loop-Wrapper: `bash` 4+ (macOS liefert 3.2 mit; eine neuere Version per `brew install bash` installieren und im `PATH` vor `/bin/bash` stellen)
+- Python 3.6.8+ (Standardbibliothek genügt für `fetch-cluster-oom.py` und die Aggregatoren; `fetch-cluster-state.py` braucht `pyyaml`)
+- `pip install pyyaml` (Pflicht für `fetch-cluster-state.py`) und `pip install openpyxl` (optional, aktiviert die `.xlsx`-Datei)
+- Für die Loop-Wrapper: `bash` 4+ (macOS liefert 3.2; per `brew install bash` eine neuere Version installieren und im `PATH` vor `/bin/bash` stellen)
+- Optional für reichere OOM-Verdicts: ein erreichbares Prometheus (Default `http://localhost:9090`; per Port-Forward auf das Prometheus / Thanos im Cluster)
 
 Leserechte auf die `pid-*` Projekte reichen aus — die Skripte schreiben
-nichts in den Cluster.
+nichts in den Cluster. Cluster-weite Leserechte (`nodes`) helfen dem
+OOM-Report, Noisy-Neighbor-Muster zu erkennen.
 
 ## Stage-Erkennung
 
@@ -191,23 +204,196 @@ reports/state-loop-20260513-101530/
 > betroffen; nur die Per-Namespace-Artefakte (`snapshot.json`,
 > `hpa-bindings.json`, `desired/`) liegen eine Ebene tiefer als erwartet.
 
+## fetch-cluster-oom.py
+
+```bash
+python3 scripts/python/fetch-cluster-oom.py [-n NS | -A] [--pod NAME]
+                                            [--summary | --json]
+                                            [--logs [--grep REGEX]]
+                                            [--prometheus-url URL]
+                                            [--prometheus-port N]
+                                            [--token TOKEN]
+                                            [--insecure]
+                                            [--no-prometheus]
+                                            [--diagnose]
+                                            [--kubectl]
+```
+
+Für jeden Container, dessen `lastState.terminated.reason == OOMKilled`
+ist, baut das Skript einen vollständigen Root-Cause-Report und
+schließt mit einem Verdict (Pattern A/B/C/D/E oder `?`) ab.
+
+### Was pro OOMKilled-Container erfasst wird
+
+| Quelle                  | Was erfasst wird                                                                  |
+|-------------------------|-----------------------------------------------------------------------------------|
+| Pod- / Container-Spec   | Image, Requests/Limits, QoS-Klasse, Probes, Args, Exit-Code, Restart-Count        |
+| Workload-Auflösung      | folgt `ownerReferences` einmal: ReplicaSet → Deployment, etc.                     |
+| Node                    | Capacity, Allocatable, Pressure-Conditions                                        |
+| Nachbar-OOMs            | andere OOMs auf demselben Node innerhalb ±1h (Beweis für Noisy-Neighbor-Pattern)  |
+| Events                  | Pod-Events der letzten Stunde                                                     |
+| Storage                 | PVCs, die der Pod mountet (Phase, Capacity, StorageClass, AccessModes)            |
+| Autoscaling             | passender HPA + VPA (falls vorhanden), mit current/desired Replicas + Metriken    |
+| Network                 | Services, die diesen Pod selektieren; NetworkPolicies, deren podSelector matched  |
+| Namespace-Constraints   | LimitRanges, ResourceQuotas mit used/hard                                         |
+| Prometheus (optional)   | Working-Set, Peaks (5m/1h), Slope (deriv 1h), Memory-Limit, CPU rate/throttle, rx/tx, fs reads/writes |
+| Pre-OOM-Logs (optional) | `oc logs --previous`, gefiltert per Regex (Default: `error|oom|killed|out ?of ?memory|fatal|exception`) |
+
+### Verdicts — die A/B/C/D/E-Patterns
+
+Das Verdict ist das erste passende Pattern in Prioritätsreihenfolge;
+alles andere landet als `?` für manuelle Analyse.
+
+| Pattern | Auslöser                                                                                 | Typische Ursache                                                            |
+|---------|------------------------------------------------------------------------------------------|------------------------------------------------------------------------------|
+| `E`     | lifetime < 60s **und** restart_count ≥ 2                                                 | App kann sich nicht innerhalb des Memory-Limits initialisieren (JVM `-Xmx`, großes ML-Modell, großer Cache-Warmup) |
+| `D`     | ≥ 2 weitere Pods auf demselben Node innerhalb ±1h OOMed                                  | Node überbucht; fehlendes Limit bei einem Nachbarn oder Kernel-OOM           |
+| `A`     | Memory-Slope (1h) ≥ ~17 KiB/s **und** peak/limit ≥ 85 %                                  | Stetiges Memory-Wachstum → Leak. Limit ist die Decke, nicht die Ursache       |
+| `B`     | Netzwerk-Rx (1m) ≥ 3 × Baseline-Rx (30m-Mittel der 5m-Rate)                              | Spike / großer Request — Body im Speicher gebuffert                          |
+| `C`     | peak/limit ≥ 95 % **und** Slope flach                                                    | Normaler Peak ≥ Memory-Limit — Workload ist unter-provisioniert               |
+| `?`     | nichts davon mit Sicherheit                                                              | Indeterminate — manuelle Analyse                                              |
+
+Jedes Verdict kommt mit einer `evidence`-Liste (was beobachtet wurde)
+und einer `fixes`-Liste (konkrete `oc`-Befehle für die weitere Analyse).
+
+### Ausgabe-Modi
+
+| Flag         | Ausgabe                                                                                  |
+|--------------|------------------------------------------------------------------------------------------|
+| (keiner)     | Voller Text-Report pro OOM (Sektionen: CONTEXT, CONFIGURATION, MEMORY, CPU, NETWORK, STORAGE, NODE, NEIGHBORS, AUTOSCALING, SERVICES & NETPOL, NAMESPACE CONSTRAINTS, EVENTS, VERDICT) |
+| `--summary`  | Eine Zeile pro OOM (`NAMESPACE  POD  CONTAINER  PATTERN  OOM AGE`). Schnelle Triage.     |
+| `--json`     | Strukturiertes Array (ein Eintrag pro OOM). Das verwendet der Loop-Wrapper für `aggregate-oom.py`. |
+| `--diagnose` | Probe-Modus: zeigt, welche Prometheus-Scrape-Sources gesund / fehlen, dann Ende.         |
+
+### Voraussetzungen für den Prometheus-Pfad
+
+Resource-Metric-Verdicts (A, B, C) feuern nur, wenn das Skript
+Prometheus erreichen kann. Ohne Prometheus ist der Verdict-Pfad auf
+D (Nachbarn) und E (Lifetime) beschränkt — immer noch nützlich, aber
+blind für die Memory-Form. `--diagnose` prüft, welche Metric-Families
+verfügbar sind, und gibt Installations-Hinweise aus, falls etwas fehlt.
+
+## fetch-cluster-oom-loop.sh
+
+Wrappt den OOM-Worker genauso wie `fetch-cluster-state-loop.sh` den
+State-Worker.
+
+```bash
+./scripts/fetch-cluster-oom-loop.sh [--report-dir DIR]
+```
+
+Default-Output ist `./reports/state-loop-<timestamp>/` (gleicher
+Verzeichnisname wie beim State-Loop, damit beide Reports per
+`--report-dir` oder via `fetch-all-loop.sh` denselben Ordner teilen
+können). Für jedes `pid-*` Projekt:
+
+1. Stage erkennen (gleiche Regel wie beim State-Loop).
+2. `python3 scripts/python/fetch-cluster-oom.py -n <ns> --json` in eine
+   Temp-Datei aufrufen.
+3. Hat der Namespace **null** OOMKilled-Container, wird die Temp-Datei
+   verworfen und **kein Per-Namespace-Verzeichnis angelegt**.
+4. Bei OOMs wird `by-stage/<stage>/<ns>/` materialisiert mit
+   `report.json`, `report.txt`, `oom-run.log`.
+5. Nach der Schleife läuft `aggregate-oom.py` und schreibt
+   `_oom-overview.txt` + `_oom-findings.csv` + `_oom-status.txt`.
+6. Hat der ganze Cluster null OOMs, schreibt der Loop nichts und (wenn
+   er das Report-Verzeichnis selbst angelegt hat) entfernt es am Ende.
+
+### Umgebungsvariablen (Prometheus opt-in)
+
+Der OOM-Loop verwendet per Default `--no-prometheus`, damit ein Lauf
+schnell und vorhersagbar ist. Prometheus per Env-Variablen aktivieren:
+
+| Variable                | Wirkung                                               |
+|-------------------------|-------------------------------------------------------|
+| `OOM_PROMETHEUS_URL`    | wird an `--prometheus-url` durchgereicht              |
+| `OOM_PROMETHEUS_PORT`   | wird an `--prometheus-port` durchgereicht             |
+| `OOM_TOKEN`             | wird an `--token` durchgereicht                       |
+| `OOM_INSECURE=1`        | wird an `--insecure` durchgereicht                    |
+
+Sind weder URL noch PORT gesetzt, hängt der Loop `--no-prometheus` an
+und das Verdict ist auf Patterns D / E (oder `?`) beschränkt.
+
+### Ausgabestruktur (nur wenn OOMs gefunden werden)
+
+```
+reports/state-loop-20260513-101530/
+├── by-stage/<stage>/<ns>/                # nur Namespaces mit OOMs
+│   ├── oom-run.log
+│   ├── report.json                       # vollständiges, strukturiertes JSON
+│   └── report.txt                        # menschenlesbarer Per-Namespace-Report
+├── _oom-overview.txt                     # Per-Namespace + Per-Stage-Rollup
+├── _oom-findings.csv                     # eine Zeile pro OOMKilled-Container
+└── _oom-status.txt                       # bash-seitige Fallback-Übersicht
+```
+
+## fetch-all-loop.sh — kombinierter Wrapper
+
+Wenn du **einen Report über State UND OOMs** willst, dieses Skript
+verwenden und die einzelnen Loops überspringen:
+
+```bash
+./scripts/fetch-all-loop.sh
+```
+
+Es legt ein einziges `./reports/state-loop-<timestamp>/` an und ruft
+dann `fetch-cluster-state-loop.sh` und `fetch-cluster-oom-loop.sh`
+nacheinander auf — beide mit `--report-dir` auf dieses Verzeichnis.
+Dateinamen sind so präfixiert, dass die Artefakte beider Skripte
+nebeneinander leben können (`_master-*`, `_resources-*`, `_hpa-*`,
+`_dimensions.csv` vom State; `_oom-*` vom OOM; per-Namespace `run.log`
+vs `oom-run.log`).
+
+Kombiniertes Layout (wenn OOMs gefunden wurden):
+
+```
+reports/state-loop-20260513-101530/
+├── by-stage/<stage>/<ns>/
+│   ├── run.log                           (state)
+│   ├── oom-run.log                       (oom — nur bei OOMs im ns)
+│   ├── _overview.json                    (state, pro ns)
+│   ├── _hpa-validation.csv               (state, pro ns)
+│   ├── _dimensions.csv                   (state, pro ns)
+│   ├── _cluster-state.xlsx               (state, pro ns)
+│   ├── report.json                       (oom, nur bei OOMs im ns)
+│   ├── report.txt                        (oom, nur bei OOMs im ns)
+│   └── by-stage/<stage>/<ns>/            (state, doppelt verschachtelt)
+│       ├── snapshot.json
+│       ├── hpa-bindings.json
+│       └── desired/...
+├── _master-overview.txt                  (state)
+├── _resources-overview.txt + .csv        (state)
+├── _hpa-validation.csv                   (state, aggregiert)
+├── _dimensions.csv                       (state, aggregiert)
+├── _oom-overview.txt                     (oom, nur bei OOMs)
+├── _oom-findings.csv                     (oom, nur bei OOMs)
+└── _oom-status.txt                       (oom, nur bei OOMs)
+```
+
+Das Abschluss-Echo druckt nur Pfade zu Dateien, die wirklich existieren
+— Läufe ohne OOMs erzeugen eine saubere Zusammenfassung ohne tote Links.
+
 ## Ausgabe interpretieren
 
 Wer noch nie einen solchen Report gelesen hat, geht in dieser Reihenfolge
 vor. Jeder Schritt grenzt von „Was ist clusterweit kaputt?" auf „Was genau
 ist mit diesem einen HPA kaputt?" ein.
 
-### Schritt 1 — die beiden Top-Level-Übersichten lesen
+### Schritt 1 — die Top-Level-Übersichten lesen
 
-Im Root des Reports liegen zwei Text-„Dashboards" mit unterschiedlichem Fokus:
+Im Root des Reports liegen bis zu drei Text-„Dashboards" mit
+unterschiedlichem Fokus:
 
-| Datei                      | Fokus                                                                                  |
-|----------------------------|----------------------------------------------------------------------------------------|
-| `_master-overview.txt`     | **HPA-Gesundheit** je Namespace — `STATUS`, `HPAS`, `BAD` (fehlgeschlagene Validierungen). |
-| `_resources-overview.txt`  | **Ressourcen-Footprint** je Namespace — Pods, CPU/Mem Req+Lim, PVCs, Storage, Quota %.  |
+| Datei                      | Fokus                                                                                  | Vorhanden, wenn               |
+|----------------------------|----------------------------------------------------------------------------------------|--------------------------------|
+| `_master-overview.txt`     | **HPA-Gesundheit** je Namespace — `STATUS`, `HPAS`, `BAD` (fehlgeschlagene Validierungen). | State-Loop lief                |
+| `_resources-overview.txt`  | **Ressourcen-Footprint** je Namespace — Pods, CPU/Mem Req+Lim, PVCs, Storage, Quota %.  | State-Loop lief                |
+| `_oom-overview.txt`        | **OOM-Aktivität** je Namespace — `STATUS`, `OOMS`, `PATTERNS` (z. B. `A x2, C x1`).     | OOM-Loop fand ≥ 1 OOM          |
 
 Zuerst `_master-overview.txt`. Danach `_resources-overview.txt` für den
-Kapazitätskontext.
+Kapazitätskontext. Danach `_oom-overview.txt`, falls vorhanden — sein
+Fehlen sagt bereits aus, dass der Cluster zum Zeitpunkt des Laufs null
+OOMKills hatte.
 
 #### `_master-overview.txt`
 
@@ -320,6 +506,49 @@ ist (z. B. „condition ScalingActive=False") und man die zugehörige
 | `condition ScalingActive=False (FailedGetResourceMetric)`                          | Clusterseitig: der HPA-Controller kann keine Metriken abrufen. Meist fehlt `metrics-server`.          | `metrics-server` installieren. Die HPA-Spec selbst ist in Ordnung.              |
 | `condition AbleToScale=False (FailedGetScale)`                                     | Clusterseitig: der HPA kann die aktuelle Skala nicht ermitteln (oft, weil das Target fehlt).         | Tritt meist zusammen mit `target ... not found` auf — zuerst das beheben.       |
 
+### OOM-Übersicht lesen (`_oom-overview.txt`)
+
+Gleicher Aufbau wie `_master-overview.txt`, andere Spalten:
+
+```
+STAGE    NAMESPACE                          STATUS  OOMS  PATTERNS
+prod     pid-003-web-prod-01-blue           ok       2    A x2
+phase    pid-004-batch-phase-01-blue        ok       1    E x1
+```
+
+| Spalte     | Bedeutung                                                                              |
+|------------|----------------------------------------------------------------------------------------|
+| `STATUS`   | Lief `fetch-cluster-oom.py` für den Namespace durch? `ok` / `FAIL` (siehe `oom-run.log`). |
+| `OOMS`     | Anzahl OOMKilled-Container im Namespace.                                                  |
+| `PATTERNS` | Kompakte Zählung der Verdict-Patterns über diese OOMs (z. B. `A x2, C x1`).               |
+
+Pattern-Legende:
+
+| Code | Bedeutung                                                                |
+|------|--------------------------------------------------------------------------|
+| `A`  | MEMORY LEAK — Memory wuchs stetig, Limit wurde erreicht                   |
+| `B`  | SPIKE / LARGE REQUEST — Traffic-Burst vor dem OOM                         |
+| `C`  | UNDER-PROVISIONED LIMIT — normaler Peak ≥ Limit                           |
+| `D`  | NODE PRESSURE / NOISY NEIGHBOR — andere Pods OOMed auf demselben Node     |
+| `E`  | STARTUP OVERRUN — App kann sich nicht im Limit initialisieren             |
+| `?`  | INDETERMINATE — manuelle Analyse nötig (oft: Prometheus nicht erreichbar) |
+
+Danach `_oom-findings.csv` öffnen für eine Zeile pro OOMKilled-Container
+mit pivot-tauglichen Spalten: `stage, namespace, pod, container, node,
+workload, oom_at, age, lifetime_s, restart_count, exit_code,
+pattern_short, pattern, evidence`. `pattern_short` ist eines von
+`A/B/C/D/E/?`, fertig zum Filtern.
+
+Für die Detailanalyse eines konkreten OOMs den Per-Namespace
+`report.txt` (Volltext) oder `report.json` (strukturiert) unter
+`by-stage/<stage>/<ns>/` öffnen.
+
+> **Wichtig** — hat ein Namespace null OOMs, schreibt der Loop für ihn
+> **nichts**: kein Per-Namespace-Verzeichnis, keine `report.json`,
+> keine `report.txt`. Ein fehlender Ordner unter `by-stage/` bedeutet,
+> dass dieser Namespace gesund war — nicht dass der Loop fehlgeschlagen
+> ist.
+
 ### Konfigurationsfehler vs. clusterseitige Bedingung
 
 Der Validator unterscheidet nicht zwischen *Manifest ist falsch* und
@@ -340,17 +569,28 @@ korrekt ist. Nach `metrics-server`-Installation kippt das auf `ok=True`.
 
 ## Welches Skript wann
 
-- **Schnell / weniger Dateien**: `fetch-cluster-state.py` direkt mit
-  `--workers 4` (oder mehr).
-- **Isolation pro Namespace, robust gegen Fehler, gleiches Muster wie
-  die anderen `*-loop.sh`-Skripte**: `fetch-cluster-state-loop.sh`.
+- **Ich weiß nicht, wo ich anfangen soll — gib mir einen kombinierten
+  Report**: `./scripts/fetch-all-loop.sh`.
+- **Schnell / wenige Dateien / ein cluster-weiter Snapshot**:
+  `fetch-cluster-state.py` direkt mit `--workers 4` (oder mehr).
+- **Isolation pro Namespace, robust gegen Fehler**:
+  `fetch-cluster-state-loop.sh`.
+- **Einen konkreten OOM tief untersuchen**: `fetch-cluster-oom.py`
+  direkt mit `-n <ns> --pod <name> --logs --prometheus-url <url>`.
+- **Cluster-weiter OOM-Sweep**: `fetch-cluster-oom-loop.sh` (oder der
+  kombinierte `fetch-all-loop.sh`).
 
 ## Verhältnis zu den anderen Skripten
 
-| Skript                        | Quelle           | Zweck                                              |
-|-------------------------------|------------------|----------------------------------------------------|
-| `check-bind-resources.sh`     | Live-Cluster     | Workload-Inventar: Pods, Deployments, STS, PVCs.   |
-| `lean-inspector.sh`           | Lokale YAMLs     | Einmal-Inspector für Quotas / Limits / NetPol.     |
-| `lean-inspector-loop.sh`      | Live-Cluster     | Lean-Inspector für jeden `pid-*` Namespace.        |
-| `fetch-cluster-state.py`      | Live-Cluster     | Voller Snapshot + HPA-Validierung + Desired-State. |
-| `fetch-cluster-state-loop.sh` | Live-Cluster     | Per-Namespace-Treiber rund um das Python-Skript.   |
+| Skript                          | Quelle            | Zweck                                                  |
+|---------------------------------|-------------------|--------------------------------------------------------|
+| `check-bind-resources.sh`       | Live-Cluster      | Workload-Inventar: Pods, Deployments, STS, PVCs.       |
+| `lean-inspector.sh`             | Lokale YAMLs      | Einmal-Inspector für Quotas / Limits / NetPol.         |
+| `lean-inspector-loop.sh`        | Live-Cluster      | Lean-Inspector für jeden `pid-*` Namespace.            |
+| `fetch-cluster-state.py`        | Live-Cluster      | Voller Snapshot + HPA-Validierung + Desired-State.     |
+| `fetch-cluster-state-loop.sh`   | Live-Cluster      | Per-Namespace-Treiber rund um den State-Worker.        |
+| `fetch-cluster-oom.py`          | Live-Cluster (+Prom) | Per-OOM-Root-Cause-Report mit A/B/C/D/E-Verdict.    |
+| `fetch-cluster-oom-loop.sh`     | Live-Cluster (+Prom) | Per-Namespace-Treiber rund um den OOM-Worker.       |
+| `aggregate-resources.py`        | State-Loop-Output | Ressourcen-Rollup `_resources-overview.{txt,csv}`.     |
+| `aggregate-oom.py`              | OOM-Loop-Output   | OOM-Rollup `_oom-overview.txt` + `_oom-findings.csv`.  |
+| `fetch-all-loop.sh`             | Live-Cluster (+Prom) | Kombinierter Wrapper: State-Loop + OOM-Loop in einem Ordner. |
