@@ -1,0 +1,265 @@
+{
+    "apiVersion": "v1",
+    "items": [
+        {
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": {
+                "annotations": {
+                    "argocd.argoproj.io/sync-wave": "9",
+                    "argocd.argoproj.io/tracking-id": "pid-1062-digitaleakte-ref-111:autoscaling/HorizontalPodAutoscaler:pid-1062-digitaleakte-ref-111-prodda/hpa-application-layer",
+                    "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"autoscaling/v1\",\"kind\":\"HorizontalPodAutoscaler\",\"metadata\":{\"annotations\":{\"argocd.argoproj.io/sync-wave\":\"9\",\"argocd.argoproj.io/tracking-id\":\"pid-1062-digitaleakte-ref-111:autoscaling/HorizontalPodAutoscaler:pid-1062-digitaleakte-ref-111-prodda/hpa-application-layer\"},\"labels\":{\"app\":\"application-layer\",\"app.kubernetes.io/instance\":\"pid-1062-digitaleakte-ref-111\",\"app.kubernetes.io/managed-by\":\"Helm\",\"app.kubernetes.io/name\":\"nscale\",\"app.kubernetes.io/part-of\":\"nscale\",\"nscale.ceyoniq.com/version\":\"9\"},\"name\":\"hpa-application-layer\",\"namespace\":\"pid-1062-digitaleakte-ref-111-prodda\"},\"spec\":{\"maxReplicas\":2,\"minReplicas\":2,\"scaleTargetRef\":{\"apiVersion\":\"apps/v1\",\"kind\":\"StatefulSet\",\"name\":\"application-layer\"},\"targetCPUUtilizationPercentage\":80}}\n"
+                },
+                "creationTimestamp": "2025-11-22T14:24:29Z",
+                "labels": {
+                    "app": "application-layer",
+                    "app.kubernetes.io/instance": "pid-1062-digitaleakte-ref-111",
+                    "app.kubernetes.io/managed-by": "Helm",
+                    "app.kubernetes.io/name": "nscale",
+                    "app.kubernetes.io/part-of": "nscale",
+                    "nscale.ceyoniq.com/version": "9"
+                },
+                "name": "hpa-application-layer",
+                "namespace": "pid-1062-digitaleakte-ref-111-prodda",
+                "resourceVersion": "15089289207",
+                "uid": "d5d4cef7-4b91-40b9-af08-298f0831cf30"
+            },
+            "spec": {
+                "maxReplicas": 2,
+                "metrics": [
+                    {
+                        "resource": {
+                            "name": "cpu",
+                            "target": {
+                                "averageUtilization": 80,
+                                "type": "Utilization"
+                            }
+                        },
+                        "type": "Resource"
+                    }
+                ],
+                "minReplicas": 2,
+                "scaleTargetRef": {
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "name": "application-layer"
+                }
+            },
+            "status": {
+                "conditions": [
+                    {
+                        "lastTransitionTime": "2025-11-22T14:24:44Z",
+                        "message": "recent recommendations were higher than current one, applying the highest recent recommendation",
+                        "reason": "ScaleDownStabilized",
+                        "status": "True",
+                        "type": "AbleToScale"
+                    },
+                    {
+                        "lastTransitionTime": "2026-04-29T11:27:36Z",
+                        "message": "the HPA was able to successfully calculate a replica count from cpu resource utilization (percentage of request)",
+                        "reason": "ValidMetricFound",
+                        "status": "True",
+                        "type": "ScalingActive"
+                    },
+                    {
+                        "lastTransitionTime": "2026-05-08T18:44:20Z",
+                        "message": "the desired replica count is less than the minimum replica count",
+                        "reason": "TooFewReplicas",
+                        "status": "True",
+                        "type": "ScalingLimited"
+                    }
+                ],
+                "currentMetrics": [
+                    {
+                        "resource": {
+                            "current": {
+                                "averageUtilization": 0,
+                                "averageValue": "2m"
+                            },
+                            "name": "cpu"
+                        },
+                        "type": "Resource"
+                    }
+                ],
+                "currentReplicas": 2,
+                "desiredReplicas": 2,
+                "lastScaleTime": "2026-04-29T13:35:57Z"
+            }
+        },
+        {
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": {
+                "annotations": {
+                    "argocd.argoproj.io/sync-wave": "9",
+                    "argocd.argoproj.io/tracking-id": "pid-1062-digitaleakte-ref-111:autoscaling/HorizontalPodAutoscaler:pid-1062-digitaleakte-ref-111-prodda/hpa-application-layer-web-1",
+                    "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"autoscaling/v1\",\"kind\":\"HorizontalPodAutoscaler\",\"metadata\":{\"annotations\":{\"argocd.argoproj.io/sync-wave\":\"9\",\"argocd.argoproj.io/tracking-id\":\"pid-1062-digitaleakte-ref-111:autoscaling/HorizontalPodAutoscaler:pid-1062-digitaleakte-ref-111-prodda/hpa-application-layer-web-1\"},\"labels\":{\"app\":\"application-layer-web\",\"app.kubernetes.io/instance\":\"pid-1062-digitaleakte-ref-111\",\"app.kubernetes.io/managed-by\":\"Helm\",\"app.kubernetes.io/name\":\"nscale\",\"app.kubernetes.io/part-of\":\"nscale\",\"nscale.ceyoniq.com/version\":\"9\",\"svc\":\"nappl-web-1\"},\"name\":\"hpa-application-layer-web-1\",\"namespace\":\"pid-1062-digitaleakte-ref-111-prodda\"},\"spec\":{\"maxReplicas\":2,\"minReplicas\":2,\"scaleTargetRef\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"name\":\"application-layer-web-1\"},\"targetCPUUtilizationPercentage\":80}}\n"
+                },
+                "creationTimestamp": "2025-11-22T14:24:29Z",
+                "labels": {
+                    "app": "application-layer-web",
+                    "app.kubernetes.io/instance": "pid-1062-digitaleakte-ref-111",
+                    "app.kubernetes.io/managed-by": "Helm",
+                    "app.kubernetes.io/name": "nscale",
+                    "app.kubernetes.io/part-of": "nscale",
+                    "nscale.ceyoniq.com/version": "9",
+                    "svc": "nappl-web-1"
+                },
+                "name": "hpa-application-layer-web-1",
+                "namespace": "pid-1062-digitaleakte-ref-111-prodda",
+                "resourceVersion": "15089289219",
+                "uid": "58384828-ddb7-4669-bc71-70f2bb9eafb6"
+            },
+            "spec": {
+                "maxReplicas": 2,
+                "metrics": [
+                    {
+                        "resource": {
+                            "name": "cpu",
+                            "target": {
+                                "averageUtilization": 80,
+                                "type": "Utilization"
+                            }
+                        },
+                        "type": "Resource"
+                    }
+                ],
+                "minReplicas": 2,
+                "scaleTargetRef": {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "application-layer-web-1"
+                }
+            },
+            "status": {
+                "conditions": [
+                    {
+                        "lastTransitionTime": "2026-02-19T07:42:59Z",
+                        "message": "recent recommendations were higher than current one, applying the highest recent recommendation",
+                        "reason": "ScaleDownStabilized",
+                        "status": "True",
+                        "type": "AbleToScale"
+                    },
+                    {
+                        "lastTransitionTime": "2026-05-07T10:08:11Z",
+                        "message": "the HPA was able to successfully calculate a replica count from cpu resource utilization (percentage of request)",
+                        "reason": "ValidMetricFound",
+                        "status": "True",
+                        "type": "ScalingActive"
+                    },
+                    {
+                        "lastTransitionTime": "2026-05-17T01:12:30Z",
+                        "message": "the desired replica count is less than the minimum replica count",
+                        "reason": "TooFewReplicas",
+                        "status": "True",
+                        "type": "ScalingLimited"
+                    }
+                ],
+                "currentMetrics": [
+                    {
+                        "resource": {
+                            "current": {
+                                "averageUtilization": 0,
+                                "averageValue": "9m"
+                            },
+                            "name": "cpu"
+                        },
+                        "type": "Resource"
+                    }
+                ],
+                "currentReplicas": 2,
+                "desiredReplicas": 2,
+                "lastScaleTime": "2026-04-29T13:35:57Z"
+            }
+        },
+        {
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": {
+                "annotations": {
+                    "argocd.argoproj.io/sync-wave": "5",
+                    "argocd.argoproj.io/tracking-id": "pid-1062-digitaleakte-ref-111:autoscaling/HorizontalPodAutoscaler:pid-1062-digitaleakte-ref-111-prodda/hpa-rendition-server",
+                    "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"autoscaling/v1\",\"kind\":\"HorizontalPodAutoscaler\",\"metadata\":{\"annotations\":{\"argocd.argoproj.io/sync-wave\":\"5\",\"argocd.argoproj.io/tracking-id\":\"pid-1062-digitaleakte-ref-111:autoscaling/HorizontalPodAutoscaler:pid-1062-digitaleakte-ref-111-prodda/hpa-rendition-server\"},\"labels\":{\"app\":\"rendition-server\",\"app.kubernetes.io/instance\":\"pid-1062-digitaleakte-ref-111\",\"app.kubernetes.io/managed-by\":\"Helm\",\"app.kubernetes.io/name\":\"nscale\",\"app.kubernetes.io/part-of\":\"nscale\",\"nscale.ceyoniq.com/version\":\"9\"},\"name\":\"hpa-rendition-server\",\"namespace\":\"pid-1062-digitaleakte-ref-111-prodda\"},\"spec\":{\"maxReplicas\":2,\"minReplicas\":2,\"scaleTargetRef\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"name\":\"rendition-server\"},\"targetCPUUtilizationPercentage\":80}}\n"
+                },
+                "creationTimestamp": "2025-11-22T14:19:07Z",
+                "labels": {
+                    "app": "rendition-server",
+                    "app.kubernetes.io/instance": "pid-1062-digitaleakte-ref-111",
+                    "app.kubernetes.io/managed-by": "Helm",
+                    "app.kubernetes.io/name": "nscale",
+                    "app.kubernetes.io/part-of": "nscale",
+                    "nscale.ceyoniq.com/version": "9"
+                },
+                "name": "hpa-rendition-server",
+                "namespace": "pid-1062-digitaleakte-ref-111-prodda",
+                "resourceVersion": "15079684072",
+                "uid": "dae4ed26-d8b0-4422-b017-e2fa2acce5da"
+            },
+            "spec": {
+                "maxReplicas": 2,
+                "metrics": [
+                    {
+                        "resource": {
+                            "name": "cpu",
+                            "target": {
+                                "averageUtilization": 80,
+                                "type": "Utilization"
+                            }
+                        },
+                        "type": "Resource"
+                    }
+                ],
+                "minReplicas": 2,
+                "scaleTargetRef": {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "rendition-server"
+                }
+            },
+            "status": {
+                "conditions": [
+                    {
+                        "lastTransitionTime": "2025-11-22T14:19:22Z",
+                        "message": "recommended size matches current size",
+                        "reason": "ReadyForNewScale",
+                        "status": "True",
+                        "type": "AbleToScale"
+                    },
+                    {
+                        "lastTransitionTime": "2026-04-29T11:31:38Z",
+                        "message": "the HPA was able to successfully calculate a replica count from cpu resource utilization (percentage of request)",
+                        "reason": "ValidMetricFound",
+                        "status": "True",
+                        "type": "ScalingActive"
+                    },
+                    {
+                        "lastTransitionTime": "2026-05-09T04:13:52Z",
+                        "message": "the desired replica count is less than the minimum replica count",
+                        "reason": "TooFewReplicas",
+                        "status": "True",
+                        "type": "ScalingLimited"
+                    }
+                ],
+                "currentMetrics": [
+                    {
+                        "resource": {
+                            "current": {
+                                "averageUtilization": 0,
+                                "averageValue": "1m"
+                            },
+                            "name": "cpu"
+                        },
+                        "type": "Resource"
+                    }
+                ],
+                "currentReplicas": 2,
+                "desiredReplicas": 2,
+                "lastScaleTime": "2025-11-22T14:19:22Z"
+            }
+        }
+    ],
+    "kind": "List",
+    "metadata": {
+        "resourceVersion": ""
+    }
+}
