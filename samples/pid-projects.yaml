@@ -1,0 +1,349 @@
+# Sample pid-* projects for exercising scripts/python/fetch-cluster-state.py.
+#
+# Five namespaces, one per stage (ref / test / prod / phase / pnext),
+# named per the convention the script parses:
+#     pid-<id>-<app>-<STAGE>-<num>-<suffix>
+#
+# Resources are deliberately tiny (1 replica, nginx-unprivileged or busybox,
+# CPU in millicores, memory in MiB) so they fit on CRC / minikube / kind+OCP.
+#
+# Two HPAs are intentionally broken so the validation CSV/Excel has rows to
+# show:
+#   - pid-003-web-prod-01-blue: HPA targets a missing Deployment
+#   - pid-004-batch-phase-01-blue: HPA uses a Resource metric, but the target
+#     Deployment has no container resources.requests
+#
+# Apply with:
+#     oc apply -f samples/pid-projects.yaml
+# Then run:
+#     ./scripts/fetch-cluster-state-loop.sh
+# Or, for a single project:
+#     python3 scripts/python/fetch-cluster-state.py \
+#         --project pid-002-api-test-01-blue --output-dir ./reports/manual
+#
+# Clean up:
+#     for ns in pid-001-shop-ref-01-blue pid-002-api-test-01-blue \
+#               pid-003-web-prod-01-blue pid-004-batch-phase-01-blue \
+#               pid-005-cache-pnext-01-blue; do
+#       oc delete project "$ns" --ignore-not-found
+#     done
+
+---
+# ============================================================================
+# 1) ref stage — healthy baseline: deployment + service + working HPA
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pid-001-shop-ref-01-blue
+  labels:
+    environment: ref
+    app: shop
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop-web
+  namespace: pid-001-shop-ref-01-blue
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: shop-web }
+  template:
+    metadata:
+      labels: { app: shop-web }
+    spec:
+      containers:
+        - name: web
+          image: nginxinc/nginx-unprivileged:alpine
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop-web
+  namespace: pid-001-shop-ref-01-blue
+spec:
+  selector: { app: shop-web }
+  ports: [{ name: http, port: 80, targetPort: 8080 }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: shop-web
+  namespace: pid-001-shop-ref-01-blue
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: shop-web
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+
+---
+# ============================================================================
+# 2) test stage — most complete: deployment + statefulset + quota + limitrange
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pid-002-api-test-01-blue
+  labels:
+    environment: test
+    app: api
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: api-quota
+  namespace: pid-002-api-test-01-blue
+spec:
+  hard:
+    requests.cpu: "2"
+    requests.memory: 1Gi
+    limits.cpu: "4"
+    limits.memory: 2Gi
+    pods: "10"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: api-defaults
+  namespace: pid-002-api-test-01-blue
+spec:
+  limits:
+    - type: Container
+      default:        { cpu: 200m, memory: 128Mi }
+      defaultRequest: { cpu: 50m,  memory: 64Mi }
+      max:            { cpu: "1",  memory: 512Mi }
+      min:            { cpu: 10m,  memory: 16Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: pid-002-api-test-01-blue
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: api-server }
+  template:
+    metadata:
+      labels: { app: api-server }
+    spec:
+      containers:
+        - name: api
+          image: nginxinc/nginx-unprivileged:alpine
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits:   { cpu: 300m, memory: 128Mi }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: api-worker
+  namespace: pid-002-api-test-01-blue
+spec:
+  serviceName: api-worker
+  replicas: 1
+  selector:
+    matchLabels: { app: api-worker }
+  template:
+    metadata:
+      labels: { app: api-worker }
+    spec:
+      containers:
+        - name: worker
+          image: busybox:1.36
+          command: ["sh", "-c", "while true; do echo work; sleep 30; done"]
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-server
+  namespace: pid-002-api-test-01-blue
+spec:
+  selector: { app: api-server }
+  ports: [{ name: http, port: 80, targetPort: 8080 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-worker
+  namespace: pid-002-api-test-01-blue
+spec:
+  clusterIP: None
+  selector: { app: api-worker }
+  ports: [{ name: gossip, port: 7000 }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-server
+  namespace: pid-002-api-test-01-blue
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-server
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 60 }
+    - type: Resource
+      resource:
+        name: memory
+        target: { type: Utilization, averageUtilization: 75 }
+
+---
+# ============================================================================
+# 3) prod stage — broken HPA: scaleTargetRef points to a Deployment that
+#    does not exist. Validation should report "target Deployment/... not
+#    found in namespace".
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pid-003-web-prod-01-blue
+  labels:
+    environment: prod
+    app: web
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-frontend
+  namespace: pid-003-web-prod-01-blue
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: web-frontend }
+  template:
+    metadata:
+      labels: { app: web-frontend }
+    spec:
+      containers:
+        - name: web
+          image: nginxinc/nginx-unprivileged:alpine
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-frontend-orphan
+  namespace: pid-003-web-prod-01-blue
+spec:
+  # Intentionally wrong: this Deployment does not exist
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-frontend-does-not-exist
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+
+---
+# ============================================================================
+# 4) phase stage — workload has NO resources.requests, but its HPA uses a
+#    Resource metric. Validation should report "HPA uses Resource metric but
+#    target containers have no resources.requests".
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pid-004-batch-phase-01-blue
+  labels:
+    environment: phase
+    app: batch
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batch-runner
+  namespace: pid-004-batch-phase-01-blue
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: batch-runner }
+  template:
+    metadata:
+      labels: { app: batch-runner }
+    spec:
+      containers:
+        - name: runner
+          image: busybox:1.36
+          command: ["sh", "-c", "while true; do sleep 60; done"]
+          # No resources block on purpose
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: batch-runner
+  namespace: pid-004-batch-phase-01-blue
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: batch-runner
+  minReplicas: 1
+  maxReplicas: 2
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 80 }
+
+---
+# ============================================================================
+# 5) pnext stage — minimal: just a namespace and a single deployment.
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pid-005-cache-pnext-01-blue
+  labels:
+    environment: pnext
+    app: cache
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache
+  namespace: pid-005-cache-pnext-01-blue
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: cache }
+  template:
+    metadata:
+      labels: { app: cache }
+    spec:
+      containers:
+        - name: cache
+          image: busybox:1.36
+          command: ["sh", "-c", "while true; do sleep 60; done"]
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits:   { cpu: 100m, memory: 64Mi }

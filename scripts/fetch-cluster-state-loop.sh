@@ -1,6 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # fetch-cluster-state-loop.sh
+#
+# Requires bash 4+ (uses mapfile, declare -A, ${var,,}). On macOS the
+# system /bin/bash is 3.2; install a newer bash via `brew install bash`
+# and ensure it is on PATH ahead of /bin/bash (the shebang above honors
+# PATH).
 #
 # Iterates over every OpenShift project whose name starts with "pid-"
 # (same discovery + stage detection as check-bind-resources.sh and
@@ -192,10 +197,26 @@ echo "Building master overview..."
         }' | sort
 } > "${MASTER_FILE}"
 
+# Resources overview (cluster-wide rollup: pods, CPU/mem req+lim, PVCs,
+# quota usage). Built by a separate Python aggregator so we have proper
+# JSON parsing for snapshot.json. Failure is non-fatal -- the rest of the
+# report is still useful.
+RES_TXT="${REPORT_DIR}/_resources-overview.txt"
+RES_CSV="${REPORT_DIR}/_resources-overview.csv"
+echo "Building resources overview..."
+if python3 "${SCRIPT_DIR}/python/aggregate-resources.py" \
+        --input-dir "${REPORT_DIR}" >/dev/null; then
+    echo "  ok"
+else
+    echo "  [WARN] resources overview generation failed" >&2
+fi
+
 echo "----------------------------------------"
 echo "Done."
 echo "Per-namespace:  ${REPORT_DIR}/by-stage/<stage>/<ns>/"
 echo "Combined HPAs:  ${HPA_CSV}"
 echo "Combined dims:  ${DIM_CSV}"
 echo "Master:         ${MASTER_FILE}"
+echo "Resources:      ${RES_TXT}"
+echo "Resources CSV:  ${RES_CSV}"
 echo "----------------------------------------"
