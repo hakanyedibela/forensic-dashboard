@@ -30,6 +30,12 @@
 #
 # Requires: oc (logged in), python3, fetch-cluster-state.py (next to this
 # script), PyYAML (`pip install pyyaml`).
+#
+# Optional env var:
+#   OC_BIN=/full/path/to/oc   point at oc explicitly. Use this when oc
+#                             lives at a non-standard path (e.g. a network
+#                             share like /mnt/Gruppenfreigabe/linux-bin/oc)
+#                             and the subprocess PATH cannot find it.
 
 set -euo pipefail
 

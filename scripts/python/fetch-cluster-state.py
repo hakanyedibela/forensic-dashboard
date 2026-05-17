@@ -54,6 +54,7 @@ Requires:
 import argparse
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
@@ -79,6 +80,13 @@ except ImportError:
 STAGE_KEYWORDS = ("ref", "prod", "test", "phase", "pnext")
 PROJECT_PREFIX = "pid-"
 
+# Allow callers on hosts with a non-standard oc location (e.g. a network-
+# mounted /mnt/Gruppenfreigabe/linux-bin/oc) to point the script at it
+# directly, bypassing PATH entirely. Falls back to "oc" so existing setups
+# keep working unchanged. Picked up once at import time so all subsequent
+# subprocess.run([_OC_BIN, ...]) calls use the same binary.
+_OC_BIN = os.environ.get("OC_BIN", "oc")
+
 
 # ---------------------------------------------------------------------------
 # oc wrappers
@@ -96,7 +104,7 @@ def oc(*args, check=False):
     """
     try:
         result = subprocess.run(
-            ["oc"] + list(args),
+            [_OC_BIN] + list(args),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
@@ -110,17 +118,20 @@ def oc(*args, check=False):
         if result.returncode != 0:
             err = (result.stderr or "").strip()
             sys.stderr.write(
-                "oc {} exited {}{}\n".format(
-                    " ".join(args), result.returncode,
+                "{} {} exited {}{}\n".format(
+                    _OC_BIN, " ".join(args), result.returncode,
                     ": " + err if err else "",
                 )
             )
         return result.stdout
     except FileNotFoundError:
-        sys.stderr.write("error: oc is not installed or not on PATH\n")
+        sys.stderr.write(
+            "error: '{}' is not installed or not on PATH. "
+            "Set OC_BIN=/full/path/to/oc to point at it explicitly.\n"
+            .format(_OC_BIN))
         sys.exit(1)
     except subprocess.CalledProcessError as e:
-        sys.stderr.write(f"oc {' '.join(args)} failed: {e.stderr}\n")
+        sys.stderr.write(f"{_OC_BIN} {' '.join(args)} failed: {e.stderr}\n")
         if check:
             raise
         return ""

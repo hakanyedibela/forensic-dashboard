@@ -42,6 +42,9 @@
 #   OOM_PROMETHEUS_PORT  pass through to --prometheus-port
 #   OOM_TOKEN            pass through to --token
 #   OOM_INSECURE=1       pass through to --insecure
+#   OC_BIN               full path to oc when it's at a non-standard location
+#                        (e.g. /mnt/Gruppenfreigabe/linux-bin/oc). Honoured
+#                        by fetch-cluster-oom.py too.
 # When none of these are set, the loop passes --no-prometheus so the run
 # stays fast and self-contained. Enable Prometheus when you want metric-
 # based verdicts (A/B/C/D/E patterns).

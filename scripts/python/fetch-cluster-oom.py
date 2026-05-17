@@ -13,7 +13,13 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-CLI = "oc"
+import os as _os
+
+# Default CLI binary. Overridable via $OC_BIN (or $KUBECTL_BIN when --kubectl
+# is used). Useful on hosts where oc lives at a non-standard path such as a
+# network-mounted /mnt/Gruppenfreigabe/linux-bin/oc -- export OC_BIN there
+# and you can stop fighting PATH.
+CLI = _os.environ.get("OC_BIN", "oc")
 
 
 # ---------------------------------------------------------------- subprocess
@@ -1314,7 +1320,13 @@ def main():
     p.add_argument("--kubectl", action="store_true", help="use kubectl instead of oc")
     args = p.parse_args()
 
-    CLI = "kubectl" if args.kubectl else "oc"
+    # --kubectl wins over OC_BIN; otherwise honor OC_BIN (set above at
+    # import time, but re-read here so a test that monkey-patches the env
+    # after import still works).
+    if args.kubectl:
+        CLI = _os.environ.get("KUBECTL_BIN", "kubectl")
+    else:
+        CLI = _os.environ.get("OC_BIN", "oc")
     if not shutil.which(CLI):
         sys.stderr.write(f"{CLI} not found in PATH\n")
         sys.exit(2)
