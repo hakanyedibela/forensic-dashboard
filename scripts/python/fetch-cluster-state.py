@@ -6,15 +6,14 @@ Snapshot the current state of every OpenShift project starting with "pid-",
 grouped by stage (ref/prod/test/phase/pnext/other), and produce:
 
   * per-namespace JSON snapshot (normalized current state)
-  * per-namespace YAML "desired state" (re-applyable manifests, stripped of
-    status/runtime fields) — can be diffed or piped into `oc apply -f`
+  * per-namespace "desired state" manifests (re-applyable, stripped of
+    status/runtime fields) — YAML when PyYAML is available, otherwise
+    JSON. Both formats work with `oc apply -f`.
   * an HPA-binding validation report (does each HPA's scaleTargetRef resolve
     to an existing Deployment/StatefulSet, are min/max replicas sane, are
     metrics configured, ...)
   * CSV summaries with the most important dimensions across namespaces
   * a top-level overview JSON
-  * a multi-sheet Excel workbook (_cluster-state.xlsx) with frozen headers,
-    autofilters and conditional formatting for HPA issues and quota usage
 
 Layout (under ./state-YYYYMMDD-HHMMSS/):
 
@@ -47,8 +46,7 @@ Usage:
 Requires:
     * oc (logged in)
     * Python 3.6.8+
-    * PyYAML   (pip install pyyaml)
-    * openpyxl (pip install openpyxl)   — for the .xlsx workbook
+    * PyYAML   (optional; falls back to JSON desired/* manifests if missing)
 """
 
 import argparse
@@ -62,38 +60,31 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+# PyYAML is optional. When present, desired/*.yaml files are written in
+# canonical YAML; when missing (or only the old 3.13 that ships with
+# RHEL 7 / Python 3.6.8, which rejects `sort_keys=`), we fall back to
+# desired/*.json. Both formats are accepted by `oc apply -f`, so the
+# downstream re-apply workflow is identical.
+_YAML_DUMP_KWARGS = None  # None == JSON fallback; {} or {"sort_keys": False} == YAML
 try:
     import yaml
+    try:
+        import io as _io
+        yaml.safe_dump_all([{"a": 1}], _io.StringIO(), sort_keys=False)
+        _YAML_DUMP_KWARGS = {"sort_keys": False}
+    except TypeError:
+        sys.stderr.write(
+            "warning: installed PyYAML does not support sort_keys -- "
+            "desired/*.yaml will be alphabetically sorted instead of "
+            "API-field-ordered. Functionally identical.\n"
+        )
+        _YAML_DUMP_KWARGS = {}
 except ImportError:
-    sys.stderr.write("error: PyYAML is required (pip install pyyaml)\n")
-    sys.exit(1)
-
-# PyYAML 5.1+ accepts `sort_keys=` in dump/dump_all. Older PyYAML (e.g.
-# the 3.13 that ships in RHEL 7 / Python 3.6.8 base packages) raises
-# TypeError on that kwarg, which used to take down write_desired() and
-# silently abort the whole per-namespace pipeline -- producing empty
-# CSVs across the cluster. Detect support once here and pass the right
-# kwargs dict everywhere we dump YAML.
-try:
-    import io as _io
-    yaml.safe_dump_all([{"a": 1}], _io.StringIO(), sort_keys=False)
-    _YAML_DUMP_KWARGS = {"sort_keys": False}
-except TypeError:
+    yaml = None
     sys.stderr.write(
-        "warning: installed PyYAML does not support sort_keys -- "
-        "desired/*.yaml will be alphabetically sorted instead of "
-        "API-field-ordered. Functionally identical. "
-        "(pip install --upgrade pyyaml to silence this.)\n"
+        "info: PyYAML not installed -- writing desired/*.json instead of "
+        "desired/*.yaml. `oc apply -f` accepts both.\n"
     )
-    _YAML_DUMP_KWARGS = {}
-
-try:
-    import openpyxl
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
-    _HAS_OPENPYXL = True
-except ImportError:
-    _HAS_OPENPYXL = False
 
 
 STAGE_KEYWORDS = ("ref", "prod", "test", "phase", "pnext")
@@ -624,36 +615,44 @@ def build_snapshot(ns, stage, raw, bindings):
 
 
 def write_desired(desired_dir, raw):
-    """Schreibt 'desired/'-YAML-Files (wiederapplybar) pro Ressourcen-Typ.
+    """Schreibt 'desired/'-Manifeste (wiederapplybar) pro Ressourcen-Typ.
 
     Dateinamen sind numerisch praefixiert (00, 10, 20, ...), damit
     `oc apply -f desired/` sie in der richtigen Reihenfolge anwendet
     (Namespace zuerst, danach Quota/LimitRange/NetPol, danach Workloads,
-    am Ende HPAs). Leere Listen werden uebersprungen, also keine
-    leeren YAML-Files.
+    am Ende HPAs). Leere Listen werden uebersprungen.
+
+    Format-Detail: schreibt YAML, wenn PyYAML installiert ist; sonst JSON
+    (eine Liste pro Datei). `oc apply -f` akzeptiert beide Formate.
     """
     desired_dir.mkdir(parents=True, exist_ok=True)
+    # Base names without extension -- ext is decided per available library.
     files = [
-        ("00-namespace.yaml",       [raw["namespace_obj"]] if raw["namespace_obj"] else []),
-        ("10-resourcequotas.yaml",  raw["resourcequotas"]),
-        ("20-limitranges.yaml",     raw["limitranges"]),
-        ("30-networkpolicies.yaml", raw["networkpolicies"]),
-        ("40-deployments.yaml",     raw["deployments"]),
-        ("41-statefulsets.yaml",    raw["statefulsets"]),
-        ("50-services.yaml",        raw["services"]),
-        ("60-pvcs.yaml",            raw["pvcs"]),
-        ("70-hpas.yaml",            raw["hpas"]),
+        ("00-namespace",       [raw["namespace_obj"]] if raw["namespace_obj"] else []),
+        ("10-resourcequotas",  raw["resourcequotas"]),
+        ("20-limitranges",     raw["limitranges"]),
+        ("30-networkpolicies", raw["networkpolicies"]),
+        ("40-deployments",     raw["deployments"]),
+        ("41-statefulsets",    raw["statefulsets"]),
+        ("50-services",        raw["services"]),
+        ("60-pvcs",            raw["pvcs"]),
+        ("70-hpas",            raw["hpas"]),
     ]
-    for filename, items in files:
+    use_yaml = yaml is not None
+    ext = ".yaml" if use_yaml else ".json"
+    for basename, items in files:
         items = [it for it in items if it]
         if not items:
             continue
-        with (desired_dir / filename).open("w") as f:
-            # Materialise the generator before dumping so the file isn't
-            # left half-written if dumping raises (small benefit: a
-            # cleaner desired/ directory when something goes wrong).
-            docs = [to_desired(it) for it in items]
-            yaml.safe_dump_all(docs, f, **_YAML_DUMP_KWARGS)
+        docs = [to_desired(it) for it in items]
+        with (desired_dir / (basename + ext)).open("w") as f:
+            if use_yaml:
+                yaml.safe_dump_all(docs, f, **_YAML_DUMP_KWARGS)
+            else:
+                # Multi-doc as a JSON array. `oc apply -f` accepts a List
+                # wrapper too, but a plain array works on every oc version
+                # we target and reads more naturally.
+                json.dump(docs, f, indent=2, default=str)
 
 
 def process_namespace(ns, stage, out_root):
@@ -740,408 +739,12 @@ def write_dimensions_csv(path, rows):
 
 
 # ---------------------------------------------------------------------------
-# Excel workbook
-# ---------------------------------------------------------------------------
-
-_HEADER_FILL = "1F4E78"      # dark blue
-_HEADER_FONT = "FFFFFF"      # white
-_ROW_BAD     = "F8CBAD"      # light red   — HPA issues, quota >95%
-_ROW_WARN    = "FFE699"      # light amber — quota 80–95%
-_ROW_OK      = "E2EFDA"      # light green — clean rows
-
-
-def _parse_quota_amount(dim, val):
-    """Normalisiert einen ResourceQuota-Wert auf eine vergleichbare Zahl.
-
-    Eine Quota hat unterschiedliche Dimensionen mit unterschiedlichen
-    Einheiten:
-      - 'requests.cpu' / 'limits.cpu'       -> Millicores
-      - 'requests.memory' / 'storage'       -> MiB
-      - 'pods', 'services', 'count/*', ...  -> Stueckzahl (float)
-
-    Anhand des Dimensions-Namens wird die richtige Einheit gewaehlt --
-    so kann 'used / hard' als Prozentsatz berechnet werden.
-    """
-    if val in (None, ""):
-        return 0.0
-    d = dim.lower()
-    if "cpu" in d:
-        return float(parse_cpu_millis(val))
-    if "memory" in d or "storage" in d:
-        return float(parse_mem_mib(val))
-    try:
-        return float(str(val))
-    except ValueError:
-        return 0.0
-
-
-def _style_header(ws, ncols):
-    """Stylt die erste Zeile eines Excel-Sheets als Header.
-
-    Blauer Hintergrund + weiss + bold, plus 'freeze pane' (Header bleibt
-    beim Scrollen sichtbar) und ein Auto-Filter auf der ganzen
-    Header-Zeile. Wird auf jedes Sheet im Workbook angewendet.
-    """
-    fill = PatternFill("solid", fgColor=_HEADER_FILL)
-    font = Font(bold=True, color=_HEADER_FONT)
-    align = Alignment(vertical="center")
-    for col in range(1, ncols + 1):
-        cell = ws.cell(row=1, column=col)
-        cell.fill = fill
-        cell.font = font
-        cell.alignment = align
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(ncols)}1"
-
-
-def _autosize(ws, max_width=60):
-    """Setzt die Spaltenbreite jedes Excel-Sheets auf den laengsten Inhalt.
-
-    Begrenzt auf max_width (Default 60 Zeichen), damit eine lange
-    Issue-Liste die Tabelle nicht ungenutzt breit macht. Mindestbreite
-    10, damit die Header lesbar bleiben.
-    """
-    for col_cells in ws.columns:
-        letter = col_cells[0].column_letter
-        width = 0
-        for cell in col_cells:
-            v = cell.value
-            if v is None:
-                continue
-            for line in str(v).split("\n"):
-                if len(line) > width:
-                    width = len(line)
-        ws.column_dimensions[letter].width = min(max(width + 2, 10), max_width)
-
-
-def _fill_row(ws, row_idx, ncols, color):
-    """Faerbt eine komplette Zeile in einem Excel-Sheet ein.
-
-    Wird fuer 'conditional formatting' verwendet: rote Zeile bei HPA-Issue
-    oder PVC unbound, Amber bei Quota 80-95%, Gruen bei sauberen HPAs.
-    """
-    fill = PatternFill("solid", fgColor=color)
-    for c in range(1, ncols + 1):
-        ws.cell(row=row_idx, column=c).fill = fill
-
-
-def _write_rows(ws, headers, rows, row_colors=None):
-    """Schreibt Header + Datenzeilen in ein Excel-Sheet und stylt es.
-
-    Wird von jeder _build_*_sheet()-Funktion verwendet, damit das Layout
-    (Header-Styling, Auto-Size, optionale Zeilenfarbe) ueberall gleich
-    ist. row_colors ist eine Liste in derselben Reihenfolge wie rows;
-    None pro Zeile bedeutet 'nicht einfaerben'.
-    """
-    ws.append(headers)
-    for i, row in enumerate(rows):
-        ws.append(row)
-        if row_colors and row_colors[i]:
-            _fill_row(ws, ws.max_row, len(headers), row_colors[i])
-    _style_header(ws, len(headers))
-    _autosize(ws)
-
-
-def _format_ports(ports):
-    """Formatiert eine Service-ports-Liste als kompakten String.
-
-    Beispiele:
-      [{port:80, protocol:'TCP'}]                   -> '80/TCP'
-      [{name:'http', port:80, targetPort:8080}]     -> 'http:80/TCP->8080'
-
-    Wird im Excel-Services-Sheet verwendet, damit alle Ports in einer
-    Zelle stehen.
-    """
-    out = []
-    for p in ports or []:
-        name = p.get("name") or ""
-        port = p.get("port")
-        proto = p.get("protocol") or "TCP"
-        target = p.get("targetPort")
-        chunk = f"{name}:{port}/{proto}" if name else f"{port}/{proto}"
-        if target not in (None, "", port):
-            chunk += f"→{target}"
-        out.append(chunk)
-    return ", ".join(out)
-
-
-def _build_overview_sheet(wb, overview):
-    """Baut das erste Sheet 'Overview' im Excel-Workbook.
-
-    Enthaelt Metadaten (Generierungszeit, Cluster-URL, Namespace-Anzahl)
-    und eine Per-Stage-Zusammenfassung (namespaces, deployments,
-    statefulsets, hpas, hpaIssues, pvcs). Rot eingefaerbt fuer Stages
-    mit HPA-Issues.
-    """
-    ws = wb.create_sheet("Overview")
-    ws["A1"] = "Cluster forensic snapshot"
-    ws["A1"].font = Font(bold=True, size=14)
-    ws["A2"] = "Generated at"
-    ws["B2"] = overview.get("generatedAt")
-    ws["A3"] = "Cluster"
-    ws["B3"] = overview.get("cluster")
-    ws["A4"] = "Total namespaces"
-    ws["B4"] = overview.get("totalNamespaces")
-    for r in range(2, 5):
-        ws.cell(row=r, column=1).font = Font(bold=True)
-
-    ws["A6"] = "Per-stage summary"
-    ws["A6"].font = Font(bold=True, size=12)
-
-    headers = ["stage", "namespaces", "deployments", "statefulsets",
-               "hpas", "hpaIssues", "pvcs"]
-    ws.append([])  # row 7 spacer? actually append goes to next free row
-    # Re-anchor: clear append cursor by writing header at row 8
-    for i, h in enumerate(headers, start=1):
-        ws.cell(row=8, column=i, value=h)
-    fill = PatternFill("solid", fgColor=_HEADER_FILL)
-    font = Font(bold=True, color=_HEADER_FONT)
-    for i in range(1, len(headers) + 1):
-        c = ws.cell(row=8, column=i)
-        c.fill = fill
-        c.font = font
-
-    row = 9
-    for stage in sorted((overview.get("byStage") or {}).keys()):
-        s = overview["byStage"][stage]
-        ws.cell(row=row, column=1, value=stage)
-        ws.cell(row=row, column=2, value=s.get("namespaces"))
-        ws.cell(row=row, column=3, value=s.get("deployments"))
-        ws.cell(row=row, column=4, value=s.get("statefulsets"))
-        ws.cell(row=row, column=5, value=s.get("hpas"))
-        ws.cell(row=row, column=6, value=s.get("hpaIssues"))
-        ws.cell(row=row, column=7, value=s.get("pvcs"))
-        if (s.get("hpaIssues") or 0) > 0:
-            _fill_row(ws, row, len(headers), _ROW_BAD)
-        row += 1
-    _autosize(ws)
-
-
-def _build_namespaces_sheet(wb, results):
-    """Sheet 'Namespaces': eine Zeile pro Namespace mit Counts pro Ressource.
-
-    Spalten: stage, namespace, env, deployments, statefulsets, hpas,
-    hpaIssues, pvcs, services, resourceQuotas, limitRanges,
-    networkPolicies. Rot, wenn der Namespace HPA-Issues hat.
-    """
-    ws = wb.create_sheet("Namespaces")
-    headers = ["stage", "namespace", "env",
-               "deployments", "statefulsets", "hpas", "hpaIssues",
-               "pvcs", "services", "resourceQuotas", "limitRanges",
-               "networkPolicies"]
-    rows, colors = [], []
-    for res in sorted(results, key=lambda r: (r["stage"], r["namespace"])):
-        snap = res["snapshot"]
-        bindings = res["bindings"]
-        hpa_issues = sum(1 for b in bindings if not b["ok"])
-        rows.append([
-            res["stage"], res["namespace"], snap.get("env"),
-            len(snap["deployments"]), len(snap["statefulsets"]),
-            len(bindings), hpa_issues,
-            len(snap["pvcs"]), len(snap["services"]),
-            len(snap["resourceQuotas"]), len(snap["limitRanges"]),
-            len(snap["networkPolicies"]),
-        ])
-        colors.append(_ROW_BAD if hpa_issues else None)
-    _write_rows(ws, headers, rows, colors)
-
-
-def _build_hpa_sheet(wb, results):
-    """Sheet 'HPAs': eine Zeile pro HorizontalPodAutoscaler.
-
-    Die fehlerhaften HPAs werden NACH OBEN sortiert (False vor True),
-    damit man die Probleme zuerst sieht. Rot bei issues, Gruen bei
-    sauberen HPAs.
-    """
-    ws = wb.create_sheet("HPAs")
-    headers = ["stage", "namespace", "hpa", "ok",
-               "targetKind", "targetName", "targetFound",
-               "targetSpecReplicas", "targetHasRequests",
-               "minReplicas", "maxReplicas",
-               "currentReplicas", "desiredReplicas",
-               "metricsCount", "metrics", "issues"]
-    rows, colors = [], []
-    for res in results:
-        for b in res["bindings"]:
-            metrics_str = "; ".join(
-                f"{m.get('type')}:{m.get('name') or ''}" for m in b["metrics"]
-            )
-            rows.append([
-                res["stage"], res["namespace"], b["hpa"], b["ok"],
-                b["targetKind"], b["targetName"], b["targetFound"],
-                b["targetSpecReplicas"], b["targetHasRequests"],
-                b["minReplicas"], b["maxReplicas"],
-                b["currentReplicas"], b["desiredReplicas"],
-                len(b["metrics"]), metrics_str,
-                "; ".join(b["issues"]),
-            ])
-            colors.append(_ROW_BAD if not b["ok"] else _ROW_OK)
-    rows.sort(key=lambda r: (bool(r[3]), r[0], r[1], r[2]))  # bad (False) first
-    colors = [_ROW_BAD if not r[3] else _ROW_OK for r in rows]
-    _write_rows(ws, headers, rows, colors)
-
-
-def _build_quotas_sheet(wb, results):
-    """Sheet 'ResourceQuotas': eine Zeile pro Quota-Dimension.
-
-    used%-Spalte zeigt die Auslastung. Rot bei >=95%, Amber bei >=80%,
-    sonst neutral. Hilft beim Aufspueren von Namespaces, die kurz vorm
-    Quota-Limit stehen.
-    """
-    ws = wb.create_sheet("ResourceQuotas")
-    headers = ["stage", "namespace", "quota", "dimension",
-               "hard", "used", "used %"]
-    rows, colors = [], []
-    for res in results:
-        for q in res["snapshot"]["resourceQuotas"]:
-            hard = q.get("hard") or {}
-            used = q.get("used") or {}
-            dims = sorted(set(hard.keys()) | set(used.keys()))
-            for dim in dims:
-                h_raw = hard.get(dim, "")
-                u_raw = used.get(dim, "")
-                h = _parse_quota_amount(dim, h_raw)
-                u = _parse_quota_amount(dim, u_raw)
-                pct = round((u / h) * 100, 1) if h > 0 else None
-                rows.append([
-                    res["stage"], res["namespace"], q["name"], dim,
-                    str(h_raw) if h_raw != "" else "",
-                    str(u_raw) if u_raw != "" else "",
-                    pct,
-                ])
-                if pct is None:
-                    colors.append(None)
-                elif pct >= 95:
-                    colors.append(_ROW_BAD)
-                elif pct >= 80:
-                    colors.append(_ROW_WARN)
-                else:
-                    colors.append(None)
-    _write_rows(ws, headers, rows, colors)
-
-
-def _build_limitranges_sheet(wb, results):
-    """Sheet 'LimitRanges': eine Zeile pro LimitRange-Constraint x Ressource.
-
-    Zeigt die Default/Min/Max-Werte fuer cpu, memory, ... pro LimitRange.
-    Hilfreich um zu pruefen, ob ein Namespace ueberhaupt Default-Limits
-    setzt.
-    """
-    ws = wb.create_sheet("LimitRanges")
-    headers = ["stage", "namespace", "limitRange", "type", "resource",
-               "min", "max", "default", "defaultRequest",
-               "maxLimitRequestRatio"]
-    rows = []
-    for res in results:
-        for lr in res["snapshot"]["limitRanges"]:
-            name = lr["name"]
-            for limit in lr.get("limits") or []:
-                ltype = limit.get("type")
-                resources = set()
-                for key in ("max", "min", "default",
-                            "defaultRequest", "maxLimitRequestRatio"):
-                    resources.update((limit.get(key) or {}).keys())
-                for r in sorted(resources):
-                    rows.append([
-                        res["stage"], res["namespace"], name, ltype, r,
-                        (limit.get("min") or {}).get(r, ""),
-                        (limit.get("max") or {}).get(r, ""),
-                        (limit.get("default") or {}).get(r, ""),
-                        (limit.get("defaultRequest") or {}).get(r, ""),
-                        (limit.get("maxLimitRequestRatio") or {}).get(r, ""),
-                    ])
-    _write_rows(ws, headers, rows)
-
-
-def _build_workloads_sheet(wb, results):
-    """Sheet 'Workloads': eine Zeile pro Deployment/StatefulSet.
-
-    Zeigt Replicas, Ready, Container-Anzahl, Images und CPU/Mem
-    Requests+Limits. Amber, wenn ein Workload weder cpu_req noch
-    mem_req gesetzt hat (hat Folgen fuer HPAs und Scheduler-
-    Reservierungen).
-    """
-    ws = wb.create_sheet("Workloads")
-    headers = ["stage", "namespace", "kind", "name",
-               "replicas", "readyReplicas", "availableReplicas",
-               "containers", "images",
-               "cpu_req_millis", "mem_req_mib",
-               "cpu_lim_millis", "mem_lim_mib"]
-    rows, colors = [], []
-    for res in results:
-        for kind, key in (("Deployment", "deployments"),
-                          ("StatefulSet", "statefulsets")):
-            for w in res["snapshot"][key]:
-                rows.append([
-                    res["stage"], res["namespace"], kind, w["name"],
-                    w.get("replicas"),
-                    w.get("readyReplicas"),
-                    w.get("availableReplicas"),
-                    w.get("containers"),
-                    ", ".join(w.get("images") or []),
-                    w.get("cpu_req_millis"),
-                    w.get("mem_req_mib"),
-                    w.get("cpu_lim_millis"),
-                    w.get("mem_lim_mib"),
-                ])
-                # Highlight workloads with no resource requests configured
-                no_req = (w.get("cpu_req_millis") or 0) == 0 and (
-                    w.get("mem_req_mib") or 0) == 0
-                colors.append(_ROW_WARN if no_req else None)
-    _write_rows(ws, headers, rows, colors)
-
-
-def _build_pvcs_sheet(wb, results):
-    """Sheet 'PVCs': eine Zeile pro PersistentVolumeClaim.
-
-    Rot, wenn der PVC nicht 'Bound' ist (z. B. 'Pending' wegen falscher
-    StorageClass). Storage-Groesse in GiB.
-    """
-    ws = wb.create_sheet("PVCs")
-    headers = ["stage", "namespace", "pvc", "status",
-               "storage_gib", "storageClass", "accessModes"]
-    rows, colors = [], []
-    for res in results:
-        for p in res["snapshot"]["pvcs"]:
-            rows.append([
-                res["stage"], res["namespace"], p["name"],
-                p.get("status"),
-                p.get("storage_gib"),
-                p.get("storageClass"),
-                ", ".join(p.get("accessModes") or []),
-            ])
-            colors.append(_ROW_BAD if p.get("status") not in (None, "Bound")
-                          else None)
-    _write_rows(ws, headers, rows, colors)
-
-
-def _build_services_sheet(wb, results):
-    """Sheet 'Services': eine Zeile pro Service.
-
-    Zeigt type (ClusterIP/NodePort/LoadBalancer/Headless), clusterIP und
-    eine kompakte Ports-Darstellung (via _format_ports).
-    """
-    ws = wb.create_sheet("Services")
-    headers = ["stage", "namespace", "service", "type",
-               "clusterIP", "ports"]
-    rows = []
-    for res in results:
-        for s in res["snapshot"]["services"]:
-            rows.append([
-                res["stage"], res["namespace"], s["name"],
-                s.get("type"), s.get("clusterIP"),
-                _format_ports(s.get("ports")),
-            ])
-    _write_rows(ws, headers, rows)
-
-
-# ---------------------------------------------------------------------------
 # Text inspector (--text mode)
 #
 # Druckt einen einzelnen Namespace menschenlesbar nach stdout. Gedacht
 # fuer Debugging: zeigt, wieviel oc tatsaechlich geliefert hat, und ob
-# das im Snapshot landet. Wenn die Excel-Sheets oder die CSVs leer sind,
-# sieht man hier auf welcher Stufe die Daten verschwinden.
+# das im Snapshot landet. Wenn die CSVs leer sind, sieht man hier auf
+# welcher Stufe die Daten verschwinden.
 # ---------------------------------------------------------------------------
 
 def _text_hr(char="=", width=78):
@@ -1160,10 +763,6 @@ def render_namespace_text(res):
     print("NAMESPACE  {}   (stage={})".format(res["namespace"], res["stage"]))
     print(_text_hr("="))
 
-    # --- Section 1: raw fetch counts -------------------------------------
-    # The first place to look when sheets are empty: how much did oc
-    # actually return? If anything here is 0 unexpectedly, the problem
-    # is at the oc/fetch layer, not in the renderers.
     counts = [
         ("deployments",     len(deployments)),
         ("statefulsets",    len(statefulsets)),
@@ -1177,10 +776,9 @@ def render_namespace_text(res):
     print()
     print("FETCH COUNTS  (what `oc get <kind> -n {} -o json` returned)".format(res["namespace"]))
     for name, n in counts:
-        marker = "  <-- 0; the corresponding sheet/CSV WILL be empty" if n == 0 else ""
+        marker = "  <-- 0; the corresponding CSV WILL be empty" if n == 0 else ""
         print("  {:<18} {:>4}{}".format(name + ":", n, marker))
 
-    # --- Section 2: per-kind details -------------------------------------
     print()
     print("DEPLOYMENTS ({})".format(len(deployments)))
     if not deployments:
@@ -1256,10 +854,6 @@ def render_namespace_text(res):
     for nm in snap.get("networkPolicies") or []:
         print("  - {}".format(nm))
 
-    # --- Section 3: would-be CSV row counts ------------------------------
-    # If these are 0 but FETCH COUNTS above are non-zero, the bug is
-    # downstream of the fetch (in validate_hpas/build_snapshot/the
-    # renderer). If both are 0, the bug is in the fetch.
     print()
     print("CSV ROW PREVIEW  (what would be written to the aggregate CSVs)")
     print("  _hpa-validation.csv:  {} data row(s)".format(len(bindings)))
@@ -1274,37 +868,6 @@ def render_namespace_text(res):
     print(_text_hr("="))
 
 
-def write_excel(path, results, overview):
-    """Baut das _cluster-state.xlsx-Workbook mit allen Sheets.
-
-    Sheets: Overview, Namespaces, HPAs, ResourceQuotas, LimitRanges,
-    Workloads, PVCs, Services. Jeder Tab hat formatierte Header
-    (Auto-Filter, Freeze-Pane) und farbliche Markierung der Probleme.
-
-    Wenn openpyxl nicht installiert ist, wird eine Warnung nach stderr
-    geschrieben und das Workbook ausgelassen (kein Abbruch -- CSV und
-    JSON-Reports werden trotzdem geschrieben).
-    """
-    if not _HAS_OPENPYXL:
-        sys.stderr.write(
-            "warning: openpyxl not installed — skipping .xlsx export "
-            "(pip install openpyxl)\n"
-        )
-        return
-    wb = openpyxl.Workbook()
-    # Remove default sheet, we'll create our own
-    wb.remove(wb.active)
-    _build_overview_sheet(wb, overview)
-    _build_namespaces_sheet(wb, results)
-    _build_hpa_sheet(wb, results)
-    _build_quotas_sheet(wb, results)
-    _build_limitranges_sheet(wb, results)
-    _build_workloads_sheet(wb, results)
-    _build_pvcs_sheet(wb, results)
-    _build_services_sheet(wb, results)
-    wb.save(path)
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1317,7 +880,7 @@ def main():
     fuehrt process_namespace() parallel via ThreadPoolExecutor aus.
 
     Am Ende werden die aggregierten Files (_hpa-validation.csv,
-    _dimensions.csv, _overview.json, _cluster-state.xlsx) geschrieben.
+    _dimensions.csv, _overview.json) geschrieben.
 
     Rueckgabe: 0 bei Erfolg (oder wenn keine Projekte gefunden wurden).
     Nicht-fatale Fehler einzelner Namespaces werden auf stderr gemeldet
@@ -1494,17 +1057,12 @@ def main():
 
     (out_root / "_overview.json").write_text(json.dumps(overview, indent=2))
 
-    xlsx_path = out_root / "_cluster-state.xlsx"
-    write_excel(xlsx_path, results, overview)
-
     bad_hpas = sum(1 for r in hpa_rows if not r["ok"])
     print(f"\nDone. Output: {out_root}")
     print(f"  Overview:        {out_root / '_overview.json'}")
     print(f"  HPA validation:  {out_root / '_hpa-validation.csv'}  "
           f"({bad_hpas} HPA(s) with issues)")
     print(f"  Dimensions:      {out_root / '_dimensions.csv'}")
-    if _HAS_OPENPYXL:
-        print(f"  Excel workbook:  {xlsx_path}")
     print(f"  Per-namespace:   {out_root}/by-stage/<stage>/<ns>/")
     return 0
 
