@@ -1,9 +1,10 @@
 /.idea/
 
-# fetch-cluster-state outputs
+# forensic-dashboard report outputs
 /reports/
 state-loop-*/
 state-2*/
+oom-loop-*/
 
 # Python bytecode
 __pycache__/

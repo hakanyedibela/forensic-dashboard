@@ -36,8 +36,37 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PY_SCRIPT="${SCRIPT_DIR}/python/fetch-cluster-state.py"
 
-TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-REPORT_DIR="./reports/state-loop-${TIMESTAMP}"
+# --report-dir DIR overrides the default of ./reports/state-loop-<ts>/.
+# Used by fetch-all-loop.sh to point this script and fetch-oom-loop.sh at
+# the same shared report directory so their artifacts coexist.
+REPORT_DIR=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --report-dir)
+            REPORT_DIR="${2:-}"
+            if [[ -z "${REPORT_DIR}" ]]; then
+                echo "error: --report-dir requires an argument" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: $(basename "$0") [--report-dir DIR]"
+            echo "  --report-dir DIR  Write outputs to DIR instead of ./reports/state-loop-<ts>/."
+            exit 0
+            ;;
+        *)
+            echo "error: unknown argument: $1" >&2
+            echo "Usage: $(basename "$0") [--report-dir DIR]" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "${REPORT_DIR}" ]]; then
+    TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+    REPORT_DIR="./reports/state-loop-${TIMESTAMP}"
+fi
 HPA_CSV="${REPORT_DIR}/_hpa-validation.csv"
 DIM_CSV="${REPORT_DIR}/_dimensions.csv"
 MASTER_FILE="${REPORT_DIR}/_master-overview.txt"
