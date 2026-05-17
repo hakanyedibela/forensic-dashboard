@@ -1,1 +1,10 @@
 /.idea/
+
+# fetch-cluster-state outputs
+/reports/
+state-loop-*/
+state-2*/
+
+# Python bytecode
+__pycache__/
+*.pyc

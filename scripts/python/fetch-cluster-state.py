@@ -13,6 +13,8 @@ grouped by stage (ref/prod/test/phase/pnext/other), and produce:
     metrics configured, ...)
   * CSV summaries with the most important dimensions across namespaces
   * a top-level overview JSON
+  * a multi-sheet Excel workbook (_cluster-state.xlsx) with frozen headers,
+    autofilters and conditional formatting for HPA issues and quota usage
 
 Layout (under ./state-YYYYMMDD-HHMMSS/):
 
@@ -44,11 +46,10 @@ Usage:
 
 Requires:
     * oc (logged in)
-    * Python 3.8+
-    * PyYAML  (pip install pyyaml)
+    * Python 3.6.8+
+    * PyYAML   (pip install pyyaml)
+    * openpyxl (pip install openpyxl)   — for the .xlsx workbook
 """
-
-from __future__ import annotations
 
 import argparse
 import csv
@@ -59,13 +60,20 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 try:
     import yaml
 except ImportError:
     sys.stderr.write("error: PyYAML is required (pip install pyyaml)\n")
     sys.exit(1)
+
+try:
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    _HAS_OPENPYXL = True
+except ImportError:
+    _HAS_OPENPYXL = False
 
 
 STAGE_KEYWORDS = ("ref", "prod", "test", "phase", "pnext")
@@ -76,10 +84,14 @@ PROJECT_PREFIX = "pid-"
 # oc wrappers
 # ---------------------------------------------------------------------------
 
-def oc(*args: str, check: bool = False) -> str:
+def oc(*args, check=False):
     try:
         result = subprocess.run(
-            ["oc", *args], capture_output=True, text=True, check=check,
+            ["oc"] + list(args),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            check=check,
         )
         return result.stdout
     except FileNotFoundError:
@@ -92,7 +104,7 @@ def oc(*args: str, check: bool = False) -> str:
         return ""
 
 
-def oc_get_single(kind: str, name: str, ns: str | None = None) -> dict | None:
+def oc_get_single(kind, name, ns=None):
     args = ["get", kind, name, "-o", "json"]
     if ns:
         args += ["-n", ns]
@@ -105,7 +117,7 @@ def oc_get_single(kind: str, name: str, ns: str | None = None) -> dict | None:
         return None
 
 
-def oc_get_list(kind: str, ns: str) -> list[dict]:
+def oc_get_list(kind, ns):
     out = oc("get", kind, "-n", ns, "-o", "json")
     if not out.strip():
         return []
@@ -115,7 +127,7 @@ def oc_get_list(kind: str, ns: str) -> list[dict]:
         return []
 
 
-def list_pid_projects() -> list[str]:
+def list_pid_projects():
     out = oc("get", "projects", "-o", "name")
     names = []
     for line in out.splitlines():
@@ -130,7 +142,7 @@ def list_pid_projects() -> list[str]:
 # Stage detection + parsing helpers
 # ---------------------------------------------------------------------------
 
-def detect_stage(ns: str) -> str:
+def detect_stage(ns):
     parts = ns.lower().split("-")
     if len(parts) > 3 and parts[3] in STAGE_KEYWORDS:
         return parts[3]
@@ -140,7 +152,7 @@ def detect_stage(ns: str) -> str:
     return "other"
 
 
-def parse_cpu_millis(v: Any) -> int:
+def parse_cpu_millis(v):
     if v in (None, "", "<none>"):
         return 0
     s = str(v).strip()
@@ -167,7 +179,7 @@ _MEM_UNITS = {
 }
 
 
-def parse_mem_mib(v: Any) -> int:
+def parse_mem_mib(v):
     if v in (None, "", "<none>"):
         return 0
     s = str(v).strip()
@@ -183,7 +195,7 @@ def parse_mem_mib(v: Any) -> int:
     return int(n * factor)
 
 
-def parse_storage_gib(v: Any) -> float:
+def parse_storage_gib(v):
     """PVC storage in Gi (float)."""
     mib = parse_mem_mib(v)
     return round(mib / 1024, 2)
@@ -207,7 +219,7 @@ _STRIP_ANNOTATION_PREFIXES = (
 )
 
 
-def _clean_metadata(meta: dict) -> dict:
+def _clean_metadata(meta):
     if not isinstance(meta, dict):
         return meta
     clean = {k: v for k, v in meta.items() if k not in _STRIP_METADATA_FIELDS}
@@ -223,7 +235,7 @@ def _clean_metadata(meta: dict) -> dict:
     return clean
 
 
-def to_desired(obj: dict) -> dict:
+def to_desired(obj):
     if not isinstance(obj, dict):
         return obj
     out = {
@@ -241,7 +253,7 @@ def to_desired(obj: dict) -> dict:
 # Per-workload dimensions
 # ---------------------------------------------------------------------------
 
-def workload_dimensions(workload: dict) -> dict:
+def workload_dimensions(workload):
     spec = workload.get("spec") or {}
     tmpl_spec = ((spec.get("template") or {}).get("spec") or {})
     containers = tmpl_spec.get("containers") or []
@@ -274,7 +286,7 @@ def workload_dimensions(workload: dict) -> dict:
 # HPA binding validation
 # ---------------------------------------------------------------------------
 
-def _metric_summary(m: dict) -> dict:
+def _metric_summary(m):
     t = m.get("type")
     if t == "Resource":
         r = m.get("resource") or {}
@@ -288,7 +300,7 @@ def _metric_summary(m: dict) -> dict:
     return {"type": t}
 
 
-def validate_hpas(hpas: list[dict], workloads_by_kind: dict[str, dict]) -> list[dict]:
+def validate_hpas(hpas, workloads_by_kind):
     results = []
     for hpa in hpas:
         meta = hpa.get("metadata") or {}
@@ -363,7 +375,7 @@ def validate_hpas(hpas: list[dict], workloads_by_kind: dict[str, dict]) -> list[
     return results
 
 
-def _target_has_requests(target: dict) -> bool:
+def _target_has_requests(target):
     containers = (((target.get("spec") or {}).get("template") or {})
                   .get("spec") or {}).get("containers") or []
     if not containers:
@@ -375,7 +387,7 @@ def _target_has_requests(target: dict) -> bool:
 # Per-namespace pipeline
 # ---------------------------------------------------------------------------
 
-def fetch_namespace(ns: str) -> dict:
+def fetch_namespace(ns):
     return {
         "namespace_obj":   oc_get_single("namespace", ns),
         "deployments":     oc_get_list("deployments", ns),
@@ -389,7 +401,7 @@ def fetch_namespace(ns: str) -> dict:
     }
 
 
-def build_snapshot(ns: str, stage: str, raw: dict, bindings: list[dict]) -> dict:
+def build_snapshot(ns, stage, raw, bindings):
     ns_obj = raw["namespace_obj"] or {}
     labels = ((ns_obj.get("metadata") or {}).get("labels")) or {}
 
@@ -453,7 +465,7 @@ def build_snapshot(ns: str, stage: str, raw: dict, bindings: list[dict]) -> dict
     }
 
 
-def write_desired(desired_dir: Path, raw: dict) -> None:
+def write_desired(desired_dir, raw):
     desired_dir.mkdir(parents=True, exist_ok=True)
     files = [
         ("00-namespace.yaml",       [raw["namespace_obj"]] if raw["namespace_obj"] else []),
@@ -475,7 +487,7 @@ def write_desired(desired_dir: Path, raw: dict) -> None:
                                sort_keys=False)
 
 
-def process_namespace(ns: str, stage: str, out_root: Path) -> dict:
+def process_namespace(ns, stage, out_root):
     ns_dir = out_root / "by-stage" / stage / ns
     ns_dir.mkdir(parents=True, exist_ok=True)
 
@@ -506,7 +518,7 @@ def process_namespace(ns: str, stage: str, out_root: Path) -> dict:
 # CSV writers
 # ---------------------------------------------------------------------------
 
-def write_hpa_csv(path: Path, rows: list[dict]) -> None:
+def write_hpa_csv(path, rows):
     fields = [
         "stage", "namespace", "hpa", "ok",
         "targetKind", "targetName", "targetFound", "targetSpecReplicas",
@@ -521,7 +533,7 @@ def write_hpa_csv(path: Path, rows: list[dict]) -> None:
             w.writerow(r)
 
 
-def write_dimensions_csv(path: Path, rows: list[dict]) -> None:
+def write_dimensions_csv(path, rows):
     fields = [
         "stage", "namespace", "kind", "name",
         "replicas", "readyReplicas", "containers", "images",
@@ -535,10 +547,341 @@ def write_dimensions_csv(path: Path, rows: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Excel workbook
+# ---------------------------------------------------------------------------
+
+_HEADER_FILL = "1F4E78"      # dark blue
+_HEADER_FONT = "FFFFFF"      # white
+_ROW_BAD     = "F8CBAD"      # light red   — HPA issues, quota >95%
+_ROW_WARN    = "FFE699"      # light amber — quota 80–95%
+_ROW_OK      = "E2EFDA"      # light green — clean rows
+
+
+def _parse_quota_amount(dim, val):
+    """Normalize a quota value to a comparable scalar.
+
+    - dimensions containing 'cpu'    → CPU millis
+    - dimensions containing 'memory' or 'storage' → MiB
+    - everything else (pods, count/*, services, ...) → plain float
+    """
+    if val in (None, ""):
+        return 0.0
+    d = dim.lower()
+    if "cpu" in d:
+        return float(parse_cpu_millis(val))
+    if "memory" in d or "storage" in d:
+        return float(parse_mem_mib(val))
+    try:
+        return float(str(val))
+    except ValueError:
+        return 0.0
+
+
+def _style_header(ws, ncols):
+    fill = PatternFill("solid", fgColor=_HEADER_FILL)
+    font = Font(bold=True, color=_HEADER_FONT)
+    align = Alignment(vertical="center")
+    for col in range(1, ncols + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = align
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(ncols)}1"
+
+
+def _autosize(ws, max_width=60):
+    for col_cells in ws.columns:
+        letter = col_cells[0].column_letter
+        width = 0
+        for cell in col_cells:
+            v = cell.value
+            if v is None:
+                continue
+            for line in str(v).split("\n"):
+                if len(line) > width:
+                    width = len(line)
+        ws.column_dimensions[letter].width = min(max(width + 2, 10), max_width)
+
+
+def _fill_row(ws, row_idx, ncols, color):
+    fill = PatternFill("solid", fgColor=color)
+    for c in range(1, ncols + 1):
+        ws.cell(row=row_idx, column=c).fill = fill
+
+
+def _write_rows(ws, headers, rows, row_colors=None):
+    ws.append(headers)
+    for i, row in enumerate(rows):
+        ws.append(row)
+        if row_colors and row_colors[i]:
+            _fill_row(ws, ws.max_row, len(headers), row_colors[i])
+    _style_header(ws, len(headers))
+    _autosize(ws)
+
+
+def _format_ports(ports):
+    out = []
+    for p in ports or []:
+        name = p.get("name") or ""
+        port = p.get("port")
+        proto = p.get("protocol") or "TCP"
+        target = p.get("targetPort")
+        chunk = f"{name}:{port}/{proto}" if name else f"{port}/{proto}"
+        if target not in (None, "", port):
+            chunk += f"→{target}"
+        out.append(chunk)
+    return ", ".join(out)
+
+
+def _build_overview_sheet(wb, overview):
+    ws = wb.create_sheet("Overview")
+    ws["A1"] = "Cluster forensic snapshot"
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"] = "Generated at"
+    ws["B2"] = overview.get("generatedAt")
+    ws["A3"] = "Cluster"
+    ws["B3"] = overview.get("cluster")
+    ws["A4"] = "Total namespaces"
+    ws["B4"] = overview.get("totalNamespaces")
+    for r in range(2, 5):
+        ws.cell(row=r, column=1).font = Font(bold=True)
+
+    ws["A6"] = "Per-stage summary"
+    ws["A6"].font = Font(bold=True, size=12)
+
+    headers = ["stage", "namespaces", "deployments", "statefulsets",
+               "hpas", "hpaIssues", "pvcs"]
+    ws.append([])  # row 7 spacer? actually append goes to next free row
+    # Re-anchor: clear append cursor by writing header at row 8
+    for i, h in enumerate(headers, start=1):
+        ws.cell(row=8, column=i, value=h)
+    fill = PatternFill("solid", fgColor=_HEADER_FILL)
+    font = Font(bold=True, color=_HEADER_FONT)
+    for i in range(1, len(headers) + 1):
+        c = ws.cell(row=8, column=i)
+        c.fill = fill
+        c.font = font
+
+    row = 9
+    for stage in sorted((overview.get("byStage") or {}).keys()):
+        s = overview["byStage"][stage]
+        ws.cell(row=row, column=1, value=stage)
+        ws.cell(row=row, column=2, value=s.get("namespaces"))
+        ws.cell(row=row, column=3, value=s.get("deployments"))
+        ws.cell(row=row, column=4, value=s.get("statefulsets"))
+        ws.cell(row=row, column=5, value=s.get("hpas"))
+        ws.cell(row=row, column=6, value=s.get("hpaIssues"))
+        ws.cell(row=row, column=7, value=s.get("pvcs"))
+        if (s.get("hpaIssues") or 0) > 0:
+            _fill_row(ws, row, len(headers), _ROW_BAD)
+        row += 1
+    _autosize(ws)
+
+
+def _build_namespaces_sheet(wb, results):
+    ws = wb.create_sheet("Namespaces")
+    headers = ["stage", "namespace", "env",
+               "deployments", "statefulsets", "hpas", "hpaIssues",
+               "pvcs", "services", "resourceQuotas", "limitRanges",
+               "networkPolicies"]
+    rows, colors = [], []
+    for res in sorted(results, key=lambda r: (r["stage"], r["namespace"])):
+        snap = res["snapshot"]
+        bindings = res["bindings"]
+        hpa_issues = sum(1 for b in bindings if not b["ok"])
+        rows.append([
+            res["stage"], res["namespace"], snap.get("env"),
+            len(snap["deployments"]), len(snap["statefulsets"]),
+            len(bindings), hpa_issues,
+            len(snap["pvcs"]), len(snap["services"]),
+            len(snap["resourceQuotas"]), len(snap["limitRanges"]),
+            len(snap["networkPolicies"]),
+        ])
+        colors.append(_ROW_BAD if hpa_issues else None)
+    _write_rows(ws, headers, rows, colors)
+
+
+def _build_hpa_sheet(wb, results):
+    ws = wb.create_sheet("HPAs")
+    headers = ["stage", "namespace", "hpa", "ok",
+               "targetKind", "targetName", "targetFound",
+               "targetSpecReplicas", "targetHasRequests",
+               "minReplicas", "maxReplicas",
+               "currentReplicas", "desiredReplicas",
+               "metricsCount", "metrics", "issues"]
+    rows, colors = [], []
+    for res in results:
+        for b in res["bindings"]:
+            metrics_str = "; ".join(
+                f"{m.get('type')}:{m.get('name') or ''}" for m in b["metrics"]
+            )
+            rows.append([
+                res["stage"], res["namespace"], b["hpa"], b["ok"],
+                b["targetKind"], b["targetName"], b["targetFound"],
+                b["targetSpecReplicas"], b["targetHasRequests"],
+                b["minReplicas"], b["maxReplicas"],
+                b["currentReplicas"], b["desiredReplicas"],
+                len(b["metrics"]), metrics_str,
+                "; ".join(b["issues"]),
+            ])
+            colors.append(_ROW_BAD if not b["ok"] else _ROW_OK)
+    rows.sort(key=lambda r: (bool(r[3]), r[0], r[1], r[2]))  # bad (False) first
+    colors = [_ROW_BAD if not r[3] else _ROW_OK for r in rows]
+    _write_rows(ws, headers, rows, colors)
+
+
+def _build_quotas_sheet(wb, results):
+    ws = wb.create_sheet("ResourceQuotas")
+    headers = ["stage", "namespace", "quota", "dimension",
+               "hard", "used", "used %"]
+    rows, colors = [], []
+    for res in results:
+        for q in res["snapshot"]["resourceQuotas"]:
+            hard = q.get("hard") or {}
+            used = q.get("used") or {}
+            dims = sorted(set(hard.keys()) | set(used.keys()))
+            for dim in dims:
+                h_raw = hard.get(dim, "")
+                u_raw = used.get(dim, "")
+                h = _parse_quota_amount(dim, h_raw)
+                u = _parse_quota_amount(dim, u_raw)
+                pct = round((u / h) * 100, 1) if h > 0 else None
+                rows.append([
+                    res["stage"], res["namespace"], q["name"], dim,
+                    str(h_raw) if h_raw != "" else "",
+                    str(u_raw) if u_raw != "" else "",
+                    pct,
+                ])
+                if pct is None:
+                    colors.append(None)
+                elif pct >= 95:
+                    colors.append(_ROW_BAD)
+                elif pct >= 80:
+                    colors.append(_ROW_WARN)
+                else:
+                    colors.append(None)
+    _write_rows(ws, headers, rows, colors)
+
+
+def _build_limitranges_sheet(wb, results):
+    ws = wb.create_sheet("LimitRanges")
+    headers = ["stage", "namespace", "limitRange", "type", "resource",
+               "min", "max", "default", "defaultRequest",
+               "maxLimitRequestRatio"]
+    rows = []
+    for res in results:
+        for lr in res["snapshot"]["limitRanges"]:
+            name = lr["name"]
+            for limit in lr.get("limits") or []:
+                ltype = limit.get("type")
+                resources = set()
+                for key in ("max", "min", "default",
+                            "defaultRequest", "maxLimitRequestRatio"):
+                    resources.update((limit.get(key) or {}).keys())
+                for r in sorted(resources):
+                    rows.append([
+                        res["stage"], res["namespace"], name, ltype, r,
+                        (limit.get("min") or {}).get(r, ""),
+                        (limit.get("max") or {}).get(r, ""),
+                        (limit.get("default") or {}).get(r, ""),
+                        (limit.get("defaultRequest") or {}).get(r, ""),
+                        (limit.get("maxLimitRequestRatio") or {}).get(r, ""),
+                    ])
+    _write_rows(ws, headers, rows)
+
+
+def _build_workloads_sheet(wb, results):
+    ws = wb.create_sheet("Workloads")
+    headers = ["stage", "namespace", "kind", "name",
+               "replicas", "readyReplicas", "availableReplicas",
+               "containers", "images",
+               "cpu_req_millis", "mem_req_mib",
+               "cpu_lim_millis", "mem_lim_mib"]
+    rows, colors = [], []
+    for res in results:
+        for kind, key in (("Deployment", "deployments"),
+                          ("StatefulSet", "statefulsets")):
+            for w in res["snapshot"][key]:
+                rows.append([
+                    res["stage"], res["namespace"], kind, w["name"],
+                    w.get("replicas"),
+                    w.get("readyReplicas"),
+                    w.get("availableReplicas"),
+                    w.get("containers"),
+                    ", ".join(w.get("images") or []),
+                    w.get("cpu_req_millis"),
+                    w.get("mem_req_mib"),
+                    w.get("cpu_lim_millis"),
+                    w.get("mem_lim_mib"),
+                ])
+                # Highlight workloads with no resource requests configured
+                no_req = (w.get("cpu_req_millis") or 0) == 0 and (
+                    w.get("mem_req_mib") or 0) == 0
+                colors.append(_ROW_WARN if no_req else None)
+    _write_rows(ws, headers, rows, colors)
+
+
+def _build_pvcs_sheet(wb, results):
+    ws = wb.create_sheet("PVCs")
+    headers = ["stage", "namespace", "pvc", "status",
+               "storage_gib", "storageClass", "accessModes"]
+    rows, colors = [], []
+    for res in results:
+        for p in res["snapshot"]["pvcs"]:
+            rows.append([
+                res["stage"], res["namespace"], p["name"],
+                p.get("status"),
+                p.get("storage_gib"),
+                p.get("storageClass"),
+                ", ".join(p.get("accessModes") or []),
+            ])
+            colors.append(_ROW_BAD if p.get("status") not in (None, "Bound")
+                          else None)
+    _write_rows(ws, headers, rows, colors)
+
+
+def _build_services_sheet(wb, results):
+    ws = wb.create_sheet("Services")
+    headers = ["stage", "namespace", "service", "type",
+               "clusterIP", "ports"]
+    rows = []
+    for res in results:
+        for s in res["snapshot"]["services"]:
+            rows.append([
+                res["stage"], res["namespace"], s["name"],
+                s.get("type"), s.get("clusterIP"),
+                _format_ports(s.get("ports")),
+            ])
+    _write_rows(ws, headers, rows)
+
+
+def write_excel(path, results, overview):
+    if not _HAS_OPENPYXL:
+        sys.stderr.write(
+            "warning: openpyxl not installed — skipping .xlsx export "
+            "(pip install openpyxl)\n"
+        )
+        return
+    wb = openpyxl.Workbook()
+    # Remove default sheet, we'll create our own
+    wb.remove(wb.active)
+    _build_overview_sheet(wb, overview)
+    _build_namespaces_sheet(wb, results)
+    _build_hpa_sheet(wb, results)
+    _build_quotas_sheet(wb, results)
+    _build_limitranges_sheet(wb, results)
+    _build_workloads_sheet(wb, results)
+    _build_pvcs_sheet(wb, results)
+    _build_services_sheet(wb, results)
+    wb.save(path)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> int:
+def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--output-dir", default=None,
@@ -569,7 +912,7 @@ def main() -> int:
 
     print(f"Processing {len(targets)} projects with {args.workers} workers...")
 
-    results: list[dict] = []
+    results = []
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         future_to_ns = {
             ex.submit(process_namespace, ns, stage, out_root): ns
@@ -674,12 +1017,17 @@ def main() -> int:
 
     (out_root / "_overview.json").write_text(json.dumps(overview, indent=2))
 
+    xlsx_path = out_root / "_cluster-state.xlsx"
+    write_excel(xlsx_path, results, overview)
+
     bad_hpas = sum(1 for r in hpa_rows if not r["ok"])
     print(f"\nDone. Output: {out_root}")
     print(f"  Overview:        {out_root / '_overview.json'}")
     print(f"  HPA validation:  {out_root / '_hpa-validation.csv'}  "
           f"({bad_hpas} HPA(s) with issues)")
     print(f"  Dimensions:      {out_root / '_dimensions.csv'}")
+    if _HAS_OPENPYXL:
+        print(f"  Excel workbook:  {xlsx_path}")
     print(f"  Per-namespace:   {out_root}/by-stage/<stage>/<ns>/")
     return 0
 

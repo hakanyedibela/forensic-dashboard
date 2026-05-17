@@ -9,7 +9,7 @@
 # HPA bindings tree. After the loop, per-namespace CSVs are concatenated
 # into combined CSVs and a master overview is produced.
 #
-# Outputs (under ./state-loop-<timestamp>/):
+# Outputs (under ./reports/state-loop-<timestamp>/):
 #   by-stage/<stage>/<ns>/
 #       run.log
 #       _overview.json
@@ -29,10 +29,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PY_SCRIPT="${SCRIPT_DIR}/fetch-cluster-state.py"
+PY_SCRIPT="${SCRIPT_DIR}/python/fetch-cluster-state.py"
 
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-REPORT_DIR="./state-loop-${TIMESTAMP}"
+REPORT_DIR="./reports/state-loop-${TIMESTAMP}"
 HPA_CSV="${REPORT_DIR}/_hpa-validation.csv"
 DIM_CSV="${REPORT_DIR}/_dimensions.csv"
 MASTER_FILE="${REPORT_DIR}/_master-overview.txt"
