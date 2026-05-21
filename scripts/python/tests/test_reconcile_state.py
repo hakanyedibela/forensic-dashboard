@@ -92,6 +92,10 @@ import json as _json
 def _write_ns(tmp_path, snapshot, desired_files):
     ns_dir = tmp_path / "by-stage" / "phase" / "pid-004-batch-phase-01-blue"
     ns_dir.mkdir(parents=True)
+    # Real snapshots always carry a "stage" field; run()/find_snapshots derive
+    # the stage from snapshot content, not the directory name.
+    snapshot = dict(snapshot)
+    snapshot.setdefault("stage", "phase")
     (ns_dir / "snapshot.json").write_text(_json.dumps(snapshot))
     if desired_files is not None:
         d = ns_dir / "desired"
@@ -183,7 +187,8 @@ def test_run_writes_per_stage_csv(tmp_path, capsys):
     assert "phase" in summary
 
 
-def test_run_skips_namespace_without_snapshot(tmp_path):
+def test_run_writes_nothing_when_no_snapshots(tmp_path):
+    # No snapshot.json anywhere under the tree -> rglob finds nothing.
     ns_dir = tmp_path / "by-stage" / "test" / "ns-no-snap"
     ns_dir.mkdir(parents=True)
     written = rs.run(tmp_path)

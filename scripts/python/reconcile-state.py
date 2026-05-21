@@ -172,27 +172,57 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def find_snapshots(root):
+    """Sammelt alle snapshot.json-Pfade unter <root>, dedupliziert auf
+    (stage, namespace).
+
+    Der Loop-Wrapper um fetch-cluster-state.py legt die Snapshots im
+    verschachtelten Pfad
+    'by-stage/<stage>/<ns>/by-stage/<stage>/<ns>/snapshot.json' ab. Stage und
+    Namespace werden aus dem JSON-Inhalt abgeleitet, nicht aus den
+    Verzeichnisnamen. Snapshots ohne Namespace werden uebersprungen.
+
+    Bei mehreren Treffern fuer denselben (stage, namespace) wird der mit dem
+    tiefsten Pfad bevorzugt -- das ist der, den Python tatsaechlich geschrieben
+    hat. Defensiv: in der Praxis sind die Treffer inhaltlich identisch.
+
+    Rueckgabe: Liste von (stage, namespace, snapshot_path)-Tupeln.
+    """
+    found = {}
+    for path in sorted(root.rglob("snapshot.json")):
+        try:
+            snap = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            sys.stderr.write("warning: cannot read %s: %s\n" % (path, e))
+            continue
+        stage = snap.get("stage") or "other"
+        namespace = snap.get("namespace")
+        if not namespace:
+            continue
+        key = (stage, namespace)
+        prev = found.get(key)
+        if prev is None or len(path.parts) > len(prev.parts):
+            found[key] = path
+    return [(stage, namespace, path)
+            for (stage, namespace), path in found.items()]
+
+
 def run(input_dir):
     """Reconcilet alle Namespaces unter input_dir und schreibt je Stage eine
     CSV-Datei in input_dir. Liefert die Liste der geschriebenen Pfade.
 
-    Layout: input_dir/by-stage/<stage>/<ns>/{snapshot.json, desired/*.yaml}
+    Snapshots werden rekursiv via rglob gefunden; Stage und Namespace stammen
+    aus dem snapshot.json-Inhalt (siehe find_snapshots), nicht aus den
+    Verzeichnisnamen.
     """
     input_dir = Path(input_dir)
-    by_stage = input_dir / "by-stage"
     rows_by_stage = {}
 
-    if by_stage.is_dir():
-        for stage_dir in sorted(p for p in by_stage.iterdir() if p.is_dir()):
-            stage = stage_dir.name
-            for ns_dir in sorted(p for p in stage_dir.iterdir() if p.is_dir()):
-                if not (ns_dir / "snapshot.json").is_file():
-                    sys.stderr.write(
-                        "warn: skipping %s (no snapshot.json)\n" % ns_dir)
-                    continue
-                current, desired = read_namespace(ns_dir)
-                rows = reconcile_rows(stage, ns_dir.name, current, desired)
-                rows_by_stage.setdefault(stage, []).extend(rows)
+    for stage, namespace, snapshot_path in find_snapshots(input_dir):
+        ns_dir = snapshot_path.parent
+        current, desired = read_namespace(ns_dir)
+        rows = reconcile_rows(stage, namespace, current, desired)
+        rows_by_stage.setdefault(stage, []).extend(rows)
 
     written = []
     for stage, rows in sorted(rows_by_stage.items()):
@@ -205,7 +235,7 @@ def run(input_dir):
               % (stage, n_ns, len(rows), n_out, out.name))
 
     if not written:
-        print("No namespaces found under %s/by-stage" % input_dir)
+        print("No namespaces found under %s" % input_dir)
     return written
 
 
@@ -214,7 +244,7 @@ def main(argv=None):
         description="Reconcile current vs desired cluster state into per-stage CSVs.")
     parser.add_argument(
         "--input-dir", required=True,
-        help="A state-loop-<ts> report directory (contains by-stage/).")
+        help="A state-loop-<ts> report directory (snapshots found recursively).")
     args = parser.parse_args(argv)
 
     input_dir = Path(args.input_dir)
