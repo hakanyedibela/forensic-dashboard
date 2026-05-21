@@ -59,3 +59,23 @@ CSV_HEADER = [
     "in_desired",
     "status",
 ]
+
+
+def current_resources(snapshot):
+    """Liefert die Menge der aktuellen Ressourcen als {(kind, name)}.
+
+    Die Namespace-Ressource selbst wird immer aufgenommen; danach jede
+    benannte Ressource aus den bekannten Snapshot-Arrays. Fehlende oder leere
+    Arrays tragen nichts bei. Doppelte (kind, name) werden durch das Set
+    automatisch zusammengefasst.
+    """
+    found = set()
+    ns = snapshot.get("namespace")
+    if ns:
+        found.add(("Namespace", ns))
+    for key, kind in SNAPSHOT_KEY_TO_KIND.items():
+        for item in snapshot.get(key) or []:
+            name = item.get("name")
+            if name:
+                found.add((kind, name))
+    return found
