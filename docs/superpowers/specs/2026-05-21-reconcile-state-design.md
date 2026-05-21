@@ -23,8 +23,14 @@ Standalone aggregator script `scripts/python/reconcile-state.py`, modeled on
 the existing `scripts/python/aggregate-resources.py`:
 
 - CLI: `python3 reconcile-state.py --input-dir reports/state-loop-<ts>/`
-- Walks every `by-stage/<stage>/<ns>/` directory under the input dir.
-- Reads `snapshot.json` (current) and `desired/*.yaml` (desired) per namespace.
+- Discovers namespaces by recursively globbing `snapshot.json` under the input
+  dir (`rglob`), mirroring `aggregate-resources.py`'s `find_snapshots`. This
+  tolerates the loop wrapper's double-nested layout
+  (`by-stage/<stage>/<ns>/by-stage/<stage>/<ns>/snapshot.json`). `stage` and
+  `namespace` come from the snapshot's own fields; results are deduped on
+  `(stage, namespace)`, preferring the deepest path.
+- Reads `snapshot.json` (current) and the sibling `desired/*.yaml` (desired)
+  per namespace.
 - Writes one `_reconcile-<stage>.csv` per stage at the input-dir root.
 - Stays self-contained (no shared package), matching the existing
   one-script-per-aggregation pattern.
@@ -96,7 +102,8 @@ output.
 
 ## Edge cases
 
-- Namespace dir missing `snapshot.json`: skip with a warning to stderr.
+- No `snapshot.json` found anywhere under the input dir: print a "No
+  namespaces found" message and write nothing.
 - Namespace dir missing `desired/`: every current resource becomes
   `NOT_DESIRED`.
 - Empty arrays in snapshot: contribute no rows (no error).
