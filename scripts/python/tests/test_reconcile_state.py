@@ -150,3 +150,41 @@ def test_reconcile_rows_sorted_by_kind_then_name():
     rows = rs.reconcile_rows("s", "ns", current, set())
     keys = [(r["kind"], r["name"]) for r in rows]
     assert keys == sorted(keys)
+
+
+import csv as _csv
+
+
+def test_run_writes_per_stage_csv(tmp_path, capsys):
+    # phase namespace: one in-sync deployment, one cluster-only service
+    _write_ns(
+        tmp_path,
+        {"namespace": "pid-004-batch-phase-01-blue",
+         "deployments": [{"name": "batch-runner"}],
+         "services": [{"name": "orphan"}]},
+        {"40-deployments.yaml":
+         "kind: Deployment\nmetadata:\n  name: batch-runner\n"},
+    )
+
+    written = rs.run(tmp_path)
+
+    out_csv = tmp_path / "_reconcile-phase.csv"
+    assert out_csv in written
+    assert out_csv.exists()
+
+    with out_csv.open() as fh:
+        rows = list(_csv.DictReader(fh))
+    statuses = {(r["kind"], r["name"]): r["status"] for r in rows}
+    assert statuses[("Deployment", "batch-runner")] == "IN_SYNC"
+    assert statuses[("Service", "orphan")] == "NOT_DESIRED"
+    assert statuses[("Namespace", "pid-004-batch-phase-01-blue")] == "NOT_DESIRED"
+
+    summary = capsys.readouterr().out
+    assert "phase" in summary
+
+
+def test_run_skips_namespace_without_snapshot(tmp_path):
+    ns_dir = tmp_path / "by-stage" / "test" / "ns-no-snap"
+    ns_dir.mkdir(parents=True)
+    written = rs.run(tmp_path)
+    assert written == []
