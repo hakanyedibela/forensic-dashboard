@@ -84,10 +84,12 @@ def current_resources(snapshot):
 def desired_from_yaml_text(text):
     """Liefert {(kind, name)} aus einem (Multi-Dokument-)YAML-Text.
 
-    Nutzt PyYAML, wenn verfuegbar. Andernfalls greift ein einfacher
-    Zeilen-Extraktor: pro Dokument das erste 'kind:' und das erste 'name:'.
-    Das reicht fuer die von fetch-cluster-state.py erzeugten Manifeste, die
-    eine stabile Formatierung haben.
+    Nutzt PyYAML, wenn verfuegbar (Produktionspfad). Andernfalls greift ein
+    Zeilen-Extraktor: pro Dokument das top-level 'kind:' und das 'name:'
+    direkt unter dem top-level 'metadata:'-Block. Dieser Fallback setzt die
+    stabile Formatierung der von fetch-cluster-state.py erzeugten Manifeste
+    voraus: block-style 'metadata:' (kein inline '{}') und keine
+    ownerReferences vor metadata.name. PyYAML behandelt beide Faelle korrekt.
     """
     found = set()
     if yaml is not None:
