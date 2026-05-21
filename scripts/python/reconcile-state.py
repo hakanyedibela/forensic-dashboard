@@ -115,3 +115,22 @@ def desired_from_yaml_text(text):
         if kind and name:
             found.add((kind, name))
     return found
+
+
+def read_namespace(ns_dir):
+    """Liest ein Namespace-Verzeichnis und liefert (current, desired) als Sets.
+
+    current stammt aus snapshot.json, desired aus allen desired/*.yaml-Dateien.
+    Fehlt das desired/-Verzeichnis, ist desired leer (alle Ressourcen gelten
+    dann als NOT_DESIRED).
+    """
+    snapshot_path = ns_dir / "snapshot.json"
+    snapshot = json.loads(snapshot_path.read_text())
+    current = current_resources(snapshot)
+
+    desired = set()
+    desired_dir = ns_dir / "desired"
+    if desired_dir.is_dir():
+        for path in sorted(desired_dir.glob("*.yaml")):
+            desired |= desired_from_yaml_text(path.read_text())
+    return current, desired

@@ -84,3 +84,42 @@ def test_desired_from_yaml_text_fallback(monkeypatch):
     got = rs.desired_from_yaml_text(MULTI_DOC_YAML)
     assert ("Deployment", "batch-runner") in got
     assert ("Namespace", "pid-004-batch-phase-01-blue") in got
+
+
+import json as _json
+
+
+def _write_ns(tmp_path, snapshot, desired_files):
+    ns_dir = tmp_path / "by-stage" / "phase" / "pid-004-batch-phase-01-blue"
+    ns_dir.mkdir(parents=True)
+    (ns_dir / "snapshot.json").write_text(_json.dumps(snapshot))
+    if desired_files is not None:
+        d = ns_dir / "desired"
+        d.mkdir()
+        for fname, content in desired_files.items():
+            (d / fname).write_text(content)
+    return ns_dir
+
+
+def test_read_namespace_returns_current_and_desired(tmp_path):
+    ns_dir = _write_ns(
+        tmp_path,
+        {"namespace": "pid-004-batch-phase-01-blue",
+         "deployments": [{"name": "batch-runner"}]},
+        {"40-deployments.yaml":
+         "kind: Deployment\nmetadata:\n  name: batch-runner\n"},
+    )
+    current, desired = rs.read_namespace(ns_dir)
+    assert ("Deployment", "batch-runner") in current
+    assert ("Deployment", "batch-runner") in desired
+
+
+def test_read_namespace_missing_desired_dir(tmp_path):
+    ns_dir = _write_ns(
+        tmp_path,
+        {"namespace": "ns1", "deployments": [{"name": "a"}]},
+        None,
+    )
+    current, desired = rs.read_namespace(ns_dir)
+    assert ("Deployment", "a") in current
+    assert desired == set()
