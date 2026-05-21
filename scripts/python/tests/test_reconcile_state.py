@@ -84,6 +84,38 @@ def test_desired_from_yaml_text_fallback(monkeypatch):
     got = rs.desired_from_yaml_text(MULTI_DOC_YAML)
     assert ("Deployment", "batch-runner") in got
     assert ("Namespace", "pid-004-batch-phase-01-blue") in got
+    assert ("HorizontalPodAutoscaler", "batch-runner") in got
+
+
+FALLBACK_SPEC_FIRST_YAML = """\
+kind: NetworkPolicy
+spec:
+  podSelector:
+    matchLabels:
+      name: target-pod
+metadata:
+  name: allow-ingress
+"""
+
+
+def test_desired_from_yaml_text_fallback_ignores_indented_name(monkeypatch):
+    # Regression: the fallback parser must only pick up a TOP-LEVEL name:,
+    # not an indented one (e.g. matchLabels.name / scaleTargetRef.name) that
+    # appears before metadata: in a manually-authored manifest.
+    monkeypatch.setattr(rs, "yaml", None)
+    got = rs.desired_from_yaml_text(FALLBACK_SPEC_FIRST_YAML)
+    assert got == {("NetworkPolicy", "allow-ingress")}
+    assert ("NetworkPolicy", "target-pod") not in got
+
+
+def test_desired_from_yaml_text_dedupes():
+    text = (
+        "kind: Deployment\nmetadata:\n  name: dup\n"
+        "---\n"
+        "kind: Deployment\nmetadata:\n  name: dup\n"
+    )
+    got = rs.desired_from_yaml_text(text)
+    assert got == {("Deployment", "dup")}
 
 
 import json as _json
@@ -187,9 +219,76 @@ def test_run_writes_per_stage_csv(tmp_path, capsys):
     assert "phase" in summary
 
 
-def test_run_writes_nothing_when_no_snapshots(tmp_path):
+def test_run_writes_nothing_when_no_snapshots(tmp_path, capsys):
     # No snapshot.json anywhere under the tree -> rglob finds nothing.
     ns_dir = tmp_path / "by-stage" / "test" / "ns-no-snap"
     ns_dir.mkdir(parents=True)
     written = rs.run(tmp_path)
     assert written == []
+    assert "No namespaces found" in capsys.readouterr().out
+
+
+def test_run_sorts_rows_by_namespace_kind_name(tmp_path):
+    # Two namespaces in ONE stage whose directory order differs from
+    # alphabetical namespace order. zeta-ns is created first on disk, but
+    # alpha-ns must sort before it in the CSV.
+    for ns_name in ("zeta-ns", "alpha-ns"):
+        ns_dir = tmp_path / "by-stage" / "phase" / ns_name
+        ns_dir.mkdir(parents=True)
+        (ns_dir / "snapshot.json").write_text(_json.dumps({
+            "stage": "phase",
+            "namespace": ns_name,
+            "deployments": [{"name": "svc-b"}, {"name": "svc-a"}],
+        }))
+
+    written = rs.run(tmp_path)
+    out_csv = tmp_path / "_reconcile-phase.csv"
+    assert out_csv in written
+
+    with out_csv.open() as fh:
+        rows = list(_csv.DictReader(fh))
+    keys = [(r["namespace"], r["kind"], r["name"]) for r in rows]
+    assert keys == sorted(keys)
+    # alpha-ns rows must all precede zeta-ns rows despite disk order
+    namespaces = [r["namespace"] for r in rows]
+    assert namespaces == sorted(namespaces)
+    assert namespaces[0] == "alpha-ns"
+
+
+def test_find_snapshots_prefers_deepest_path(tmp_path):
+    # Two snapshot.json for the same (stage, namespace) at different depths.
+    # The deepest-path one (what Python actually wrote) must win.
+    shallow = tmp_path / "by-stage" / "phase" / "ns1"
+    shallow.mkdir(parents=True)
+    (shallow / "snapshot.json").write_text(_json.dumps({
+        "stage": "phase", "namespace": "ns1",
+        "deployments": [{"name": "shallow-only"}],
+    }))
+
+    deep = tmp_path / "by-stage" / "phase" / "ns1" / "by-stage" / "phase" / "ns1"
+    deep.mkdir(parents=True)
+    (deep / "snapshot.json").write_text(_json.dumps({
+        "stage": "phase", "namespace": "ns1",
+        "deployments": [{"name": "deep-only"}],
+    }))
+
+    found = rs.find_snapshots(tmp_path)
+    assert len(found) == 1
+    stage, namespace, path = found[0]
+    assert (stage, namespace) == ("phase", "ns1")
+    assert path == deep / "snapshot.json"
+    # confirm via resource content
+    current, _ = rs.read_namespace(path.parent)
+    assert ("Deployment", "deep-only") in current
+    assert ("Deployment", "shallow-only") not in current
+
+
+def test_find_snapshots_skips_missing_namespace(tmp_path):
+    ns_dir = tmp_path / "by-stage" / "phase" / "ns1"
+    ns_dir.mkdir(parents=True)
+    (ns_dir / "snapshot.json").write_text(_json.dumps({
+        "stage": "phase",
+        "deployments": [{"name": "a"}],
+    }))
+    assert rs.find_snapshots(tmp_path) == []
+    assert rs.run(tmp_path) == []
