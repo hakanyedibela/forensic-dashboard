@@ -101,17 +101,38 @@ def desired_from_yaml_text(text):
         return found
 
     # Fallback: split on document markers, scan lines.
+    #
+    # We must read the TOP-LEVEL `kind:` and the `name:` that lives directly
+    # under the TOP-LEVEL `metadata:` block. A naive "first name: anywhere"
+    # grabs the wrong key (e.g. spec.podSelector.matchLabels.name or
+    # scaleTargetRef.name) when spec: precedes metadata: in a manually-authored
+    # manifest. So:
+    #   * kind: must be at column 0 (matched against the raw line).
+    #   * name: must be a direct child of a top-level `metadata:` key, i.e. we
+    #     only accept a `name:` while we are inside the metadata block (a
+    #     top-level `metadata:` was seen and we have not yet dedented back to
+    #     another top-level key).
     for chunk in re.split(r"^---\s*$", text, flags=re.MULTILINE):
         kind = None
         name = None
+        in_metadata = False
         for line in chunk.splitlines():
-            stripped = line.strip()
-            if kind is None and stripped.startswith("kind:"):
-                kind = stripped[len("kind:"):].strip()
-            elif name is None and re.match(r"name:\s*\S", stripped):
-                name = stripped[len("name:"):].strip()
-            if kind and name:
-                break
+            if not line.strip():
+                continue
+            top_level = re.match(r"^\S", line)
+            if kind is None and re.match(r"^kind:\s*\S", line):
+                kind = line[len("kind:"):].strip()
+                in_metadata = False
+                continue
+            if re.match(r"^metadata:\s*$", line):
+                in_metadata = True
+                continue
+            if top_level:
+                # any other top-level key ends the metadata block
+                in_metadata = False
+                continue
+            if in_metadata and name is None and re.match(r"^\s+name:\s*\S", line):
+                name = line.split("name:", 1)[1].strip()
         if kind and name:
             found.add((kind, name))
     return found
@@ -208,7 +229,7 @@ def find_snapshots(root):
 
 
 def run(input_dir):
-    """Reconcilet alle Namespaces unter input_dir und schreibt je Stage eine
+    """Reconciliert alle Namespaces unter input_dir und schreibt je Stage eine
     CSV-Datei in input_dir. Liefert die Liste der geschriebenen Pfade.
 
     Snapshots werden rekursiv via rglob gefunden; Stage und Namespace stammen
@@ -226,6 +247,7 @@ def run(input_dir):
 
     written = []
     for stage, rows in sorted(rows_by_stage.items()):
+        rows.sort(key=lambda r: (r["namespace"], r["kind"], r["name"]))
         out = input_dir / ("_reconcile-%s.csv" % stage)
         write_csv(out, rows)
         written.append(out)
