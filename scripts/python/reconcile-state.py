@@ -162,3 +162,68 @@ def reconcile_rows(stage, namespace, current, desired):
             "status": status,
         })
     return rows
+
+
+def write_csv(path, rows):
+    """Schreibt CSV_HEADER + rows nach path."""
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=CSV_HEADER)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def run(input_dir):
+    """Reconcilet alle Namespaces unter input_dir und schreibt je Stage eine
+    CSV-Datei in input_dir. Liefert die Liste der geschriebenen Pfade.
+
+    Layout: input_dir/by-stage/<stage>/<ns>/{snapshot.json, desired/*.yaml}
+    """
+    input_dir = Path(input_dir)
+    by_stage = input_dir / "by-stage"
+    rows_by_stage = {}
+
+    if by_stage.is_dir():
+        for stage_dir in sorted(p for p in by_stage.iterdir() if p.is_dir()):
+            stage = stage_dir.name
+            for ns_dir in sorted(p for p in stage_dir.iterdir() if p.is_dir()):
+                if not (ns_dir / "snapshot.json").is_file():
+                    sys.stderr.write(
+                        "warn: skipping %s (no snapshot.json)\n" % ns_dir)
+                    continue
+                current, desired = read_namespace(ns_dir)
+                rows = reconcile_rows(stage, ns_dir.name, current, desired)
+                rows_by_stage.setdefault(stage, []).extend(rows)
+
+    written = []
+    for stage, rows in sorted(rows_by_stage.items()):
+        out = input_dir / ("_reconcile-%s.csv" % stage)
+        write_csv(out, rows)
+        written.append(out)
+        n_ns = len({r["namespace"] for r in rows})
+        n_out = sum(1 for r in rows if r["status"] != "IN_SYNC")
+        print("  [%s] %d namespace(s), %d resource(s), %d out-of-sync -> %s"
+              % (stage, n_ns, len(rows), n_out, out.name))
+
+    if not written:
+        print("No namespaces found under %s/by-stage" % input_dir)
+    return written
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Reconcile current vs desired cluster state into per-stage CSVs.")
+    parser.add_argument(
+        "--input-dir", required=True,
+        help="A state-loop-<ts> report directory (contains by-stage/).")
+    args = parser.parse_args(argv)
+
+    input_dir = Path(args.input_dir)
+    if not input_dir.is_dir():
+        parser.error("input-dir does not exist: %s" % input_dir)
+
+    run(input_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
