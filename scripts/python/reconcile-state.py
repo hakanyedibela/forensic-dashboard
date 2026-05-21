@@ -79,3 +79,39 @@ def current_resources(snapshot):
             if name:
                 found.add((kind, name))
     return found
+
+
+def desired_from_yaml_text(text):
+    """Liefert {(kind, name)} aus einem (Multi-Dokument-)YAML-Text.
+
+    Nutzt PyYAML, wenn verfuegbar. Andernfalls greift ein einfacher
+    Zeilen-Extraktor: pro Dokument das erste 'kind:' und das erste 'name:'.
+    Das reicht fuer die von fetch-cluster-state.py erzeugten Manifeste, die
+    eine stabile Formatierung haben.
+    """
+    found = set()
+    if yaml is not None:
+        for doc in yaml.safe_load_all(text):
+            if not isinstance(doc, dict):
+                continue
+            kind = doc.get("kind")
+            name = (doc.get("metadata") or {}).get("name")
+            if kind and name:
+                found.add((kind, name))
+        return found
+
+    # Fallback: split on document markers, scan lines.
+    for chunk in re.split(r"^---\s*$", text, flags=re.MULTILINE):
+        kind = None
+        name = None
+        for line in chunk.splitlines():
+            stripped = line.strip()
+            if kind is None and stripped.startswith("kind:"):
+                kind = stripped[len("kind:"):].strip()
+            elif name is None and re.match(r"name:\s*\S", stripped):
+                name = stripped[len("name:"):].strip()
+            if kind and name:
+                break
+        if kind and name:
+            found.add((kind, name))
+    return found

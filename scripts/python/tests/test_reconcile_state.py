@@ -46,3 +46,41 @@ def test_current_resources_dedupes():
     }
     got = rs.current_resources(snapshot)
     assert sum(1 for k in got if k == ("Deployment", "a")) == 1
+
+
+MULTI_DOC_YAML = """\
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pid-004-batch-phase-01-blue
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batch-runner
+  namespace: pid-004-batch-phase-01-blue
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: batch-runner
+"""
+
+
+def test_desired_from_yaml_text_extracts_kind_name():
+    got = rs.desired_from_yaml_text(MULTI_DOC_YAML)
+    assert ("Namespace", "pid-004-batch-phase-01-blue") in got
+    assert ("Deployment", "batch-runner") in got
+    assert ("HorizontalPodAutoscaler", "batch-runner") in got
+
+
+def test_desired_from_yaml_text_ignores_empty_docs():
+    got = rs.desired_from_yaml_text("---\n\n---\n")
+    assert got == set()
+
+
+def test_desired_from_yaml_text_fallback(monkeypatch):
+    monkeypatch.setattr(rs, "yaml", None)
+    got = rs.desired_from_yaml_text(MULTI_DOC_YAML)
+    assert ("Deployment", "batch-runner") in got
+    assert ("Namespace", "pid-004-batch-phase-01-blue") in got
