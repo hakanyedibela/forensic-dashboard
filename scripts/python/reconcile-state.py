@@ -134,3 +134,31 @@ def read_namespace(ns_dir):
         for path in sorted(desired_dir.glob("*.yaml")):
             desired |= desired_from_yaml_text(path.read_text())
     return current, desired
+
+
+def reconcile_rows(stage, namespace, current, desired):
+    """Vergleicht current/desired (presence-level) und liefert CSV-Zeilen.
+
+    Eine Zeile je (kind, name) aus der Vereinigung beider Mengen, sortiert
+    nach (kind, name) fuer stabile Diffs.
+    """
+    rows = []
+    for kind, name in sorted(current | desired):
+        in_cur = (kind, name) in current
+        in_des = (kind, name) in desired
+        if in_cur and in_des:
+            status = "IN_SYNC"
+        elif in_des:
+            status = "MISSING_IN_CLUSTER"
+        else:
+            status = "NOT_DESIRED"
+        rows.append({
+            "stage": stage,
+            "namespace": namespace,
+            "kind": kind,
+            "name": name,
+            "in_current": str(in_cur),
+            "in_desired": str(in_des),
+            "status": status,
+        })
+    return rows

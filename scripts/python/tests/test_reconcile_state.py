@@ -123,3 +123,30 @@ def test_read_namespace_missing_desired_dir(tmp_path):
     current, desired = rs.read_namespace(ns_dir)
     assert ("Deployment", "a") in current
     assert desired == set()
+
+
+def test_reconcile_rows_all_three_statuses():
+    current = {("Namespace", "ns1"), ("Deployment", "a"), ("Service", "extra")}
+    desired = {("Namespace", "ns1"), ("Deployment", "a"), ("HorizontalPodAutoscaler", "missing")}
+    rows = rs.reconcile_rows("phase", "ns1", current, desired)
+    by_key = {(r["kind"], r["name"]): r for r in rows}
+
+    assert by_key[("Deployment", "a")]["status"] == "IN_SYNC"
+    assert by_key[("Deployment", "a")]["in_current"] == "True"
+    assert by_key[("Deployment", "a")]["in_desired"] == "True"
+
+    assert by_key[("Service", "extra")]["status"] == "NOT_DESIRED"
+    assert by_key[("Service", "extra")]["in_desired"] == "False"
+
+    assert by_key[("HorizontalPodAutoscaler", "missing")]["status"] == "MISSING_IN_CLUSTER"
+    assert by_key[("HorizontalPodAutoscaler", "missing")]["in_current"] == "False"
+
+    # every row carries stage + namespace
+    assert all(r["stage"] == "phase" and r["namespace"] == "ns1" for r in rows)
+
+
+def test_reconcile_rows_sorted_by_kind_then_name():
+    current = {("Service", "b"), ("Deployment", "z"), ("Deployment", "a")}
+    rows = rs.reconcile_rows("s", "ns", current, set())
+    keys = [(r["kind"], r["name"]) for r in rows]
+    assert keys == sorted(keys)
