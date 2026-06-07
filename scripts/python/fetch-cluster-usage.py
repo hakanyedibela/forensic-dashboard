@@ -18,7 +18,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 # ----------------------------------------------------------- quantity helpers
@@ -857,6 +857,59 @@ def render_json(trees, stream, window, cluster):
     stream.write("\n")
 
 
+# ----------------------------------------------------- persisting to disk/PVC
+
+REPORT_DATE_FMT = "%Y-%m-%d"
+_DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def dated_output_dir(base, now):
+    """`<base>/<YYYY-MM-DD>` for `now` — one folder per daily run so a CronJob
+    keeps history instead of overwriting yesterday's report."""
+    return os.path.join(base, now.strftime(REPORT_DATE_FMT))
+
+
+def write_report_files(trees, out_dir, window, cluster):
+    """Write resources.csv, ooms.csv and report.json into out_dir (created if
+    needed). Returns out_dir."""
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "resources.csv"), "w") as f:
+        render_resources_csv(trees, f)
+    with open(os.path.join(out_dir, "ooms.csv"), "w") as f:
+        render_ooms_csv(trees, f)
+    with open(os.path.join(out_dir, "report.json"), "w") as f:
+        render_json(trees, f, window=window, cluster=cluster)
+    return out_dir
+
+
+def prune_old_reports(base, retention_days, now):
+    """Remove `<base>/<YYYY-MM-DD>` folders older than retention_days. Only
+    touches date-named directories (never other files in base). retention_days
+    <= 0 is a no-op. Returns the list of removed folder names."""
+    if retention_days <= 0:
+        return []
+    cutoff = (now - timedelta(days=retention_days)).date()
+    removed = []
+    try:
+        entries = sorted(os.listdir(base))
+    except OSError:
+        return []
+    for name in entries:
+        if not _DATE_DIR_RE.match(name):
+            continue
+        path = os.path.join(base, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            folder_date = datetime.strptime(name, REPORT_DATE_FMT).date()
+        except ValueError:
+            continue
+        if folder_date < cutoff:
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(name)
+    return removed
+
+
 # --------------------------------------------------------------- text render
 
 def _print_table(headers, rows, stream, indent="  "):
@@ -990,6 +1043,12 @@ def build_parser():
                      help="stdout format(s) (default: text).")
     out.add_argument("--output-dir",
                      help="Also write resources.csv, ooms.csv, report.json.")
+    out.add_argument("--date-subdir", action="store_true",
+                     help="Write into <output-dir>/<YYYY-MM-DD>/ so a daily run "
+                          "keeps history instead of overwriting.")
+    out.add_argument("--retention-days", type=int, default=0,
+                     help="With --date-subdir, prune dated folders older than N "
+                          "days (0 = keep everything).")
     return p
 
 
@@ -1083,14 +1142,17 @@ def main(argv=None):
         render_resources_csv(trees, sys.stdout)
 
     if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        with open(os.path.join(args.output_dir, "resources.csv"), "w") as f:
-            render_resources_csv(trees, f)
-        with open(os.path.join(args.output_dir, "ooms.csv"), "w") as f:
-            render_ooms_csv(trees, f)
-        with open(os.path.join(args.output_dir, "report.json"), "w") as f:
-            render_json(trees, f, window=args.window, cluster=cluster)
-        sys.stderr.write(f"wrote reports to {args.output_dir}\n")
+        now = datetime.now(timezone.utc)
+        target = (dated_output_dir(args.output_dir, now)
+                  if args.date_subdir else args.output_dir)
+        write_report_files(trees, target, args.window, cluster)
+        sys.stderr.write(f"wrote reports to {target}\n")
+        if args.date_subdir and args.retention_days > 0:
+            removed = prune_old_reports(args.output_dir, args.retention_days, now)
+            if removed:
+                sys.stderr.write(
+                    f"pruned {len(removed)} report folder(s) older than "
+                    f"{args.retention_days}d: {', '.join(removed)}\n")
     return 0
 
 

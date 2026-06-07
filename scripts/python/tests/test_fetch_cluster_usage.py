@@ -609,3 +609,51 @@ def test_build_tree_container_util_none_without_limit(fcu):
     node = fcu.build_namespace_tree("ns1", [leaf], [])
     c = node["workloads"][0]["pods"][0]["containers"][0]
     assert c["cpu_peak_util_pct"] is None
+
+
+def test_dated_output_dir(fcu):
+    now = fcu.datetime(2026, 6, 7, 6, 0, tzinfo=fcu.timezone.utc)
+    assert fcu.dated_output_dir("/reports", now) == "/reports/2026-06-07"
+
+
+def test_write_report_files(fcu, tmp_path):
+    out = fcu.write_report_files([_sample_tree(fcu)], str(tmp_path / "2026-06-07"),
+                                 window="24h", cluster="c1")
+    assert (tmp_path / "2026-06-07" / "resources.csv").exists()
+    assert (tmp_path / "2026-06-07" / "ooms.csv").exists()
+    report = tmp_path / "2026-06-07" / "report.json"
+    assert report.exists()
+    obj = json.loads(report.read_text())
+    assert obj["namespaces"][0]["namespace"] == "ns1"
+    assert out == str(tmp_path / "2026-06-07")
+
+
+def test_prune_old_reports_removes_only_old_date_dirs(fcu, tmp_path):
+    base = tmp_path
+    for name in ("2026-05-01", "2026-06-06", "latest", "notes.txt"):
+        if name.endswith(".txt"):
+            (base / name).write_text("keep me")
+        else:
+            (base / name).mkdir()
+    now = fcu.datetime(2026, 6, 7, tzinfo=fcu.timezone.utc)
+    removed = fcu.prune_old_reports(str(base), retention_days=30, now=now)
+    assert removed == ["2026-05-01"]
+    assert not (base / "2026-05-01").exists()
+    assert (base / "2026-06-06").exists()       # within retention
+    assert (base / "latest").exists()           # not a date dir -> untouched
+    assert (base / "notes.txt").exists()         # not a dir -> untouched
+
+
+def test_prune_old_reports_zero_is_noop(fcu, tmp_path):
+    (tmp_path / "2020-01-01").mkdir()
+    now = fcu.datetime(2026, 6, 7, tzinfo=fcu.timezone.utc)
+    assert fcu.prune_old_reports(str(tmp_path), retention_days=0, now=now) == []
+    assert (tmp_path / "2020-01-01").exists()
+
+
+def test_build_parser_persistence_defaults(fcu):
+    args = fcu.build_parser().parse_args([])
+    assert args.date_subdir is False
+    assert args.retention_days == 0
+    args2 = fcu.build_parser().parse_args(["--date-subdir", "--retention-days", "30"])
+    assert args2.date_subdir is True and args2.retention_days == 30
