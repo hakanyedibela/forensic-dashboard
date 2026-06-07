@@ -501,3 +501,20 @@ def test_render_json_structure(fcu):
     assert obj["window"] == "24h"
     assert obj["cluster"] == "c1"
     assert obj["namespaces"][0]["namespace"] == "ns1"
+
+
+def test_render_text_contains_levels(fcu):
+    buf = io.StringIO()
+    fcu.render_text([_sample_tree(fcu)], buf, levels=("namespace", "workload",
+                                                      "pod", "container"))
+    out = buf.getvalue()
+    assert "ns1" in out
+    assert "CPU lim" in out
+    assert "MEM lim" in out
+
+
+def test_render_text_level_filter(fcu):
+    buf = io.StringIO()
+    fcu.render_text([_sample_tree(fcu)], buf, levels=("namespace",))
+    out = buf.getvalue()
+    assert "CONTAINERS" not in out

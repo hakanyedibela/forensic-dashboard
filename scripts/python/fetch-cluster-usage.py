@@ -844,6 +844,85 @@ def render_json(trees, stream, window, cluster):
     stream.write("\n")
 
 
+# --------------------------------------------------------------- text render
+
+def _print_table(headers, rows, stream, indent="  "):
+    if not rows:
+        return
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(str(cell)))
+    fmt = indent + "  ".join(f"{{:<{w}}}" for w in widths)
+    stream.write(fmt.format(*headers) + "\n")
+    for r in rows:
+        stream.write(fmt.format(*[str(c) for c in r]) + "\n")
+
+
+def _usage_cells(t):
+    """Common CPU/mem columns for a totals dict."""
+    return [
+        fmt_cores(t.get("cpu_request")), fmt_cores(t.get("cpu_limit")),
+        fmt_cores(t.get("cpu_now")), fmt_cores(t.get("cpu_peak")),
+        fmt_pct(t.get("cpu_peak_util_pct")),
+        fmt_bytes(t.get("mem_request")), fmt_bytes(t.get("mem_limit")),
+        fmt_bytes(t.get("mem_now")), fmt_bytes(t.get("mem_peak")),
+        fmt_pct(t.get("mem_peak_util_pct")),
+        t.get("oom_count", 0),
+    ]
+
+
+_USAGE_HEADERS = ["CPU req", "CPU lim", "CPU now", "CPU peak", "CPU %",
+                  "MEM req", "MEM lim", "MEM now", "MEM peak", "MEM %", "OOM"]
+
+
+def render_text(trees, stream, levels=("namespace", "workload", "pod",
+                                       "container")):
+    for node in trees:
+        stream.write("\n" + "=" * 100 + "\n")
+        stream.write(f"NAMESPACE  {node['namespace']}   [stage={node['stage']}]"
+                     f"   pods={node['totals']['pod_count']} "
+                     f"containers={node['totals']['container_count']} "
+                     f"ooms={node['totals']['oom_count']}\n")
+        stream.write("=" * 100 + "\n")
+
+        if "namespace" in levels:
+            _print_table(["", *_USAGE_HEADERS],
+                         [["TOTAL", *_usage_cells(node["totals"])]], stream)
+
+        if "workload" in levels:
+            stream.write("\nWORKLOADS\n")
+            rows = [[f"{wl['kind']}/{wl['name']}", *_usage_cells(wl["totals"])]
+                    for wl in node["workloads"]]
+            _print_table(["WORKLOAD", *_USAGE_HEADERS], rows, stream)
+
+        if "pod" in levels:
+            stream.write("\nPODS\n")
+            rows = []
+            for wl in node["workloads"]:
+                for pod in wl["pods"]:
+                    rows.append([pod["name"], *_usage_cells(pod["totals"])])
+            _print_table(["POD", *_USAGE_HEADERS], rows, stream)
+
+        if "container" in levels:
+            stream.write("\nCONTAINERS\n")
+            rows = []
+            for wl in node["workloads"]:
+                for pod in wl["pods"]:
+                    for c in pod["containers"]:
+                        rows.append([f"{pod['name']}/{c['container']}",
+                                     *_usage_cells(c)])
+            _print_table(["POD/CONTAINER", *_USAGE_HEADERS], rows, stream)
+
+        if node["ooms"]:
+            stream.write("\nOOM-KILLED\n")
+            rows = [[o["pod"], o["container"], o.get("source", "-"),
+                     o.get("oom_events", "-"), o.get("restart_count", "-"),
+                     o.get("finished_at", "-")] for o in node["ooms"]]
+            _print_table(["POD", "CONTAINER", "SRC", "EVENTS", "RESTARTS",
+                          "LAST OOM"], rows, stream)
+
+
 def main(argv=None):
     raise NotImplementedError
 
