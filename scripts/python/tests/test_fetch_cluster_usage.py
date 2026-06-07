@@ -316,3 +316,42 @@ def test_thanos_ooms_and_counts(fcu):
                      "oom_events": 5}]
     fcu.attach_oom_counts(leaves, fcu.merge_ooms([], ooms))
     assert leaves[0]["oom_count"] == 1
+
+
+def test_cli_client_builds_get_args(fcu):
+    calls = []
+
+    def fake_run(args):
+        calls.append(args)
+        return '{"items": [{"metadata": {"name": "x"}}]}'
+
+    client = fcu.CliK8sClient(binary="kubectl", run=fake_run)
+    items = client.list_pods("ns1")
+    assert calls[0] == ["get", "pods", "-n", "ns1", "-o", "json"]
+    assert items == [{"metadata": {"name": "x"}}]
+
+
+def test_cli_client_all_namespaces(fcu):
+    client = fcu.CliK8sClient(binary="oc",
+                              run=lambda a: '{"items": []}')
+    client.list_pods(None)  # no namespace -> -A
+    seen = []
+    client2 = fcu.CliK8sClient(binary="oc",
+                               run=lambda a: (seen.append(a) or '{"items": []}'))
+    client2.list_deployments(None)
+    assert seen[0] == ["get", "deployments", "-A", "-o", "json"]
+
+
+def test_rest_client_builds_url(fcu):
+    seen = {}
+
+    def fake_get(url):
+        seen["url"] = url
+        return {"items": [{"metadata": {"name": "p"}}]}
+
+    client = fcu.RestK8sClient(host="https://k8s:6443", token="t",
+                               get_json=fake_get)
+    client.list_pods("ns1")
+    assert seen["url"] == "https://k8s:6443/api/v1/namespaces/ns1/pods"
+    client.list_deployments(None)
+    assert seen["url"] == "https://k8s:6443/apis/apps/v1/deployments"
