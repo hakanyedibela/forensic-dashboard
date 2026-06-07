@@ -758,6 +758,51 @@ On OpenShift, uncomment the `cluster-monitoring-view` binding so the SA token is
 accepted by `thanos-querier`. On RKE2/kube-prometheus-stack, Thanos in-cluster
 usually needs no auth.
 
+### Persisting the daily reports
+
+The CronJob writes the human-readable table to **stdout** (captured by your
+Loki/EFK stack — browse it in Grafana with no extra setup) **and** writes
+`resources.csv` / `ooms.csv` / `report.json` into a per-day folder on a PVC:
+
+```
+/reports/2026-06-07/{resources.csv,ooms.csv,report.json}
+/reports/2026-06-08/...
+```
+
+`--date-subdir` gives each run its own dated folder (so a daily run keeps
+history instead of overwriting), and `--retention-days 30` prunes folders older
+than 30 days (only date-named folders are ever removed). The manifest provisions
+a 1Gi `PersistentVolumeClaim` (`cluster-usage-reports`). Prefer
+`ReadWriteMany` if your storage class supports it (OpenShift ODF/NFS,
+Longhorn-RWX); `ReadWriteOnce` works for the single-writer CronJob too.
+
+A PVC isn't browsable on its own — to get the files off it:
+
+```bash
+# copy a day's reports to your machine via a throwaway reader pod
+oc run usage-reader --image=busybox --restart=Never -n forensic-usage \
+  --overrides='{"spec":{"containers":[{"name":"r","image":"busybox",
+    "command":["sleep","3600"],"volumeMounts":[{"name":"r","mountPath":"/reports",
+    "readOnly":true}]}],"volumes":[{"name":"r","persistentVolumeClaim":
+    {"claimName":"cluster-usage-reports"}}]}}'
+oc cp forensic-usage/usage-reader:/reports ./usage-reports
+oc delete pod usage-reader -n forensic-usage
+```
+
+Or uncomment the read-only **viewer** `Deployment` + `Service` at the bottom of
+the manifest to browse the folders over HTTP (`python -m http.server`; needs an
+RWX PVC, or a reader on the CronJob's node for RWO).
+
+**Writability:** on RKE2 the root container writes the PVC directly. On OpenShift
+the restricted SCC assigns a random UID + fsGroup and chowns the volume, which
+is usually enough; if writes fail with `Permission denied`, set
+`securityContext.fsGroup` in the CronJob to a GID your SCC allows.
+
+**Want object storage instead?** You already run a Thanos object store
+(`manifests/thanos-objstore.md`). For durable, downloadable, lifecycle-expired
+reports, add an `mc`/`rclone` sidecar that syncs `/reports` to a bucket after
+the Python step — ask and we can wire that up.
+
 ### Requirements
 
 - Python 3.6+ (stdlib only)
