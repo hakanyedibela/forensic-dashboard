@@ -44,3 +44,17 @@ def test_fmt_bytes(fcu):
 def test_fmt_pct(fcu):
     assert fcu.fmt_pct(95.0) == "95.0%"
     assert fcu.fmt_pct(None) == "-"
+
+
+@pytest.mark.parametrize("ns,stage", [
+    ("pid-001-shop-ref-01-blue", "ref"),
+    ("pid-002-api-test-01-blue", "test"),
+    ("pid-003-web-prod-01-blue", "prod"),
+    ("pid-004-batch-phase-01-blue", "phase"),
+    ("pid-005-cache-pnext-01-blue", "pnext"),
+    ("pid-x-prod", "prod"),
+    ("kube-system", "other"),
+    ("pid-007-noStage-here-99", "other"),
+])
+def test_detect_stage(fcu, ns, stage):
+    assert fcu.detect_stage(ns) == stage
