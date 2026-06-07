@@ -14,6 +14,21 @@
 #   oc create configmap cluster-usage-script \
 #     --from-file=fetch-cluster-usage.py=scripts/python/fetch-cluster-usage.py \
 #     -n forensic-usage --dry-run=client -o yaml
+#
+# Persistence: the job writes the human-readable report to stdout (captured by
+# Loki/EFK) AND writes resources.csv / ooms.csv / report.json into a per-day
+# folder on a PVC: /reports/<YYYY-MM-DD>/. --retention-days prunes old folders.
+#
+# Retrieving the files (PVC is not browsable on its own):
+#   # one-off copy of a day's reports to your machine:
+#   oc run usage-reader --image=busybox --restart=Never -n forensic-usage \
+#     --overrides='{"spec":{"containers":[{"name":"r","image":"busybox","command":["sleep","3600"],
+#       "volumeMounts":[{"name":"r","mountPath":"/reports","readOnly":true}]}],
+#       "volumes":[{"name":"r","persistentVolumeClaim":{"claimName":"cluster-usage-reports"}}]}}'
+#   oc cp forensic-usage/usage-reader:/reports ./usage-reports
+#   oc delete pod usage-reader -n forensic-usage
+# Or run the optional read-only viewer Deployment at the bottom of this file
+# (needs a ReadWriteMany PVC, or the same node as the CronJob for ReadWriteOnce).
 ---
 apiVersion: v1
 kind: Namespace
@@ -66,6 +81,23 @@ subjects:
 #     name: cluster-usage
 #     namespace: forensic-usage
 ---
+# Report storage. Reports are tiny (CSV/JSON), so 1Gi is generous even with a
+# long --retention-days. Prefer ReadWriteMany if your storage class supports it
+# (OpenShift ODF/NFS; Longhorn-RWX on RKE2) so the viewer below can read while
+# the CronJob writes; ReadWriteOnce works too (single writer) but a reader pod
+# must land on the same node. Set storageClassName to your default if needed.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cluster-usage-reports
+  namespace: forensic-usage
+spec:
+  accessModes: ["ReadWriteOnce"]   # change to ReadWriteMany if supported
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: <your-storage-class>
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -96,11 +128,29 @@ spec:
         spec:
           serviceAccountName: cluster-usage
           restartPolicy: Never
+          # Writability: python:3.12-slim runs as root and writes the PVC fine
+          # on RKE2. On OpenShift the restricted SCC assigns a random UID and an
+          # fsGroup from the namespace range and chowns the volume to it, so the
+          # default below is usually enough. If writes fail with "Permission
+          # denied", uncomment fsGroup and set it to a GID your SCC allows.
+          securityContext: {}
+            # fsGroup: 0
           containers:
             - name: cluster-usage
               image: python:3.12-slim
               command: ["python3", "/app/fetch-cluster-usage.py"]
-              args: ["--in-cluster", "--window", "24h", "--format", "text"]
+              # text -> stdout (Loki); CSV/JSON -> /reports/<date>/; keep 30 days
+              args:
+                - "--in-cluster"
+                - "--window"
+                - "24h"
+                - "--format"
+                - "text"
+                - "--output-dir"
+                - "/reports"
+                - "--date-subdir"
+                - "--retention-days"
+                - "30"
               env:
                 - name: THANOS_URL
                   value: ""   # set to your querier, e.g.
@@ -109,6 +159,8 @@ spec:
               volumeMounts:
                 - name: script
                   mountPath: /app
+                - name: reports
+                  mountPath: /reports
               resources:
                 requests: { cpu: 50m, memory: 128Mi }
                 limits:   { cpu: 500m, memory: 256Mi }
@@ -116,3 +168,49 @@ spec:
             - name: script
               configMap:
                 name: cluster-usage-script
+            - name: reports
+              persistentVolumeClaim:
+                claimName: cluster-usage-reports
+---
+# OPTIONAL read-only viewer: browse the reports at http://<svc>/ without copying
+# them off the PVC. Needs a ReadWriteMany PVC (so it can mount while the CronJob
+# writes); with ReadWriteOnce it only works when scheduled on the CronJob's node.
+# Uncomment to use.
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: cluster-usage-viewer
+#   namespace: forensic-usage
+# spec:
+#   replicas: 1
+#   selector:
+#     matchLabels: { app: cluster-usage-viewer }
+#   template:
+#     metadata:
+#       labels: { app: cluster-usage-viewer }
+#     spec:
+#       containers:
+#         - name: viewer
+#           image: python:3.12-slim
+#           command: ["python3", "-m", "http.server", "8080", "--directory", "/reports"]
+#           ports: [{ containerPort: 8080 }]
+#           volumeMounts:
+#             - name: reports
+#               mountPath: /reports
+#               readOnly: true
+#           resources:
+#             requests: { cpu: 10m, memory: 32Mi }
+#             limits:   { cpu: 100m, memory: 64Mi }
+#       volumes:
+#         - name: reports
+#           persistentVolumeClaim:
+#             claimName: cluster-usage-reports
+# ---
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: cluster-usage-viewer
+#   namespace: forensic-usage
+# spec:
+#   selector: { app: cluster-usage-viewer }
+#   ports: [{ port: 80, targetPort: 8080 }]
