@@ -152,3 +152,26 @@ def test_rollup_pod_count_distinct(fcu):
     agg = fcu.rollup(leaves)
     assert agg["pod_count"] == 2
     assert agg["container_count"] == 3
+
+
+def test_merge_ooms_dedup_and_source(fcu):
+    live = [{"namespace": "ns1", "pod": "p1", "container": "c1",
+             "restart_count": 3, "finished_at": "2026-06-07T10:00:00Z",
+             "exit_code": 137}]
+    thanos = [
+        {"namespace": "ns1", "pod": "p1", "container": "c1", "oom_events": 5},
+        {"namespace": "ns1", "pod": "p2", "container": "c1", "oom_events": 1},
+    ]
+    merged = fcu.merge_ooms(live, thanos)
+    by_key = {(o["namespace"], o["pod"], o["container"]): o for o in merged}
+    assert by_key[("ns1", "p1", "c1")]["source"] == "both"
+    assert by_key[("ns1", "p1", "c1")]["oom_events"] == 5
+    assert by_key[("ns1", "p1", "c1")]["restart_count"] == 3
+    assert by_key[("ns1", "p2", "c1")]["source"] == "thanos"
+
+
+def test_merge_ooms_live_only(fcu):
+    live = [{"namespace": "ns1", "pod": "p1", "container": "c1",
+             "restart_count": 1}]
+    merged = fcu.merge_ooms(live, [])
+    assert merged[0]["source"] == "live"
