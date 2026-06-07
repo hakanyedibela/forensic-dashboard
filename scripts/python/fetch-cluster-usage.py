@@ -737,6 +737,42 @@ def read_sa_token(token_path=SA_TOKEN_PATH):
         return None
 
 
+# --------------------------------------------------------------- orchestrator
+
+def _run_usage_queries(thanos, namespace, window, step):
+    """Execute the five usage queries; return {field: {(pod,container): val}}."""
+    qs = usage_queries(namespace, window, step)
+    return {field: parse_vector_by_pod_container(thanos.query(expr))
+            for field, expr in qs.items()}
+
+
+def _run_oom_queries(thanos, namespace, window):
+    qs = oom_queries(namespace, window)
+    events = parse_vector_by_pod_container(thanos.query(qs["events"]))
+    return events
+
+
+def collect_namespace(fcu_k8s, namespace, thanos, window, step):
+    """Full per-namespace pipeline -> nested namespace tree dict."""
+    pods = fcu_k8s.list_pods(namespace)
+    rs = fcu_k8s.list_replicasets(namespace)
+    rs_index = {(r["metadata"]["namespace"], r["metadata"]["name"]): r
+                for r in rs}
+    leaves = pods_to_leaves(pods, rs_index)
+    live = live_ooms_from_pods(pods)
+
+    thanos_oom = []
+    if thanos is not None and getattr(thanos, "available", True):
+        usage_maps = _run_usage_queries(thanos, namespace, window, step)
+        attach_usage(leaves, usage_maps)
+        events = _run_oom_queries(thanos, namespace, window)
+        thanos_oom = thanos_ooms(namespace, events)
+
+    merged = merge_ooms(live, thanos_oom)
+    attach_oom_counts(leaves, merged)
+    return build_namespace_tree(namespace, leaves, merged)
+
+
 def main(argv=None):
     raise NotImplementedError
 

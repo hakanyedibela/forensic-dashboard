@@ -391,3 +391,66 @@ def test_pick_cli_binary(fcu, monkeypatch):
     monkeypatch.setattr(fcu.shutil, "which",
                         lambda b: "/usr/bin/kubectl" if b == "kubectl" else None)
     assert fcu.pick_cli_binary(prefer_kubectl=False) == "kubectl"
+
+
+class FakeK8s:
+    def __init__(self, pods=None, rs=None):
+        self._pods = pods or []
+        self._rs = rs or []
+
+    def list_pods(self, namespace=None):
+        return self._pods
+
+    def list_replicasets(self, namespace=None):
+        return self._rs
+
+    def list_namespaces(self):
+        return []
+
+
+def test_collect_namespace_no_thanos(fcu):
+    pods = [{
+        "metadata": {"name": "web-1", "namespace": "pid-001-shop-ref-01-blue",
+                     "labels": {}},
+        "spec": {"nodeName": "n1", "containers": [
+            {"name": "web", "resources": {
+                "limits": {"cpu": "200m", "memory": "128Mi"}}}]},
+        "status": {"containerStatuses": []},
+    }]
+    node = fcu.collect_namespace(
+        fcu_k8s=FakeK8s(pods=pods),
+        namespace="pid-001-shop-ref-01-blue",
+        thanos=None, window="24h", step="5m")
+    assert node["stage"] == "ref"
+    assert node["totals"]["cpu_limit"] == pytest.approx(0.2)
+    assert node["totals"]["cpu_now"] is None
+    assert node["workloads"][0]["pods"][0]["name"] == "web-1"
+
+
+def test_collect_namespace_with_thanos(fcu):
+    pods = [{
+        "metadata": {"name": "web-1", "namespace": "ns1", "labels": {}},
+        "spec": {"nodeName": "n1", "containers": [
+            {"name": "web", "resources": {
+                "limits": {"cpu": "200m", "memory": "128Mi"}}}]},
+        "status": {"containerStatuses": []},
+    }]
+    from conftest import FakeThanos
+    thanos = FakeThanos({
+        "rate(container_cpu_usage_seconds_total": [
+            {"metric": {"pod": "web-1", "container": "web"},
+             "value": [0, "0.05"]}],
+        "container_memory_working_set_bytes": [
+            {"metric": {"pod": "web-1", "container": "web"},
+             "value": [0, str(80 * 1024**2)]}],
+        "container_oom_events_total": [
+            {"metric": {"pod": "web-1", "container": "web"},
+             "value": [0, "2"]}],
+    })
+    node = fcu.collect_namespace(fcu_k8s=FakeK8s(pods=pods), namespace="ns1",
+                                 thanos=thanos, window="24h", step="5m")
+    leaf = node["workloads"][0]["pods"][0]["containers"][0]
+    assert leaf["cpu_now"] == pytest.approx(0.05)
+    assert leaf["mem_now"] == 80 * 1024**2
+    assert node["totals"]["oom_count"] == 1
+    assert any(o["source"] in ("thanos", "both") for o in node["ooms"])
