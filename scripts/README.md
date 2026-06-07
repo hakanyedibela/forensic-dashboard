@@ -805,7 +805,8 @@ the Python step — ask and we can wire that up.
 
 ### Requirements
 
-- Python 3.6+ (stdlib only)
+- Python 3.6.8+ (stdlib only) — runs on the RHEL 8 / OpenShift system `python3`
+  as well as the `python:3.12-slim` CronJob image.
 - Local: `oc` or `kubectl` (`--kubectl`) with an active session; RBAC `get`/`list`
   on pods, replicasets, deployments, statefulsets, daemonsets, namespaces.
 - In-cluster: the ServiceAccount RBAC from the manifest.
