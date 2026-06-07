@@ -134,6 +134,32 @@ def workload_for(pod, rs_index):
     return "", ""
 
 
+# ------------------------------------------------------------- rollup math
+
+def sum_limit(values):
+    """Sum configured requests/limits. Any unset (None) contributor means the
+    aggregate is unbounded -> None. Empty -> None."""
+    values = list(values)
+    if not values or any(v is None for v in values):
+        return None
+    return sum(values)
+
+
+def sum_usage(values):
+    """Sum observed usage. None means 'no data' for that contributor and is
+    skipped. Returns None only when every contributor is missing."""
+    present = [v for v in values if v is not None]
+    return sum(present) if present else None
+
+
+def util_pct(usage, limit):
+    """usage/limit as a percentage, or None when usage missing or limit
+    unknown/zero."""
+    if usage is None or not limit:
+        return None
+    return usage / limit * 100.0
+
+
 def main(argv=None):
     raise NotImplementedError
 
