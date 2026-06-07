@@ -923,8 +923,156 @@ def render_text(trees, stream, levels=("namespace", "workload", "pod",
                           "LAST OOM"], rows, stream)
 
 
+# ----------------------------------------------------------------------- CLI
+
+# Binary used by the copied Thanos helpers (discover_querier / port-forward /
+# auto_token). main() overrides this from --kubectl / autodetect.
+CLI = "oc"
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Cluster usage report: configured limits/requests vs real "
+                    "Thanos usage per namespace/workload/pod/container, plus "
+                    "OOM-killed list (live + Thanos).",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    scope = p.add_argument_group("scope")
+    scope.add_argument("--pattern", default="^pid-",
+                       help="Namespace name filter (default: ^pid-).")
+    scope.add_argument("--namespace", action="append",
+                       help="Restrict to this namespace (repeatable).")
+    scope.add_argument("--all-namespaces", action="store_true",
+                       help="Ignore --pattern; scan every namespace.")
+
+    be = p.add_argument_group("backend")
+    g = be.add_mutually_exclusive_group()
+    g.add_argument("--in-cluster", action="store_true",
+                   help="Force the in-cluster REST backend.")
+    g.add_argument("--cli", action="store_true",
+                   help="Force the oc/kubectl CLI backend.")
+    be.add_argument("--kubectl", action="store_true",
+                    help="Prefer kubectl over oc for the CLI backend.")
+
+    th = p.add_argument_group("thanos")
+    th.add_argument("--thanos-url", help="Thanos Querier base URL.")
+    th.add_argument("--token", help="Bearer token for Thanos.")
+    th.add_argument("--token-file", help="Read bearer token from file.")
+    th.add_argument("--insecure", action="store_true",
+                    help="Skip TLS verification for Thanos.")
+    th.add_argument("--no-thanos", action="store_true",
+                    help="Skip usage queries; configured + live OOM only.")
+    th.add_argument("--window", default="24h",
+                    help="Lookback window for peak/avg (default: 24h).")
+    th.add_argument("--step", default="5m",
+                    help="Sub-query step for *_over_time (default: 5m).")
+    th.add_argument("--local-port", type=int, default=19090,
+                    help="Local port for the port-forward fallback.")
+
+    out = p.add_argument_group("output")
+    out.add_argument("--level", default="namespace,workload,pod,container",
+                     help="Comma list of text levels (default: all).")
+    out.add_argument("--format", action="append",
+                     choices=["text", "json", "csv"],
+                     help="stdout format(s) (default: text).")
+    out.add_argument("--output-dir",
+                     help="Also write resources.csv, ooms.csv, report.json.")
+    return p
+
+
+def select_namespaces(k8s, pattern, explicit, all_namespaces):
+    """Resolve the namespace list. explicit wins; else list + filter."""
+    if explicit:
+        return list(explicit)
+    names = [n["metadata"]["name"] for n in k8s.list_namespaces()]
+    if all_namespaces:
+        return names
+    rx = re.compile(pattern)
+    return [n for n in names if rx.search(n)]
+
+
+def _make_k8s(args):
+    kind = choose_backend_kind(force_cli=args.cli, force_rest=args.in_cluster)
+    if kind == "rest":
+        host = (f"https://{os.environ['KUBERNETES_SERVICE_HOST']}:"
+                f"{os.environ.get('KUBERNETES_SERVICE_PORT', '443')}")
+        return RestK8sClient(host, token=read_sa_token(),
+                             ca_cert=SA_CA_PATH if os.path.exists(SA_CA_PATH)
+                             else None, insecure=args.insecure)
+    return CliK8sClient(binary=pick_cli_binary(prefer_kubectl=args.kubectl))
+
+
+def _resolve_token(args):
+    if args.token:
+        return args.token
+    if args.token_file:
+        with open(args.token_file) as f:
+            return f.read().strip()
+    return read_sa_token() or auto_token()
+
+
+def _make_thanos(args):
+    """Returns a Thanos client or None (when --no-thanos or unreachable)."""
+    if args.no_thanos:
+        return None
+    base = args.thanos_url or os.environ.get("THANOS_URL")
+    if not base:
+        svc = discover_querier()
+        if not svc:
+            sys.stderr.write("warn: no Thanos URL and no known Querier Service; "
+                             "continuing without usage metrics.\n")
+            return None
+        ns, name, port = svc
+        if os.environ.get("KUBERNETES_SERVICE_HOST"):
+            base = f"http://{name}.{ns}:{port}"
+        else:
+            sys.stderr.write(f"info: port-forwarding {ns}/{name}:{port}\n")
+            start_port_forward(svc, args.local_port)
+            base = f"http://127.0.0.1:{args.local_port}"
+    client = Thanos(base, token=_resolve_token(args), insecure=args.insecure)
+    ok, err = client.probe()
+    if not ok:
+        sys.stderr.write(f"warn: Thanos unreachable ({err}); continuing without "
+                         "usage metrics.\n")
+        return None
+    return client
+
+
 def main(argv=None):
-    raise NotImplementedError
+    args = build_parser().parse_args(argv)
+    global CLI
+    CLI = pick_cli_binary(prefer_kubectl=args.kubectl)
+    k8s = _make_k8s(args)
+    thanos = _make_thanos(args)
+    namespaces = select_namespaces(k8s, args.pattern, args.namespace,
+                                   args.all_namespaces)
+    if not namespaces:
+        sys.stderr.write("no matching namespaces.\n")
+        return 0
+
+    trees = [collect_namespace(k8s, ns, thanos, args.window, args.step)
+             for ns in namespaces]
+
+    formats = args.format or ["text"]
+    levels = tuple(s.strip() for s in args.level.split(",") if s.strip())
+    cluster = os.environ.get("KUBERNETES_SERVICE_HOST", "local")
+    if "text" in formats:
+        render_text(trees, sys.stdout, levels=levels)
+    if "json" in formats:
+        render_json(trees, sys.stdout, window=args.window, cluster=cluster)
+    if "csv" in formats:
+        render_resources_csv(trees, sys.stdout)
+
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "resources.csv"), "w") as f:
+            render_resources_csv(trees, f)
+        with open(os.path.join(args.output_dir, "ooms.csv"), "w") as f:
+            render_ooms_csv(trees, f)
+        with open(os.path.join(args.output_dir, "report.json"), "w") as f:
+            render_json(trees, f, window=args.window, cluster=cluster)
+        sys.stderr.write(f"wrote reports to {args.output_dir}\n")
+    return 0
 
 
 if __name__ == "__main__":
