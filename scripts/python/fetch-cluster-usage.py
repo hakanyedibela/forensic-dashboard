@@ -58,7 +58,10 @@ def parse_mem(s):
     units = {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4,
              "Pi": 1024**5, "K": 1000, "M": 10**6, "G": 10**9, "T": 10**12,
              "P": 10**15}
-    for suf, mul in units.items():
+    # Match the longest suffix first so binary "Ki"/"Mi" win over "K"/"M"
+    # regardless of dict iteration order (robust on Python 3.6, too).
+    for suf in sorted(units, key=len, reverse=True):
+        mul = units[suf]
         if s.endswith(suf):
             try:
                 return int(float(s[:-len(suf)]) * mul)
@@ -518,45 +521,6 @@ QUERIER_CANDIDATES = [
     ("monitoring", "kps-prometheus", "9090"),
     ("monitoring", "prometheus-operated", "9090"),
 ]
-
-
-_DUR_RE = re.compile(r"^\s*(-?\d+)\s*([smhdw])\s*$")
-
-
-def parse_time(value, *, now=None):
-    """Accept 'now', RFC3339, unix seconds, or a relative offset like '-1h'."""
-    if value is None:
-        return None
-    s = str(value).strip()
-    if s in ("", "now"):
-        return (now or time.time())
-    m = _DUR_RE.match(s)
-    if m:
-        n, unit = int(m.group(1)), m.group(2)
-        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
-        return (now or time.time()) + n * mult
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    except ValueError:
-        raise SystemExit(f"error: cannot parse time: {value!r}")
-
-
-def parse_step(value):
-    """Step as Prometheus duration string ('30s', '1m', '5m') or seconds."""
-    s = str(value).strip()
-    if _DUR_RE.match(s):
-        return s
-    try:
-        return str(int(float(s)))
-    except ValueError:
-        raise SystemExit(f"error: cannot parse step: {value!r}")
 
 
 def discover_querier():
