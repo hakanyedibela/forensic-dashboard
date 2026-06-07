@@ -58,3 +58,30 @@ def test_fmt_pct(fcu):
 ])
 def test_detect_stage(fcu, ns, stage):
     assert fcu.detect_stage(ns) == stage
+
+
+def _pod(name, ns="ns1", owner=None, labels=None):
+    md = {"name": name, "namespace": ns, "labels": labels or {}}
+    if owner:
+        md["ownerReferences"] = [owner]
+    return {"metadata": md, "spec": {}, "status": {}}
+
+
+def test_workload_for_deployment_via_rs(fcu):
+    rs = {"metadata": {"name": "web-abc", "namespace": "ns1",
+                       "ownerReferences": [{"kind": "Deployment", "name": "web",
+                                            "controller": True}]}}
+    rs_index = {("ns1", "web-abc"): rs}
+    pod = _pod("web-abc-123", owner={"kind": "ReplicaSet", "name": "web-abc",
+                                     "controller": True})
+    assert fcu.workload_for(pod, rs_index) == ("Deployment", "web")
+
+
+def test_workload_for_statefulset(fcu):
+    pod = _pod("db-0", owner={"kind": "StatefulSet", "name": "db",
+                              "controller": True})
+    assert fcu.workload_for(pod, {}) == ("StatefulSet", "db")
+
+
+def test_workload_for_orphan(fcu):
+    assert fcu.workload_for(_pod("loose"), {}) == ("", "")
