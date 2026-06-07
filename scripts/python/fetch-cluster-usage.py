@@ -91,6 +91,26 @@ def fmt_pct(v):
     return "-" if v is None else f"{v:.1f}%"
 
 
+# ------------------------------------------------------------ stage detection
+
+STAGE_KEYWORDS = ("ref", "prod", "test", "phase", "pnext")
+
+
+def detect_stage(ns):
+    """Stage from namespace name per convention pid-<id>-<app>-<STAGE>-<num>-...
+
+    Checks dash-segment index 3 first (canonical position), then any segment,
+    matching the bash loops' detect_stage. Returns 'other' if no keyword found.
+    """
+    parts = ns.lower().split("-")
+    if len(parts) > 3 and parts[3] in STAGE_KEYWORDS:
+        return parts[3]
+    for p in parts:
+        if p in STAGE_KEYWORDS:
+            return p
+    return "other"
+
+
 def main(argv=None):
     raise NotImplementedError
 
