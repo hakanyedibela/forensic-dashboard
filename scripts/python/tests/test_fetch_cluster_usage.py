@@ -85,3 +85,33 @@ def test_workload_for_statefulset(fcu):
 
 def test_workload_for_orphan(fcu):
     assert fcu.workload_for(_pod("loose"), {}) == ("", "")
+
+
+def test_sum_limit_all_present(fcu):
+    assert fcu.sum_limit([0.1, 0.2, 0.3]) == pytest.approx(0.6)
+
+
+def test_sum_limit_any_missing_is_none(fcu):
+    assert fcu.sum_limit([0.1, None, 0.3]) is None
+
+
+def test_sum_limit_empty_is_none(fcu):
+    assert fcu.sum_limit([]) is None
+
+
+def test_sum_usage_partial(fcu):
+    assert fcu.sum_usage([1.0, None, 2.0]) == pytest.approx(3.0)
+
+
+def test_sum_usage_all_none(fcu):
+    assert fcu.sum_usage([None, None]) is None
+
+
+def test_util_pct(fcu):
+    assert fcu.util_pct(0.95, 1.0) == pytest.approx(95.0)
+
+
+def test_util_pct_no_limit_or_usage(fcu):
+    assert fcu.util_pct(0.5, None) is None
+    assert fcu.util_pct(None, 1.0) is None
+    assert fcu.util_pct(0.5, 0) is None
