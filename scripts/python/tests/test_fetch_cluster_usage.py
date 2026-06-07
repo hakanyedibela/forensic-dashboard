@@ -255,3 +255,31 @@ def test_build_namespace_tree(fcu):
     assert len(wl["pods"]) == 2
     assert wl["pods"][0]["containers"][0]["container"] == "web"
     assert node["ooms"] == ooms
+
+
+def test_usage_queries_contain_expected_promql(fcu):
+    q = fcu.usage_queries("ns1", "24h", "5m")
+    assert q["cpu_now"] == (
+        'sum by (pod, container) '
+        '(rate(container_cpu_usage_seconds_total{namespace="ns1",container!=""}[5m]))'
+    )
+    assert "max_over_time" in q["cpu_peak"]
+    assert "[24h:5m]" in q["cpu_peak"]
+    assert q["mem_now"] == (
+        'sum by (pod, container) '
+        '(container_memory_working_set_bytes{namespace="ns1",container!=""})'
+    )
+    assert "max_over_time" in q["mem_peak"] and "[24h]" in q["mem_peak"]
+
+
+def test_parse_vector_by_pod_container(fcu):
+    payload = {"data": {"resultType": "vector", "result": [
+        {"metric": {"pod": "p1", "container": "c1"}, "value": [0, "0.25"]},
+        {"metric": {"pod": "p2", "container": "c1"}, "value": [0, "0.5"]},
+    ]}}
+    out = fcu.parse_vector_by_pod_container(payload)
+    assert out == {("p1", "c1"): 0.25, ("p2", "c1"): 0.5}
+
+
+def test_parse_vector_empty(fcu):
+    assert fcu.parse_vector_by_pod_container({"data": {"result": []}}) == {}

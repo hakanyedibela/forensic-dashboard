@@ -301,6 +301,56 @@ def build_namespace_tree(namespace, leaves, ooms):
     }
 
 
+# ----------------------------------------------------------- thanos queries
+
+def usage_queries(namespace, window, step):
+    """PromQL for the five usage series, aggregated by (pod, container).
+
+    cpu_* are cores (rate of the CPU seconds counter); mem_* are working-set
+    bytes. peak/avg use *_over_time across the lookback window.
+    """
+    sel = f'namespace="{namespace}",container!=""'
+    cpu_rate = f"rate(container_cpu_usage_seconds_total{{{sel}}}[5m])"
+    wss = f"container_memory_working_set_bytes{{{sel}}}"
+    by = "sum by (pod, container)"
+    return {
+        "cpu_now": f"{by} ({cpu_rate})",
+        "cpu_peak": f"{by} (max_over_time({cpu_rate}[{window}:{step}]))",
+        "cpu_avg": f"{by} (avg_over_time({cpu_rate}[{window}:{step}]))",
+        "mem_now": f"{by} ({wss})",
+        "mem_peak": f"{by} (max_over_time({wss}[{window}]))",
+    }
+
+
+def oom_queries(namespace, window):
+    """PromQL for historical OOM signal, aggregated by (pod, container)."""
+    sel = f'namespace="{namespace}",container!=""'
+    return {
+        "events": f'sum by (pod, container) '
+                  f'(increase(container_oom_events_total{{{sel}}}[{window}]))',
+        "terminated": f'max by (pod, container) '
+                      f'(kube_pod_container_status_last_terminated_reason'
+                      f'{{namespace="{namespace}",reason="OOMKilled"}})',
+    }
+
+
+def parse_vector_by_pod_container(payload):
+    """Thanos instant-vector payload -> {(pod, container): float}. Series
+    missing pod/container labels are skipped."""
+    out = {}
+    for s in payload.get("data", {}).get("result", []):
+        metric = s.get("metric", {})
+        pod = metric.get("pod")
+        container = metric.get("container")
+        if not pod or not container:
+            continue
+        try:
+            out[(pod, container)] = float(s.get("value", [None, None])[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
 def main(argv=None):
     raise NotImplementedError
 
