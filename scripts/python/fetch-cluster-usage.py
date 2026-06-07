@@ -351,6 +351,37 @@ def parse_vector_by_pod_container(payload):
     return out
 
 
+# --------------------------------------------------- attach observed signals
+
+def attach_usage(leaves, usage_maps):
+    """Fill cpu_now/peak/avg + mem_now/peak on each leaf from the per-series
+    maps produced by parse_vector_by_pod_container. Missing series stay None."""
+    for leaf in leaves:
+        key = (leaf["pod"], leaf["container"])
+        for field, m in usage_maps.items():
+            if key in m:
+                leaf[field] = m[key]
+
+
+def thanos_ooms(namespace, events_map):
+    """Historical OOM records (oom_events > 0) from the increase() vector."""
+    out = []
+    for (pod, container), v in events_map.items():
+        if v and v > 0:
+            out.append({"namespace": namespace, "pod": pod,
+                        "container": container, "oom_events": int(round(v))})
+    return out
+
+
+def attach_oom_counts(leaves, merged_ooms):
+    """Set each leaf's oom_count to 1 if its (ns,pod,container) is in the merged
+    OOM set, else 0 (used so rollups surface an oom_count per level)."""
+    keys = {(o["namespace"], o["pod"], o["container"]) for o in merged_ooms}
+    for leaf in leaves:
+        leaf["oom_count"] = 1 if (
+            leaf["namespace"], leaf["pod"], leaf["container"]) in keys else 0
+
+
 def main(argv=None):
     raise NotImplementedError
 
