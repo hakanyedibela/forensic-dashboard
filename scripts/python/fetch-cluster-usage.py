@@ -259,6 +259,48 @@ def live_ooms_from_pods(pods):
     return out
 
 
+# ----------------------------------------------------- nested tree assembly
+
+def _workload_key(leaf):
+    return (leaf.get("workload_kind") or "", leaf.get("workload") or leaf["pod"])
+
+
+def build_namespace_tree(namespace, leaves, ooms):
+    """namespace -> workloads -> pods -> containers, with a rollup at each level.
+
+    leaves are this namespace's container records (usage already attached).
+    ooms is the merged OOM list for this namespace.
+    """
+    workloads = []
+    wl_groups = {}
+    for leaf in leaves:
+        wl_groups.setdefault(_workload_key(leaf), []).append(leaf)
+
+    for (wl_kind, wl_name), wl_leaves in sorted(wl_groups.items()):
+        pods = []
+        pod_groups = {}
+        for leaf in wl_leaves:
+            pod_groups.setdefault(leaf["pod"], []).append(leaf)
+        for pod_name, pod_leaves in sorted(pod_groups.items()):
+            pods.append({
+                "name": pod_name,
+                "totals": rollup(pod_leaves),
+                "containers": sorted(pod_leaves, key=lambda x: x["container"]),
+            })
+        workloads.append({
+            "kind": wl_kind, "name": wl_name,
+            "totals": rollup(wl_leaves), "pods": pods,
+        })
+
+    return {
+        "namespace": namespace,
+        "stage": detect_stage(namespace),
+        "totals": rollup(leaves),
+        "workloads": workloads,
+        "ooms": ooms,
+    }
+
+
 def main(argv=None):
     raise NotImplementedError
 

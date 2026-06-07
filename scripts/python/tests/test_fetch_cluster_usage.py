@@ -232,3 +232,26 @@ def test_live_ooms_ignores_non_oom(fcu):
     statuses = [{"name": "c", "lastState": {"terminated": {"reason": "Error"}}}]
     pods = [_pod_full("p1", "ns1", containers=[{"name": "c"}], statuses=statuses)]
     assert fcu.live_ooms_from_pods(pods) == []
+
+
+def test_build_namespace_tree(fcu):
+    leaves = [
+        _leaf(namespace="ns1", pod="web-1", container="web"),
+        _leaf(namespace="ns1", pod="web-2", container="web"),
+    ]
+    for leaf in leaves:
+        leaf["workload_kind"] = "Deployment"
+        leaf["workload"] = "web"
+    ooms = [{"namespace": "ns1", "pod": "web-1", "container": "web",
+             "source": "live"}]
+    node = fcu.build_namespace_tree("ns1", leaves, ooms)
+    assert node["namespace"] == "ns1"
+    assert node["stage"] == "other"
+    assert node["totals"]["container_count"] == 2
+    assert len(node["workloads"]) == 1
+    wl = node["workloads"][0]
+    assert (wl["kind"], wl["name"]) == ("Deployment", "web")
+    assert wl["totals"]["pod_count"] == 2
+    assert len(wl["pods"]) == 2
+    assert wl["pods"][0]["containers"][0]["container"] == "web"
+    assert node["ooms"] == ooms
