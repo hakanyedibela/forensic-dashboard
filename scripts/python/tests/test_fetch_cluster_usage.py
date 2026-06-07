@@ -283,3 +283,36 @@ def test_parse_vector_by_pod_container(fcu):
 
 def test_parse_vector_empty(fcu):
     assert fcu.parse_vector_by_pod_container({"data": {"result": []}}) == {}
+
+
+def test_attach_usage(fcu):
+    leaves = [_leaf(pod="p1", container="c1", cpu_now=None, cpu_peak=None,
+                    mem_now=None, mem_peak=None, cpu_avg=None)]
+    usage = {
+        "cpu_now": {("p1", "c1"): 0.1},
+        "cpu_peak": {("p1", "c1"): 0.18},
+        "cpu_avg": {("p1", "c1"): 0.12},
+        "mem_now": {("p1", "c1"): 100 * 1024**2},
+        "mem_peak": {("p1", "c1"): 120 * 1024**2},
+    }
+    fcu.attach_usage(leaves, usage)
+    assert leaves[0]["cpu_now"] == pytest.approx(0.1)
+    assert leaves[0]["cpu_peak"] == pytest.approx(0.18)
+    assert leaves[0]["mem_peak"] == 120 * 1024**2
+
+
+def test_attach_usage_missing_series_stays_none(fcu):
+    leaves = [_leaf(pod="p9", container="c1", cpu_now=None)]
+    fcu.attach_usage(leaves, {"cpu_now": {}, "cpu_peak": {}, "cpu_avg": {},
+                              "mem_now": {}, "mem_peak": {}})
+    assert leaves[0]["cpu_now"] is None
+
+
+def test_thanos_ooms_and_counts(fcu):
+    events = {("p1", "c1"): 5.0, ("p2", "c1"): 0.0}
+    leaves = [_leaf(namespace="ns1", pod="p1", container="c1", oom_count=0)]
+    ooms = fcu.thanos_ooms("ns1", events)
+    assert ooms == [{"namespace": "ns1", "pod": "p1", "container": "c1",
+                     "oom_events": 5}]
+    fcu.attach_oom_counts(leaves, fcu.merge_ooms([], ooms))
+    assert leaves[0]["oom_count"] == 1
