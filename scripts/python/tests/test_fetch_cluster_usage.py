@@ -454,3 +454,50 @@ def test_collect_namespace_with_thanos(fcu):
     assert leaf["mem_now"] == 80 * 1024**2
     assert node["totals"]["oom_count"] == 1
     assert any(o["source"] in ("thanos", "both") for o in node["ooms"])
+
+
+import io
+import json
+
+
+def _sample_tree(fcu):
+    pods = [{
+        "metadata": {"name": "web-1", "namespace": "ns1", "labels": {}},
+        "spec": {"nodeName": "n1", "containers": [
+            {"name": "web", "resources": {
+                "limits": {"cpu": "200m", "memory": "128Mi"},
+                "requests": {"cpu": "50m", "memory": "64Mi"}}}]},
+        "status": {"containerStatuses": []},
+    }]
+
+    class K:
+        list_pods = lambda self, ns=None: pods
+        list_replicasets = lambda self, ns=None: []
+    return fcu.collect_namespace(fcu_k8s=K(), namespace="ns1", thanos=None,
+                                 window="24h", step="5m")
+
+
+def test_flatten_rows_one_per_level(fcu):
+    rows = fcu.flatten_rows([_sample_tree(fcu)])
+    levels = {r["level"] for r in rows}
+    assert levels == {"namespace", "workload", "pod", "container"}
+    container_row = next(r for r in rows if r["level"] == "container")
+    assert container_row["namespace"] == "ns1"
+    assert container_row["cpu_limit"] == pytest.approx(0.2)
+
+
+def test_render_csv_has_header_and_rows(fcu):
+    buf = io.StringIO()
+    fcu.render_resources_csv([_sample_tree(fcu)], buf)
+    text = buf.getvalue()
+    assert text.splitlines()[0].startswith("level,stage,namespace")
+    assert "container" in text
+
+
+def test_render_json_structure(fcu):
+    buf = io.StringIO()
+    fcu.render_json([_sample_tree(fcu)], buf, window="24h", cluster="c1")
+    obj = json.loads(buf.getvalue())
+    assert obj["window"] == "24h"
+    assert obj["cluster"] == "c1"
+    assert obj["namespaces"][0]["namespace"] == "ns1"
