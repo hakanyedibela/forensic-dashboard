@@ -23,6 +23,18 @@ The script must run both **as a Kubernetes CronJob in-cluster** and **from a
 developer laptop**, with no third-party Python dependencies (stdlib only),
 consistent with the rest of `scripts/python/`.
 
+### Target environments
+
+| | Production | Local test |
+|---|---|---|
+| Cluster | OpenShift | RKE2 |
+| CLI binary | `oc` | `kubectl` (`--kubectl`) |
+| Thanos service | `openshift-monitoring/thanos-querier:9091` | kube-prometheus-stack Thanos in `monitoring` |
+| Thanos auth | **required** — SA bound to `cluster-monitoring-view` (in-cluster) or `oc whoami -t` (local); often `--insecure` for the route | **none** typically |
+
+Both must work from the same code path: CLI backend auto-picks `oc` then
+`kubectl` (override `--kubectl`); Thanos endpoint + auth degrade per §4.2.
+
 ## 2. Deliverables
 
 | Path | Purpose |
