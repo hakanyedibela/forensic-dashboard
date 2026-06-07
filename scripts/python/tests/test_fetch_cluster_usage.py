@@ -115,3 +115,40 @@ def test_util_pct_no_limit_or_usage(fcu):
     assert fcu.util_pct(0.5, None) is None
     assert fcu.util_pct(None, 1.0) is None
     assert fcu.util_pct(0.5, 0) is None
+
+
+def _leaf(**kw):
+    base = dict(
+        namespace="ns1", pod="p1", container="c1",
+        cpu_request=0.05, cpu_limit=0.2, cpu_now=0.1, cpu_peak=0.15, cpu_avg=0.1,
+        mem_request=64 * 1024**2, mem_limit=128 * 1024**2,
+        mem_now=100 * 1024**2, mem_peak=120 * 1024**2,
+        oom_count=0,
+    )
+    base.update(kw)
+    return base
+
+
+def test_rollup_sums_and_counts(fcu):
+    leaves = [_leaf(container="c1"), _leaf(container="c2", cpu_limit=0.3,
+                                           mem_limit=256 * 1024**2)]
+    agg = fcu.rollup(leaves)
+    assert agg["cpu_limit"] == pytest.approx(0.5)
+    assert agg["mem_limit"] == 384 * 1024**2
+    assert agg["cpu_now"] == pytest.approx(0.2)
+    assert agg["container_count"] == 2
+    assert agg["cpu_peak_util_pct"] == pytest.approx(0.3 / 0.5 * 100)
+
+
+def test_rollup_unset_limit_blocks_util(fcu):
+    leaves = [_leaf(cpu_limit=None)]
+    agg = fcu.rollup(leaves)
+    assert agg["cpu_limit"] is None
+    assert agg["cpu_peak_util_pct"] is None
+
+
+def test_rollup_pod_count_distinct(fcu):
+    leaves = [_leaf(pod="p1"), _leaf(pod="p1", container="c2"), _leaf(pod="p2")]
+    agg = fcu.rollup(leaves)
+    assert agg["pod_count"] == 2
+    assert agg["container_count"] == 3

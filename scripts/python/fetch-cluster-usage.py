@@ -160,6 +160,31 @@ def util_pct(usage, limit):
     return usage / limit * 100.0
 
 
+# Canonical numeric fields every level carries.
+LIMIT_FIELDS = ("cpu_request", "cpu_limit", "mem_request", "mem_limit")
+USAGE_FIELDS = ("cpu_now", "cpu_peak", "cpu_avg", "mem_now", "mem_peak")
+
+
+def rollup(leaves):
+    """Aggregate a list of leaf records into one level dict.
+
+    Requests/limits use sum_limit (None if any contributor unset); usage uses
+    sum_usage (None only if all missing). Adds cpu/mem peak-util%, oom_count,
+    and distinct pod/container counts.
+    """
+    agg = {}
+    for f in LIMIT_FIELDS:
+        agg[f] = sum_limit([leaf.get(f) for leaf in leaves])
+    for f in USAGE_FIELDS:
+        agg[f] = sum_usage([leaf.get(f) for leaf in leaves])
+    agg["cpu_peak_util_pct"] = util_pct(agg["cpu_peak"], agg["cpu_limit"])
+    agg["mem_peak_util_pct"] = util_pct(agg["mem_peak"], agg["mem_limit"])
+    agg["oom_count"] = sum(leaf.get("oom_count", 0) for leaf in leaves)
+    agg["pod_count"] = len({(leaf["namespace"], leaf["pod"]) for leaf in leaves})
+    agg["container_count"] = len(leaves)
+    return agg
+
+
 def main(argv=None):
     raise NotImplementedError
 
