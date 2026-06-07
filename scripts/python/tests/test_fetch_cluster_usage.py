@@ -553,3 +553,16 @@ def test_main_help_exits_zero(fcu):
     with pytest.raises(SystemExit) as e:
         fcu.main(["--help"])
     assert e.value.code == 0
+
+
+def test_make_thanos_no_thanos_returns_none(fcu):
+    args = fcu.build_parser().parse_args(["--no-thanos"])
+    assert fcu._make_thanos(args) is None
+
+
+def test_make_thanos_degrades_when_no_querier(fcu, monkeypatch):
+    # No URL, no env, no discoverable querier -> degrade to None (not crash).
+    monkeypatch.delenv("THANOS_URL", raising=False)
+    monkeypatch.setattr(fcu, "discover_querier", lambda: None)
+    args = fcu.build_parser().parse_args([])
+    assert fcu._make_thanos(args) is None

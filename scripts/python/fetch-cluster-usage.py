@@ -994,7 +994,13 @@ def select_namespaces(k8s, pattern, explicit, all_namespaces):
 def _make_k8s(args):
     kind = choose_backend_kind(force_cli=args.cli, force_rest=args.in_cluster)
     if kind == "rest":
-        host = (f"https://{os.environ['KUBERNETES_SERVICE_HOST']}:"
+        api_host = os.environ.get("KUBERNETES_SERVICE_HOST")
+        if not api_host:
+            sys.stderr.write(
+                "error: --in-cluster requires KUBERNETES_SERVICE_HOST to be set "
+                "(only available inside a pod). Drop --in-cluster to use oc/kubectl.\n")
+            sys.exit(2)
+        host = (f"https://{api_host}:"
                 f"{os.environ.get('KUBERNETES_SERVICE_PORT', '443')}")
         return RestK8sClient(host, token=read_sa_token(),
                              ca_cert=SA_CA_PATH if os.path.exists(SA_CA_PATH)
