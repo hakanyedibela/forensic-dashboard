@@ -185,6 +185,31 @@ def rollup(leaves):
     return agg
 
 
+# ----------------------------------------------------------------- OOM merge
+
+def _oom_key(o):
+    return (o["namespace"], o["pod"], o["container"])
+
+
+def merge_ooms(live, thanos):
+    """Merge live (pod lastState) and Thanos (historical) OOM records, keyed by
+    (namespace, pod, container). Live fields win on overlap; Thanos contributes
+    oom_events. source is 'live', 'thanos', or 'both'. Sorted by key."""
+    by_key = {}
+    for o in live:
+        by_key[_oom_key(o)] = {**o, "source": "live"}
+    for o in thanos:
+        k = _oom_key(o)
+        if k in by_key:
+            existing = by_key[k]
+            existing["source"] = "both"
+            if "oom_events" in o:
+                existing["oom_events"] = o["oom_events"]
+        else:
+            by_key[k] = {**o, "source": "thanos"}
+    return [by_key[k] for k in sorted(by_key)]
+
+
 def main(argv=None):
     raise NotImplementedError
 
