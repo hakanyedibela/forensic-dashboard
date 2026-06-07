@@ -111,6 +111,29 @@ def detect_stage(ns):
     return "other"
 
 
+# --------------------------------------------------- relationship resolution
+
+def workload_for(pod, rs_index):
+    """Logical workload (kind, name) for a pod. Follows pod -> ReplicaSet ->
+    Deployment via ownerReferences so we report 'Deployment/web' rather than
+    the ReplicaSet. rs_index maps (ns, name) -> ReplicaSet object. Returns
+    ('', '') for pods with no controller owner."""
+    ns = pod["metadata"]["namespace"]
+    for owner in pod.get("metadata", {}).get("ownerReferences", []):
+        if not owner.get("controller"):
+            continue
+        kind, name = owner["kind"], owner["name"]
+        if kind == "ReplicaSet":
+            rs = rs_index.get((ns, name))
+            if rs:
+                for o2 in rs.get("metadata", {}).get("ownerReferences", []):
+                    if o2.get("controller"):
+                        return o2.get("kind", "ReplicaSet"), o2.get("name", name)
+            return kind, name
+        return kind, name
+    return "", ""
+
+
 def main(argv=None):
     raise NotImplementedError
 
