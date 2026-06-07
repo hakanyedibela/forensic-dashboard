@@ -355,3 +355,39 @@ def test_rest_client_builds_url(fcu):
     assert seen["url"] == "https://k8s:6443/api/v1/namespaces/ns1/pods"
     client.list_deployments(None)
     assert seen["url"] == "https://k8s:6443/apis/apps/v1/deployments"
+
+
+def test_choose_backend_prefers_rest_in_cluster(fcu, monkeypatch, tmp_path):
+    tok = tmp_path / "token"
+    tok.write_text("abc")
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    monkeypatch.setenv("KUBERNETES_SERVICE_PORT", "443")
+    kind = fcu.choose_backend_kind(force_cli=False, force_rest=False,
+                                   token_path=str(tok))
+    assert kind == "rest"
+
+
+def test_choose_backend_falls_back_to_cli(fcu, monkeypatch):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    kind = fcu.choose_backend_kind(force_cli=False, force_rest=False,
+                                   token_path="/nonexistent")
+    assert kind == "cli"
+
+
+def test_choose_backend_force_cli(fcu, monkeypatch, tmp_path):
+    tok = tmp_path / "token"
+    tok.write_text("abc")
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
+    assert fcu.choose_backend_kind(force_cli=True, force_rest=False,
+                                   token_path=str(tok)) == "cli"
+
+
+def test_pick_cli_binary(fcu, monkeypatch):
+    monkeypatch.delenv("OC_BIN", raising=False)
+    monkeypatch.delenv("KUBECTL_BIN", raising=False)
+    monkeypatch.setattr(fcu.shutil, "which",
+                        lambda b: "/usr/bin/oc" if b == "oc" else None)
+    assert fcu.pick_cli_binary(prefer_kubectl=False) == "oc"
+    monkeypatch.setattr(fcu.shutil, "which",
+                        lambda b: "/usr/bin/kubectl" if b == "kubectl" else None)
+    assert fcu.pick_cli_binary(prefer_kubectl=False) == "kubectl"

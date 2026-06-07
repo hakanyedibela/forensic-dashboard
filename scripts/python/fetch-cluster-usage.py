@@ -5,6 +5,7 @@ from live pod state + Thanos history. Self-contained (stdlib only); runs locally
 via oc/kubectl and in-cluster as a CronJob. See scripts/README.md."""
 
 import argparse
+import atexit
 import csv
 import json
 import os
@@ -495,6 +496,245 @@ class RestK8sClient:
 
     def list_daemonsets(self, namespace=None):
         return self._list("daemonsets", namespace)
+
+
+# ----------------------------------------------------------- thanos client
+
+# (namespace, service, port) — first match wins. Mirrors oom-usage.py.
+QUERIER_CANDIDATES = [
+    ("openshift-monitoring", "thanos-querier", "9091"),
+    ("monitoring", "thanos-query", "9090"),
+    ("monitoring", "thanos-query-frontend", "9090"),
+    ("monitoring", "kps-kube-prometheus-stack-thanos-discovery", "10902"),
+    ("monitoring", "kps-kube-prometheus-stack-prometheus", "9090"),
+    ("monitoring", "kps-prometheus", "9090"),
+    ("monitoring", "prometheus-operated", "9090"),
+]
+
+
+_DUR_RE = re.compile(r"^\s*(-?\d+)\s*([smhdw])\s*$")
+
+
+def parse_time(value, *, now=None):
+    """Accept 'now', RFC3339, unix seconds, or a relative offset like '-1h'."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s in ("", "now"):
+        return (now or time.time())
+    m = _DUR_RE.match(s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
+        return (now or time.time()) + n * mult
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        raise SystemExit(f"error: cannot parse time: {value!r}")
+
+
+def parse_step(value):
+    """Step as Prometheus duration string ('30s', '1m', '5m') or seconds."""
+    s = str(value).strip()
+    if _DUR_RE.match(s):
+        return s
+    try:
+        return str(int(float(s)))
+    except ValueError:
+        raise SystemExit(f"error: cannot parse step: {value!r}")
+
+
+def discover_querier():
+    for ns, name, port in QUERIER_CANDIDATES:
+        rc = subprocess.run([CLI, "get", "svc", name, "-n", ns],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL).returncode
+        if rc == 0:
+            return ns, name, port
+    return None
+
+
+def start_port_forward(svc, local_port, timeout=15):
+    ns, name, remote_port = svc
+    proc = subprocess.Popen(
+        [CLI, "port-forward", f"svc/{name}", f"{local_port}:{remote_port}", "-n", ns],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True,
+    )
+    atexit.register(
+        lambda: (proc.terminate(), proc.wait(timeout=5)) if proc.poll() is None else None
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            out = (proc.stdout.read() or "").strip() if proc.stdout else ""
+            raise RuntimeError(f"{CLI} port-forward exited: {out or 'no output'}")
+        try:
+            with socket.create_connection(("127.0.0.1", local_port), timeout=0.5):
+                return proc
+        except OSError:
+            time.sleep(0.3)
+    # Timed out. Kill it, then drain whatever kubectl wrote so the user sees why.
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    out = (proc.stdout.read() or "").strip() if proc.stdout else ""
+    raise RuntimeError(
+        f"timed out waiting for port-forward to {ns}/{name}:{remote_port} "
+        f"on local :{local_port}.\n--- {CLI} output ---\n{out or '(empty)'}"
+    )
+
+
+def auto_token():
+    if CLI != "oc" and not shutil.which("oc"):
+        return None
+    try:
+        out = subprocess.run(["oc", "whoami", "-t"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             universal_newlines=True).stdout.strip()
+        return out or None
+    except FileNotFoundError:
+        return None
+
+
+class Thanos:
+    def __init__(self, base_url, *, token=None, insecure=False, timeout=30,
+                 dedup=True, partial_response=False, max_source_resolution=None,
+                 engine=None, store_matchers=None):
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.timeout = timeout
+        self.dedup = dedup
+        self.partial_response = partial_response
+        self.max_source_resolution = max_source_resolution
+        self.engine = engine
+        self.store_matchers = list(store_matchers or [])
+        self.ctx = ssl.create_default_context()
+        if insecure:
+            self.ctx.check_hostname = False
+            self.ctx.verify_mode = ssl.CERT_NONE
+
+    def _thanos_params(self):
+        p = []
+        # Thanos accepts these as repeated form fields. Omitting them lets
+        # the server keep its defaults (which is also fine).
+        p.append(("dedup", "true" if self.dedup else "false"))
+        if self.partial_response:
+            p.append(("partial_response", "true"))
+        if self.max_source_resolution:
+            p.append(("max_source_resolution", self.max_source_resolution))
+        if self.engine:
+            p.append(("engine", self.engine))
+        for m in self.store_matchers:
+            p.append(("storeMatch[]", m))
+        return p
+
+    def _get(self, path, params):
+        qs = urllib.parse.urlencode(params, doseq=True)
+        url = f"{self.base_url}{path}?{qs}"
+        req = urllib.request.Request(url)
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        with urllib.request.urlopen(req, context=self.ctx, timeout=self.timeout) as r:
+            payload = json.load(r)
+        if payload.get("status") != "success":
+            raise RuntimeError(
+                f"API error: {payload.get('errorType')}: {payload.get('error')}"
+            )
+        return payload
+
+    def probe(self):
+        try:
+            self._get("/api/v1/query", [("query", "1"), ("time", str(int(time.time())))])
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    def query(self, expr, ts=None):
+        params = [("query", expr)]
+        if ts is not None:
+            params.append(("time", f"{ts:.3f}"))
+        params += self._thanos_params()
+        return self._get("/api/v1/query", params)
+
+    def query_range(self, expr, start, end, step):
+        params = [
+            ("query", expr),
+            ("start", f"{start:.3f}"),
+            ("end", f"{end:.3f}"),
+            ("step", str(step)),
+        ]
+        params += self._thanos_params()
+        return self._get("/api/v1/query_range", params)
+
+    def labels(self, start=None, end=None):
+        params = []
+        if start is not None:
+            params.append(("start", f"{start:.3f}"))
+        if end is not None:
+            params.append(("end", f"{end:.3f}"))
+        return self._get("/api/v1/labels", params)
+
+    def label_values(self, name, start=None, end=None):
+        params = []
+        if start is not None:
+            params.append(("start", f"{start:.3f}"))
+        if end is not None:
+            params.append(("end", f"{end:.3f}"))
+        return self._get(f"/api/v1/label/{urllib.parse.quote(name)}/values", params)
+
+    def series(self, matches, start=None, end=None):
+        params = [("match[]", m) for m in matches]
+        if start is not None:
+            params.append(("start", f"{start:.3f}"))
+        if end is not None:
+            params.append(("end", f"{end:.3f}"))
+        return self._get("/api/v1/series", params)
+
+
+# --------------------------------------------------------- env autodetection
+
+SA_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+SA_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+
+def choose_backend_kind(force_cli, force_rest, token_path=SA_TOKEN_PATH):
+    """'rest' when in-cluster (SA token present + KUBERNETES_SERVICE_HOST set),
+    else 'cli'. Explicit flags win."""
+    if force_cli:
+        return "cli"
+    if force_rest:
+        return "rest"
+    if os.environ.get("KUBERNETES_SERVICE_HOST") and os.path.exists(token_path):
+        return "rest"
+    return "cli"
+
+
+def pick_cli_binary(prefer_kubectl=False):
+    """oc by default (falls back to kubectl); prefer_kubectl flips the order.
+    Honors $OC_BIN / $KUBECTL_BIN."""
+    if prefer_kubectl:
+        return os.environ.get("KUBECTL_BIN") or (
+            "kubectl" if shutil.which("kubectl") else "oc")
+    return os.environ.get("OC_BIN") or (
+        "oc" if shutil.which("oc") else "kubectl")
+
+
+def read_sa_token(token_path=SA_TOKEN_PATH):
+    try:
+        with open(token_path) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
 
 
 def main(argv=None):
