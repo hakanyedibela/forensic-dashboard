@@ -773,6 +773,77 @@ def collect_namespace(fcu_k8s, namespace, thanos, window, step):
     return build_namespace_tree(namespace, leaves, merged)
 
 
+# ------------------------------------------------------------- flat rows / csv
+
+CSV_COLUMNS = [
+    "level", "stage", "namespace", "workload_kind", "workload", "pod",
+    "container", "cpu_request", "cpu_limit", "cpu_now", "cpu_peak", "cpu_avg",
+    "cpu_peak_util_pct", "mem_request", "mem_limit", "mem_now", "mem_peak",
+    "mem_peak_util_pct", "oom_count", "pod_count", "container_count",
+]
+
+
+def _row_from_totals(level, stage, namespace, totals, **ids):
+    row = {c: "" for c in CSV_COLUMNS}
+    row.update({"level": level, "stage": stage, "namespace": namespace})
+    row.update(ids)
+    for k, v in totals.items():
+        if k in row:
+            row[k] = v
+    return row
+
+
+def flatten_rows(trees):
+    """One row per level (namespace/workload/pod/container) across all trees."""
+    rows = []
+    for node in trees:
+        ns, stage = node["namespace"], node["stage"]
+        rows.append(_row_from_totals("namespace", stage, ns, node["totals"]))
+        for wl in node["workloads"]:
+            rows.append(_row_from_totals(
+                "workload", stage, ns, wl["totals"],
+                workload_kind=wl["kind"], workload=wl["name"]))
+            for pod in wl["pods"]:
+                rows.append(_row_from_totals(
+                    "pod", stage, ns, pod["totals"],
+                    workload_kind=wl["kind"], workload=wl["name"],
+                    pod=pod["name"]))
+                for c in pod["containers"]:
+                    rows.append(_row_from_totals(
+                        "container", stage, ns, c,
+                        workload_kind=wl["kind"], workload=wl["name"],
+                        pod=pod["name"], container=c["container"]))
+    return rows
+
+
+def render_resources_csv(trees, stream):
+    writer = csv.DictWriter(stream, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for row in flatten_rows(trees):
+        writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
+
+
+def render_ooms_csv(trees, stream):
+    cols = ["stage", "namespace", "pod", "container", "source", "oom_events",
+            "restart_count", "exit_code", "finished_at"]
+    writer = csv.DictWriter(stream, fieldnames=cols, extrasaction="ignore")
+    writer.writeheader()
+    for node in trees:
+        for o in node["ooms"]:
+            writer.writerow({"stage": node["stage"], **o})
+
+
+def render_json(trees, stream, window, cluster):
+    obj = {
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "cluster": cluster,
+        "window": window,
+        "namespaces": trees,
+    }
+    json.dump(obj, stream, indent=2)
+    stream.write("\n")
+
+
 def main(argv=None):
     raise NotImplementedError
 
