@@ -382,6 +382,121 @@ def attach_oom_counts(leaves, merged_ooms):
             leaf["namespace"], leaf["pod"], leaf["container"]) in keys else 0
 
 
+# ------------------------------------------------------------- k8s backends
+
+# logical -> (cli_plural, api_group_path, is_namespaced)
+_RESOURCES = {
+    "pods":         ("pods",         "/api/v1",        True),
+    "replicasets":  ("replicasets",  "/apis/apps/v1",  True),
+    "deployments":  ("deployments",  "/apis/apps/v1",  True),
+    "statefulsets": ("statefulsets", "/apis/apps/v1",  True),
+    "daemonsets":   ("daemonsets",   "/apis/apps/v1",  True),
+    "namespaces":   ("namespaces",   "/api/v1",        False),
+}
+
+
+class CliK8sClient:
+    """Backend that shells out to oc/kubectl. `run(args)` returns stdout text;
+    injectable for tests."""
+
+    def __init__(self, binary="oc", run=None):
+        self.binary = binary
+        self._run = run or self._default_run
+
+    def _default_run(self, args):
+        proc = subprocess.run([self.binary, *args],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True)
+        if proc.returncode != 0:
+            sys.stderr.write(f"command failed: {self.binary} {' '.join(args)}\n"
+                             f"{proc.stderr}\n")
+            return ""
+        return proc.stdout
+
+    def _list(self, resource, namespace):
+        plural, _path, namespaced = _RESOURCES[resource]
+        args = ["get", plural]
+        if namespaced:
+            args += (["-n", namespace] if namespace else ["-A"])
+        args += ["-o", "json"]
+        raw = self._run(args)
+        if not raw.strip():
+            return []
+        try:
+            return json.loads(raw).get("items", [])
+        except json.JSONDecodeError:
+            return []
+
+    def list_namespaces(self):
+        return self._list("namespaces", None)
+
+    def list_pods(self, namespace=None):
+        return self._list("pods", namespace)
+
+    def list_replicasets(self, namespace=None):
+        return self._list("replicasets", namespace)
+
+    def list_deployments(self, namespace=None):
+        return self._list("deployments", namespace)
+
+    def list_statefulsets(self, namespace=None):
+        return self._list("statefulsets", namespace)
+
+    def list_daemonsets(self, namespace=None):
+        return self._list("daemonsets", namespace)
+
+
+class RestK8sClient:
+    """In-cluster backend talking to the API server over HTTPS. `get_json(url)`
+    is injectable for tests; the default uses urllib with the SA token + CA."""
+
+    def __init__(self, host, token=None, ca_cert=None, get_json=None,
+                 insecure=False):
+        self.host = host.rstrip("/")
+        self.token = token
+        self.ctx = ssl.create_default_context(cafile=ca_cert) if ca_cert \
+            else ssl.create_default_context()
+        if insecure:
+            self.ctx.check_hostname = False
+            self.ctx.verify_mode = ssl.CERT_NONE
+        self._get = get_json or self._default_get
+
+    def _default_get(self, url):
+        req = urllib.request.Request(url)
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        with urllib.request.urlopen(req, context=self.ctx, timeout=30) as r:
+            return json.load(r)
+
+    def _url(self, resource, namespace):
+        plural, path, namespaced = _RESOURCES[resource]
+        if namespaced and namespace:
+            return f"{self.host}{path}/namespaces/{namespace}/{plural}"
+        return f"{self.host}{path}/{plural}"
+
+    def _list(self, resource, namespace):
+        payload = self._get(self._url(resource, namespace))
+        return payload.get("items", []) if isinstance(payload, dict) else []
+
+    def list_namespaces(self):
+        return self._list("namespaces", None)
+
+    def list_pods(self, namespace=None):
+        return self._list("pods", namespace)
+
+    def list_replicasets(self, namespace=None):
+        return self._list("replicasets", namespace)
+
+    def list_deployments(self, namespace=None):
+        return self._list("deployments", namespace)
+
+    def list_statefulsets(self, namespace=None):
+        return self._list("statefulsets", namespace)
+
+    def list_daemonsets(self, namespace=None):
+        return self._list("daemonsets", namespace)
+
+
 def main(argv=None):
     raise NotImplementedError
 
