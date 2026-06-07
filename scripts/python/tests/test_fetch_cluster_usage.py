@@ -566,3 +566,27 @@ def test_make_thanos_degrades_when_no_querier(fcu, monkeypatch):
     monkeypatch.setattr(fcu, "discover_querier", lambda: None)
     args = fcu.build_parser().parse_args([])
     assert fcu._make_thanos(args) is None
+
+
+def test_build_tree_container_rows_carry_util_pct(fcu):
+    # Every level, including the container leaf, must carry peak-util% so the
+    # text/CSV renderers show it (not just the rollup levels).
+    leaf = _leaf(namespace="ns1", pod="p1", container="c1",
+                 cpu_peak=0.15, cpu_limit=0.2,
+                 mem_peak=110 * 1024**2, mem_limit=128 * 1024**2)
+    leaf["workload_kind"] = "Deployment"
+    leaf["workload"] = "web"
+    node = fcu.build_namespace_tree("ns1", [leaf], [])
+    c = node["workloads"][0]["pods"][0]["containers"][0]
+    assert c["cpu_peak_util_pct"] == pytest.approx(75.0)
+    assert c["mem_peak_util_pct"] == pytest.approx(110 / 128 * 100)
+
+
+def test_build_tree_container_util_none_without_limit(fcu):
+    leaf = _leaf(namespace="ns1", pod="p1", container="c1",
+                 cpu_peak=0.15, cpu_limit=None)
+    leaf["workload_kind"] = "Deployment"
+    leaf["workload"] = "web"
+    node = fcu.build_namespace_tree("ns1", [leaf], [])
+    c = node["workloads"][0]["pods"][0]["containers"][0]
+    assert c["cpu_peak_util_pct"] is None

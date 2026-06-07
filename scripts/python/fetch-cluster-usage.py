@@ -272,6 +272,14 @@ def build_namespace_tree(namespace, leaves, ooms):
     leaves are this namespace's container records (usage already attached).
     ooms is the merged OOM list for this namespace.
     """
+    # Container leaves need their own peak-util% so the renderers show it at the
+    # container level too (rollup() only computes util% for aggregate levels).
+    for leaf in leaves:
+        leaf["cpu_peak_util_pct"] = util_pct(leaf.get("cpu_peak"),
+                                             leaf.get("cpu_limit"))
+        leaf["mem_peak_util_pct"] = util_pct(leaf.get("mem_peak"),
+                                             leaf.get("mem_limit"))
+
     workloads = []
     wl_groups = {}
     for leaf in leaves:
