@@ -175,3 +175,60 @@ def test_merge_ooms_live_only(fcu):
              "restart_count": 1}]
     merged = fcu.merge_ooms(live, [])
     assert merged[0]["source"] == "live"
+
+
+def _pod_full(name, ns, containers, owner=None, node="n1", statuses=None):
+    md = {"name": name, "namespace": ns, "labels": {}}
+    if owner:
+        md["ownerReferences"] = [owner]
+    return {
+        "metadata": md,
+        "spec": {"nodeName": node, "containers": containers},
+        "status": {"containerStatuses": statuses or []},
+    }
+
+
+def test_pods_to_leaves_configured(fcu):
+    pods = [_pod_full(
+        "web-abc-1", "ns1",
+        containers=[{"name": "web", "resources": {
+            "requests": {"cpu": "50m", "memory": "64Mi"},
+            "limits": {"cpu": "200m", "memory": "128Mi"}}}],
+        owner={"kind": "ReplicaSet", "name": "web-abc", "controller": True},
+    )]
+    rs = {"metadata": {"name": "web-abc", "namespace": "ns1",
+                       "ownerReferences": [{"kind": "Deployment", "name": "web",
+                                            "controller": True}]}}
+    leaves = fcu.pods_to_leaves(pods, {("ns1", "web-abc"): rs})
+    assert len(leaves) == 1
+    leaf = leaves[0]
+    assert leaf["workload_kind"] == "Deployment"
+    assert leaf["workload"] == "web"
+    assert leaf["cpu_limit"] == pytest.approx(0.2)
+    assert leaf["mem_request"] == 64 * 1024**2
+    assert leaf["cpu_now"] is None
+    assert leaf["oom_count"] == 0
+
+
+def test_pods_to_leaves_no_resources(fcu):
+    pods = [_pod_full("bare", "ns1", containers=[{"name": "c"}])]
+    leaves = fcu.pods_to_leaves(pods, {})
+    assert leaves[0]["cpu_limit"] is None
+    assert leaves[0]["mem_request"] is None
+
+
+def test_live_ooms_from_pods(fcu):
+    statuses = [{"name": "c", "restartCount": 2, "lastState": {"terminated": {
+        "reason": "OOMKilled", "exitCode": 137,
+        "finishedAt": "2026-06-07T10:00:00Z"}}}]
+    pods = [_pod_full("p1", "ns1", containers=[{"name": "c"}], statuses=statuses)]
+    ooms = fcu.live_ooms_from_pods(pods)
+    assert ooms == [{"namespace": "ns1", "pod": "p1", "container": "c",
+                     "restart_count": 2, "exit_code": 137,
+                     "finished_at": "2026-06-07T10:00:00Z"}]
+
+
+def test_live_ooms_ignores_non_oom(fcu):
+    statuses = [{"name": "c", "lastState": {"terminated": {"reason": "Error"}}}]
+    pods = [_pod_full("p1", "ns1", containers=[{"name": "c"}], statuses=statuses)]
+    assert fcu.live_ooms_from_pods(pods) == []

@@ -210,6 +210,55 @@ def merge_ooms(live, thanos):
     return [by_key[k] for k in sorted(by_key)]
 
 
+# ------------------------------------------------------- pod -> leaf records
+
+def pods_to_leaves(pods, rs_index):
+    """One leaf per container with configured requests/limits + workload labels.
+    Usage fields (cpu_now/peak/avg, mem_now/peak) start as None and are filled
+    by attach_usage(). oom_count starts at 0 and is bumped by attach_ooms()."""
+    leaves = []
+    for pod in pods:
+        ns = pod["metadata"]["namespace"]
+        name = pod["metadata"]["name"]
+        node = pod.get("spec", {}).get("nodeName", "-")
+        wl_kind, wl_name = workload_for(pod, rs_index)
+        for c in pod.get("spec", {}).get("containers", []) or []:
+            res = c.get("resources", {}) or {}
+            req = res.get("requests", {}) or {}
+            lim = res.get("limits", {}) or {}
+            leaves.append({
+                "namespace": ns, "pod": name, "container": c["name"],
+                "node": node, "workload_kind": wl_kind, "workload": wl_name,
+                "cpu_request": parse_cpu(req.get("cpu")),
+                "cpu_limit": parse_cpu(lim.get("cpu")),
+                "mem_request": parse_mem(req.get("memory")),
+                "mem_limit": parse_mem(lim.get("memory")),
+                "cpu_now": None, "cpu_peak": None, "cpu_avg": None,
+                "mem_now": None, "mem_peak": None,
+                "oom_count": 0,
+            })
+    return leaves
+
+
+def live_ooms_from_pods(pods):
+    """Live OOM records from pod lastState.terminated.reason == OOMKilled."""
+    out = []
+    for pod in pods:
+        ns = pod["metadata"]["namespace"]
+        name = pod["metadata"]["name"]
+        for cs in pod.get("status", {}).get("containerStatuses", []) or []:
+            last = (cs.get("lastState") or {}).get("terminated")
+            if not last or last.get("reason") != "OOMKilled":
+                continue
+            out.append({
+                "namespace": ns, "pod": name, "container": cs["name"],
+                "restart_count": cs.get("restartCount", 0),
+                "exit_code": last.get("exitCode"),
+                "finished_at": last.get("finishedAt"),
+            })
+    return out
+
+
 def main(argv=None):
     raise NotImplementedError
 
