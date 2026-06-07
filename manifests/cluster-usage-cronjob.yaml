@@ -1,0 +1,118 @@
+# Cluster-wide CronJob that runs fetch-cluster-usage.py against all pid-*
+# namespaces and logs the report. The script is shipped via a ConfigMap so no
+# image build / registry is needed -- the job runs stock python:3.12-slim.
+#
+# OpenShift (production) note: thanos-querier requires the ServiceAccount to be
+# allowed to read metrics. Uncomment the cluster-monitoring-view binding below
+# and set THANOS_URL to the querier route/service.
+#
+# RKE2 (local test): the kube-prometheus-stack Thanos/Prometheus service in the
+# monitoring namespace typically needs no auth; set THANOS_URL accordingly or
+# let auto-discovery handle it.
+#
+# Regenerate the ConfigMap after editing the script:
+#   oc create configmap cluster-usage-script \
+#     --from-file=fetch-cluster-usage.py=scripts/python/fetch-cluster-usage.py \
+#     -n forensic-usage --dry-run=client -o yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: forensic-usage
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cluster-usage
+  namespace: forensic-usage
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-usage-read
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-usage-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-usage-read
+subjects:
+  - kind: ServiceAccount
+    name: cluster-usage
+    namespace: forensic-usage
+---
+# OpenShift only: lets the SA token query thanos-querier. Harmless to omit on
+# clusters where Thanos needs no auth (RKE2/KPS).
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: ClusterRoleBinding
+# metadata:
+#   name: cluster-usage-monitoring
+# roleRef:
+#   apiGroup: rbac.authorization.k8s.io
+#   kind: ClusterRole
+#   name: cluster-monitoring-view
+# subjects:
+#   - kind: ServiceAccount
+#     name: cluster-usage
+#     namespace: forensic-usage
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-usage-script
+  namespace: forensic-usage
+data:
+  fetch-cluster-usage.py: |
+    # PLACEHOLDER -- replace with the real script via:
+    #   oc create configmap cluster-usage-script \
+    #     --from-file=fetch-cluster-usage.py=scripts/python/fetch-cluster-usage.py \
+    #     -n forensic-usage --dry-run=client -o yaml | oc apply -f -
+    raise SystemExit("ConfigMap not populated; see manifest header")
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cluster-usage
+  namespace: forensic-usage
+spec:
+  schedule: "0 6 * * *"   # daily 06:00; matches the default 24h window
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          serviceAccountName: cluster-usage
+          restartPolicy: Never
+          containers:
+            - name: cluster-usage
+              image: python:3.12-slim
+              command: ["python3", "/app/fetch-cluster-usage.py"]
+              args: ["--in-cluster", "--window", "24h", "--format", "text"]
+              env:
+                - name: THANOS_URL
+                  value: ""   # set to your querier, e.g.
+                              # http://thanos-querier.openshift-monitoring:9091
+                              # (OpenShift) — add --insecure in args if a route
+              volumeMounts:
+                - name: script
+                  mountPath: /app
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits:   { cpu: 500m, memory: 256Mi }
+          volumes:
+            - name: script
+              configMap:
+                name: cluster-usage-script
