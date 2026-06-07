@@ -13,3 +13,22 @@ _spec.loader.exec_module(_mod)
 def fcu():
     """The loaded fetch-cluster-usage module under test."""
     return _mod
+
+
+class FakeThanos:
+    """Returns canned instant-vector payloads keyed by substring of the query."""
+
+    def __init__(self, responses=None):
+        self.responses = responses or {}
+        self.available = True
+
+    def query(self, expr, ts=None):
+        for needle, result in self.responses.items():
+            if needle in expr:
+                return {"data": {"resultType": "vector", "result": result}}
+        return {"data": {"resultType": "vector", "result": []}}
+
+
+@pytest.fixture
+def fake_thanos():
+    return FakeThanos
