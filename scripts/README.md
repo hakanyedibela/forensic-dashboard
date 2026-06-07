@@ -13,6 +13,7 @@ Helper scripts for working with the OOM observability stack from the command lin
 | [`oom-usage.py`](#oom-usagepy) | Recover **memory and CPU usage at OOM time** by querying Prometheus/Thanos for each OOMKilled container's last terminated timestamp. |
 | [`oom-history.py`](#oom-historypy) | Walk each Deployment's **rollout history** (revisions / ReplicaSets) and report OOM status + pre-OOM logs per revision — answers "which version of the deployment started OOMing?". |
 | [`oom-rootcause.py`](#oom-rootcausepy) | **Deep root-cause report per OOMKilled pod** in one shot: workload, node, neighbors, events, PVCs, HPA/VPA, services, NetworkPolicies, LimitRanges, ResourceQuotas, Prometheus memory/CPU/network/storage trends, pre-OOM logs, and a verdict (Pattern A/B/C/D/E) with concrete remediation commands. Use this when you need to answer **why** an OOM happened — leak vs spike vs under-provisioned vs node-pressure vs startup. |
+| [`fetch-cluster-usage.py`](#fetch-cluster-usagepy) | Report configured CPU/memory **limits & requests vs. real Thanos usage** (current + peak over a window) rolled up at **namespace / workload / pod / container**, plus an **OOM-killed** list from live pod state + Thanos history. Runs locally (oc/kubectl) and in-cluster as a CronJob. |
 
 ---
 
@@ -700,3 +701,68 @@ Conventions for additions to this directory:
 5. **Keep the script docstring to one line.** Full usage docs live in this README under a new section, indexed in the table at the top.
 6. **Make it executable.** `chmod +x scripts/<name>.py` and start the file with `#!/usr/bin/env python3`.
 7. **Read-only by default.** If a script mutates cluster state, it must require an explicit `--apply` flag and dry-run by default.
+
+---
+
+## `fetch-cluster-usage.py`
+
+Self-contained (stdlib-only) report of **limits vs. real usage** across every
+`pid-*` namespace, with OOM-killed containers from both live pod state and
+Thanos history. Auto-detects its environment: in-cluster it uses the Kubernetes
+REST API with the pod ServiceAccount token; locally it shells out to `oc`/`kubectl`.
+
+### What it reports
+
+For each level — namespace, workload (Deployment/StatefulSet/DaemonSet), pod,
+container — it shows CPU request/limit/now/peak (+peak-util%) and memory
+request/limit/now/peak (+peak-util%), plus OOM counts. Usage comes from Thanos
+(`container_cpu_usage_seconds_total` rate, `container_memory_working_set_bytes`,
+current + `*_over_time` peak/avg over `--window`).
+
+### Usage
+
+```bash
+# Local (RKE2, kubectl), all pid-* namespaces, last 24h
+python3 scripts/python/fetch-cluster-usage.py --kubectl
+
+# Local without Thanos (configured limits + live OOM only)
+python3 scripts/python/fetch-cluster-usage.py --kubectl --no-thanos
+
+# Explicit Thanos URL + token (e.g. OpenShift querier)
+python3 scripts/python/fetch-cluster-usage.py \
+  --thanos-url https://thanos-querier-openshift-monitoring.apps.example.com \
+  --insecure --window 7d
+
+# One namespace, write CSV/JSON to a directory
+python3 scripts/python/fetch-cluster-usage.py --namespace pid-002-api-test-01-blue \
+  --output-dir ./reports/usage
+
+# Trim text verbosity to just rollups
+python3 scripts/python/fetch-cluster-usage.py --level namespace,workload
+```
+
+### In-cluster (CronJob)
+
+`manifests/cluster-usage-cronjob.yaml` ships a cluster-wide CronJob (ServiceAccount
++ ClusterRole/Binding + ConfigMap-delivered script on `python:3.12-slim`).
+Populate the ConfigMap from the real script and set `THANOS_URL`:
+
+```bash
+oc create configmap cluster-usage-script \
+  --from-file=fetch-cluster-usage.py=scripts/python/fetch-cluster-usage.py \
+  -n forensic-usage --dry-run=client -o yaml | oc apply -f -
+oc apply -f manifests/cluster-usage-cronjob.yaml
+```
+
+On OpenShift, uncomment the `cluster-monitoring-view` binding so the SA token is
+accepted by `thanos-querier`. On RKE2/kube-prometheus-stack, Thanos in-cluster
+usually needs no auth.
+
+### Requirements
+
+- Python 3.6+ (stdlib only)
+- Local: `oc` or `kubectl` (`--kubectl`) with an active session; RBAC `get`/`list`
+  on pods, replicasets, deployments, statefulsets, daemonsets, namespaces.
+- In-cluster: the ServiceAccount RBAC from the manifest.
+- A reachable Thanos/Prometheus query API for usage columns (optional; degrades
+  to `-` when absent).
