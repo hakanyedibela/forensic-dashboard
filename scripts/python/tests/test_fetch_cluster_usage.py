@@ -518,3 +518,38 @@ def test_render_text_level_filter(fcu):
     fcu.render_text([_sample_tree(fcu)], buf, levels=("namespace",))
     out = buf.getvalue()
     assert "CONTAINERS" not in out
+
+
+def test_select_namespaces_pattern(fcu):
+    all_ns = [{"metadata": {"name": "pid-001-shop-ref-01-blue"}},
+              {"metadata": {"name": "kube-system"}},
+              {"metadata": {"name": "pid-002-api-test-01-blue"}}]
+
+    class K:
+        def list_namespaces(self):
+            return all_ns
+    names = fcu.select_namespaces(K(), pattern=r"^pid-", explicit=None,
+                                  all_namespaces=False)
+    assert names == ["pid-001-shop-ref-01-blue", "pid-002-api-test-01-blue"]
+
+
+def test_select_namespaces_explicit(fcu):
+    class K:
+        def list_namespaces(self):
+            raise AssertionError("must not be called when explicit given")
+    assert fcu.select_namespaces(K(), pattern=r"^pid-", explicit=["a", "b"],
+                                 all_namespaces=False) == ["a", "b"]
+
+
+def test_build_parser_defaults(fcu):
+    args = fcu.build_parser().parse_args([])
+    assert args.pattern == "^pid-"
+    assert args.window == "24h"
+    assert args.step == "5m"
+    assert args.level == "namespace,workload,pod,container"
+
+
+def test_main_help_exits_zero(fcu):
+    with pytest.raises(SystemExit) as e:
+        fcu.main(["--help"])
+    assert e.value.code == 0
