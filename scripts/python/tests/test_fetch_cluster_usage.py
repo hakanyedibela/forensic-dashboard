@@ -582,6 +582,25 @@ def test_build_tree_container_rows_carry_util_pct(fcu):
     assert c["mem_peak_util_pct"] == pytest.approx(110 / 128 * 100)
 
 
+def test_discover_querier_missing_binary_returns_none(fcu, monkeypatch):
+    # python:3.12-slim CronJob image has no oc/kubectl -> subprocess raises
+    # FileNotFoundError; discovery must degrade to None, not crash.
+    def boom(*a, **k):
+        raise FileNotFoundError("no such binary")
+    monkeypatch.setattr(fcu.subprocess, "run", boom)
+    assert fcu.discover_querier() is None
+
+
+def test_make_thanos_degrades_when_binary_missing(fcu, monkeypatch):
+    monkeypatch.delenv("THANOS_URL", raising=False)
+
+    def boom(*a, **k):
+        raise FileNotFoundError("no such binary")
+    monkeypatch.setattr(fcu.subprocess, "run", boom)
+    args = fcu.build_parser().parse_args([])
+    assert fcu._make_thanos(args) is None
+
+
 def test_build_tree_container_util_none_without_limit(fcu):
     leaf = _leaf(namespace="ns1", pod="p1", container="c1",
                  cpu_peak=0.15, cpu_limit=None)

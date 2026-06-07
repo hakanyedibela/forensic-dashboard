@@ -561,9 +561,14 @@ def parse_step(value):
 
 def discover_querier():
     for ns, name, port in QUERIER_CANDIDATES:
-        rc = subprocess.run([CLI, "get", "svc", name, "-n", ns],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL).returncode
+        try:
+            rc = subprocess.run([CLI, "get", "svc", name, "-n", ns],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL).returncode
+        except FileNotFoundError:
+            # No oc/kubectl on PATH (e.g. the python:3.12-slim CronJob image).
+            # Can't auto-discover -> caller degrades to no usage metrics.
+            return None
         if rc == 0:
             return ns, name, port
     return None
