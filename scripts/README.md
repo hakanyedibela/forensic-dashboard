@@ -808,7 +808,9 @@ the Python step — ask and we can wire that up.
 - Python 3.6.8+ (stdlib only) — runs on the RHEL 8 / OpenShift system `python3`
   as well as the `python:3.12-slim` CronJob image.
 - Local: `oc` or `kubectl` (`--kubectl`) with an active session; RBAC `get`/`list`
-  on pods, replicasets, deployments, statefulsets, daemonsets, namespaces.
+  on pods, replicasets, deployments, statefulsets, daemonsets, and namespaces.
+  (With `oc` it discovers namespaces via `oc get projects` — the projects you can
+  see — matching `fetch-cluster-state-loop.sh`; `kubectl` lists `namespaces`.)
 - In-cluster: the ServiceAccount RBAC from the manifest.
 - A reachable Thanos/Prometheus query API for usage columns (optional; degrades
   to `-` when absent).

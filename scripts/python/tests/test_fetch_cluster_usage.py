@@ -611,6 +611,31 @@ def test_build_tree_container_util_none_without_limit(fcu):
     assert c["cpu_peak_util_pct"] is None
 
 
+def test_cli_list_namespaces_uses_projects_for_oc(fcu):
+    seen = []
+    client = fcu.CliK8sClient(
+        binary="oc", run=lambda a: (seen.append(a) or '{"items": []}'))
+    client.list_namespaces()
+    assert seen[0] == ["get", "projects", "-o", "json"]
+
+
+def test_cli_list_namespaces_uses_namespaces_for_kubectl(fcu):
+    seen = []
+    client = fcu.CliK8sClient(
+        binary="kubectl", run=lambda a: (seen.append(a) or '{"items": []}'))
+    client.list_namespaces()
+    assert seen[0] == ["get", "namespaces", "-o", "json"]
+
+
+def test_rest_list_namespaces_uses_namespaces(fcu):
+    seen = {}
+    client = fcu.RestK8sClient(host="https://k8s:6443", token="t",
+                               get_json=lambda url: (seen.update(url=url) or
+                                                     {"items": []}))
+    client.list_namespaces()
+    assert seen["url"] == "https://k8s:6443/api/v1/namespaces"
+
+
 def test_dated_output_dir(fcu):
     now = fcu.datetime(2026, 6, 7, 6, 0, tzinfo=fcu.timezone.utc)
     assert fcu.dated_output_dir("/reports", now) == "/reports/2026-06-07"
