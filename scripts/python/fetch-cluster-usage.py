@@ -867,6 +867,14 @@ def _row_from_totals(level, stage, namespace, totals, **ids):
     return row
 
 
+# Metric (non-identity) columns, reused for the concise per-namespace summary.
+_IDENTITY_KEYS = {"level", "stage", "namespace", "workload_kind", "workload",
+                  "pod", "container"}
+METRIC_FIELDS = [(h, k) for h, k in CSV_FIELDS if k not in _IDENTITY_KEYS]
+NS_CSV_FIELDS = [("stage", "stage"), ("namespace", "namespace")] + METRIC_FIELDS
+NS_CSV_COLUMNS = [h for h, _ in NS_CSV_FIELDS]
+
+
 def aggregate_totals(totals_list):
     """Combine a list of level-`totals` dicts into one. Same None-semantics as
     rollup(): requests/limits are None if any contributor is unset; usage is
@@ -946,6 +954,20 @@ def render_resources_csv(trees, stream, summary_kinds=("cluster", "stage")):
         writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
 
 
+def render_namespaces_csv(trees, stream):
+    """Concise one-row-per-namespace summary: total configured vs. real CPU/mem
+    (no workload/pod/container detail). Sorted by stage then namespace."""
+    writer = csv.DictWriter(stream, fieldnames=NS_CSV_COLUMNS,
+                            extrasaction="ignore")
+    writer.writeheader()
+    for node in sorted(trees, key=lambda n: (n["stage"], n["namespace"])):
+        row = {"stage": node["stage"], "namespace": node["namespace"]}
+        for header, key in METRIC_FIELDS:
+            v = node["totals"].get(key)
+            row[header] = "" if v is None else v
+        writer.writerow(row)
+
+
 def render_ooms_csv(trees, stream):
     cols = ["stage", "namespace", "pod", "container", "source", "oom_events",
             "restart_count", "exit_code", "finished_at"]
@@ -988,8 +1010,9 @@ LEGEND_TEXT = """# Cluster-Nutzungsbericht — Legende
 Erzeugt von scripts/python/fetch-cluster-usage.py.
 
 ## Dateien in diesem Ordner
-- `resources.csv` — CPU-/Speicher-Konfiguration vs. tatsächliche Nutzung, eine Zeile pro Ebene (siehe `level`).
-- `ooms.csv`      — eine Zeile pro OOM-getötetem Container.
+- `resources.csv`  — CPU-/Speicher-Konfiguration vs. tatsächliche Nutzung, eine Zeile pro Ebene (siehe `level`).
+- `namespaces.csv` — kompakte Übersicht: genau eine Zeile pro Namespace (Summe: verbraucht vs. limitiert), ohne Workload-/Pod-/Container-Details.
+- `ooms.csv`       — eine Zeile pro OOM-getötetem Container.
 - `report.json`   — dieselben Daten verschachtelt (Namespace → Workload → Pod → Container) plus Aggregationen.
 - `by-stage/<stage>/` — (im obersten Ordner) dieselben Dateien, beschränkt auf eine Stage.
 
@@ -1052,6 +1075,8 @@ def write_report_files(trees, out_dir, window, cluster,
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "resources.csv"), "w") as f:
         render_resources_csv(trees, f, summary_kinds=summary_kinds)
+    with open(os.path.join(out_dir, "namespaces.csv"), "w") as f:
+        render_namespaces_csv(trees, f)
     with open(os.path.join(out_dir, "ooms.csv"), "w") as f:
         render_ooms_csv(trees, f)
     with open(os.path.join(out_dir, "report.json"), "w") as f:
@@ -1143,6 +1168,12 @@ def render_text(trees, stream, levels=("namespace", "workload", "pod",
         for stage, totals in stage_summaries(trees):
             rows.append([f"stage/{stage}", *_usage_cells(totals)])
         _print_table(["SCOPE", *_USAGE_HEADERS], rows, stream)
+
+        stream.write("\nBY NAMESPACE — total used vs. limited per namespace\n")
+        ns_rows = [[f"{n['stage']}/{n['namespace']}", *_usage_cells(n["totals"])]
+                   for n in sorted(trees, key=lambda n: (n["stage"],
+                                                         n["namespace"]))]
+        _print_table(["NAMESPACE", *_USAGE_HEADERS], ns_rows, stream)
 
     for node in trees:
         stream.write("\n" + "=" * 100 + "\n")
