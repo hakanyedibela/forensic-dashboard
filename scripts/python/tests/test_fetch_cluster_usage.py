@@ -682,3 +682,130 @@ def test_build_parser_persistence_defaults(fcu):
     assert args.retention_days == 0
     args2 = fcu.build_parser().parse_args(["--date-subdir", "--retention-days", "30"])
     assert args2.date_subdir is True and args2.retention_days == 30
+
+
+# --- declared-but-idle workloads -------------------------------------------
+
+def _wl(kind, name, containers, replicas=0):
+    spec = {"template": {"spec": {"containers": containers}}}
+    if replicas is not None:
+        spec["replicas"] = replicas
+    return {"metadata": {"name": name, "namespace": "ns1"}, "spec": spec}
+
+
+class IdleFakeK8s:
+    """Fake client exposing the full list_* surface for idle-workload tests."""
+
+    def __init__(self, pods=None, rs=None, deployments=None, statefulsets=None,
+                 daemonsets=None):
+        self._pods = pods or []
+        self._rs = rs or []
+        self._deploy = deployments or []
+        self._sts = statefulsets or []
+        self._ds = daemonsets or []
+
+    def list_pods(self, namespace=None):
+        return self._pods
+
+    def list_replicasets(self, namespace=None):
+        return self._rs
+
+    def list_deployments(self, namespace=None):
+        return self._deploy
+
+    def list_statefulsets(self, namespace=None):
+        return self._sts
+
+    def list_daemonsets(self, namespace=None):
+        return self._ds
+
+
+def test_idle_workload_entry_template_totals(fcu):
+    sts = _wl("StatefulSet", "db", containers=[
+        {"name": "db", "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
+                                      "limits": {"cpu": "500m", "memory": "512Mi"}}}],
+        replicas=0)
+    entries = fcu.idle_workload_entries([("StatefulSet", sts)], present_keys=set())
+    assert len(entries) == 1
+    e = entries[0]
+    assert (e["kind"], e["name"]) == ("StatefulSet", "db")
+    assert e["idle"] is True
+    assert e["pods"] == []
+    assert e["totals"]["cpu_limit"] == pytest.approx(0.5)
+    assert e["totals"]["mem_limit"] == 512 * 1024**2
+    assert e["totals"]["cpu_now"] is None
+    assert e["totals"]["pod_count"] == 0
+    assert e["totals"]["container_count"] == 1
+
+
+def test_idle_workload_entries_skips_present(fcu):
+    sts = _wl("StatefulSet", "db", containers=[{"name": "db"}])
+    entries = fcu.idle_workload_entries([("StatefulSet", sts)],
+                                        present_keys={("StatefulSet", "db")})
+    assert entries == []
+
+
+def test_collect_namespace_includes_idle_statefulset(fcu):
+    # One running Deployment pod + a StatefulSet scaled to 0 (no pods).
+    pods = [{
+        "metadata": {"name": "web-1", "namespace": "ns1", "labels": {},
+                     "ownerReferences": [{"kind": "StatefulSet", "name": "web",
+                                          "controller": True}]},
+        "spec": {"nodeName": "n1", "containers": [
+            {"name": "web", "resources": {"limits": {"cpu": "200m"}}}]},
+        "status": {"containerStatuses": []},
+    }]
+    idle_sts = _wl("StatefulSet", "db", containers=[
+        {"name": "db", "resources": {"limits": {"cpu": "500m", "memory": "512Mi"}}}],
+        replicas=0)
+    # 'web' StatefulSet has a running pod; 'db' is idle.
+    running_sts = _wl("StatefulSet", "web", containers=[{"name": "web"}], replicas=1)
+    client = IdleFakeK8s(pods=pods, statefulsets=[running_sts, idle_sts])
+    node = fcu.collect_namespace(client, "ns1", thanos=None, window="24h", step="5m")
+    by = {(w["kind"], w["name"]): w for w in node["workloads"]}
+    assert ("StatefulSet", "db") in by          # idle one is shown
+    assert by[("StatefulSet", "db")].get("idle") is True
+    assert by[("StatefulSet", "db")]["totals"]["pod_count"] == 0
+    assert by[("StatefulSet", "db")]["totals"]["cpu_limit"] == pytest.approx(0.5)
+    # the running one is NOT duplicated as idle
+    assert by[("StatefulSet", "web")].get("idle") is not True
+    # namespace totals exclude the idle workload (no running pods)
+    assert node["totals"]["pod_count"] == 1
+
+
+def test_collect_namespace_idle_opt_out(fcu):
+    idle_sts = _wl("StatefulSet", "db", containers=[{"name": "db"}], replicas=0)
+    client = IdleFakeK8s(pods=[], statefulsets=[idle_sts])
+    node = fcu.collect_namespace(client, "ns1", thanos=None, window="24h",
+                                 step="5m", include_idle=False)
+    assert node["workloads"] == []
+
+
+def test_build_parser_no_idle_flag(fcu):
+    assert fcu.build_parser().parse_args([]).no_idle_workloads is False
+    assert fcu.build_parser().parse_args(
+        ["--no-idle-workloads"]).no_idle_workloads is True
+
+
+def test_render_text_marks_idle_workload(fcu):
+    node = {"namespace": "ns1", "stage": "ref",
+            "totals": fcu.rollup([]), "ooms": [],
+            "workloads": [{"kind": "StatefulSet", "name": "db", "idle": True,
+                           "totals": fcu._template_totals(
+                               [{"name": "db", "resources": {
+                                   "limits": {"cpu": "500m"}}}]),
+                           "pods": []}]}
+    buf = io.StringIO()
+    fcu.render_text([node], buf, levels=("workload",))
+    out = buf.getvalue()
+    assert "StatefulSet/db" in out and "idle: 0 pods" in out
+
+
+def test_collect_namespace_idle_tolerates_minimal_client(fcu):
+    # A client without list_statefulsets etc. must not crash (idle skipped).
+    class Minimal:
+        list_pods = lambda self, ns=None: []
+        list_replicasets = lambda self, ns=None: []
+    node = fcu.collect_namespace(Minimal(), "ns1", thanos=None, window="24h",
+                                 step="5m")
+    assert node["workloads"] == []
