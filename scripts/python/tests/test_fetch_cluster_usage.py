@@ -889,20 +889,15 @@ def test_render_json_includes_summaries(fcu):
     assert obj["stage_summaries"][0]["stage"] == "ref"
 
 
-def test_write_legend_creates_file(fcu, tmp_path):
+def test_write_legend_is_german_only(fcu, tmp_path):
     fcu.write_legend(str(tmp_path))
+    # LEGEND.md holds the German legend...
     txt = (tmp_path / "LEGEND.md").read_text(encoding="utf-8")
-    for token in ("level", "cluster", "stage", "cpu_limit", "idle", "oom_events"):
+    for token in ("Legende", "Spalten", "Cores", "tatsächliche",
+                  "level", "cluster", "stage", "cpu_limit", "oom_events"):
         assert token in txt
-
-
-def test_write_legend_creates_german_file(fcu, tmp_path):
-    fcu.write_legend(str(tmp_path))
-    de = (tmp_path / "LEGEND.de.md").read_text(encoding="utf-8")
-    # German prose, with the literal column identifiers preserved
-    for token in ("Legende", "Spalten", "Cores", "tatsächliche", "cpu_limit",
-                  "oom_events"):
-        assert token in de
+    # ...and there is no separate LEGEND.de.md.
+    assert not (tmp_path / "LEGEND.de.md").exists()
 
 
 def test_write_all_reports_combined_and_by_stage(fcu, tmp_path):
@@ -919,8 +914,8 @@ def test_write_all_reports_combined_and_by_stage(fcu, tmp_path):
     assert (tmp_path / "by-stage" / "ref" / "resources.csv").exists()
     assert (tmp_path / "by-stage" / "test" / "report.json").exists()
     assert (tmp_path / "by-stage" / "ref" / "LEGEND.md").exists()
-    assert (tmp_path / "by-stage" / "ref" / "LEGEND.de.md").exists()
-    assert (tmp_path / "LEGEND.de.md").exists()
+    assert not (tmp_path / "by-stage" / "ref" / "LEGEND.de.md").exists()
+    assert not (tmp_path / "LEGEND.de.md").exists()
     stage_rows = list(_csv.DictReader(
         io.StringIO((tmp_path / "by-stage" / "ref" / "resources.csv").read_text())))
     assert stage_rows[0]["level"] == "stage" and stage_rows[0]["stage"] == "ref"
