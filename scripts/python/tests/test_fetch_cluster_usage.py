@@ -891,6 +891,44 @@ def test_render_csv_summary_kinds_stage_only(fcu):
     assert not any(r["level"] == "cluster" for r in rows)
 
 
+def test_render_namespaces_csv_one_row_per_namespace(fcu):
+    ta = _mk_totals(fcu, 0.2, 0.1, 100, 50)
+    tb = _mk_totals(fcu, 0.4, 0.3, 200, 150)
+    trees = [_node("pid-b", "test", tb), _node("pid-a", "ref", ta)]
+    buf = io.StringIO()
+    fcu.render_namespaces_csv(trees, buf)
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    # one row per namespace, sorted by (stage, namespace) -> ref before test
+    assert [r["namespace"] for r in rows] == ["pid-a", "pid-b"]
+    assert rows[0]["stage"] == "ref"
+    assert rows[0]["cpu_limit_cores"] == "0.2"
+    assert rows[1]["mem_limit_bytes"] == "200"
+    # concise: no per-workload/pod/container identity columns, no level column
+    header = buf.getvalue().splitlines()[0]
+    for absent in ("level", "workload_kind", "workload", "pod", "container"):
+        assert absent not in header.split(",")
+    # carries unit-bearing metric columns
+    for present in ("cpu_limit_cores", "mem_limit_bytes", "cpu_now_cores",
+                    "mem_now_bytes"):
+        assert present in header.split(",")
+
+
+def test_render_text_has_by_namespace_table(fcu):
+    t = _mk_totals(fcu, 0.2, 0.1, 100, 50)
+    buf = io.StringIO()
+    fcu.render_text([_node("pid-a", "ref", t)], buf, levels=("namespace",))
+    out = buf.getvalue()
+    assert "BY NAMESPACE" in out
+    assert "ref/pid-a" in out
+
+
+def test_write_report_files_writes_namespaces_csv(fcu, tmp_path):
+    t = _mk_totals(fcu, 0.2, 0.1, 100, 50)
+    fcu.write_report_files([_node("pid-a", "ref", t)], str(tmp_path),
+                           window="24h", cluster="c1")
+    assert (tmp_path / "namespaces.csv").exists()
+
+
 def test_render_json_includes_summaries(fcu):
     t = _mk_totals(fcu, 0.2, 0.1, 100, 50)
     buf = io.StringIO()
