@@ -313,6 +313,51 @@ def build_namespace_tree(namespace, leaves, ooms):
     }
 
 
+def _template_totals(containers):
+    """Totals dict for a workload's pod template (one replica's worth of
+    configured requests/limits). Usage is unknown (None), pod_count is 0 — used
+    for declared-but-idle workloads that have no running pods."""
+    cpu_req, cpu_lim, mem_req, mem_lim = [], [], [], []
+    for c in containers:
+        res = c.get("resources", {}) or {}
+        req = res.get("requests", {}) or {}
+        lim = res.get("limits", {}) or {}
+        cpu_req.append(parse_cpu(req.get("cpu")))
+        cpu_lim.append(parse_cpu(lim.get("cpu")))
+        mem_req.append(parse_mem(req.get("memory")))
+        mem_lim.append(parse_mem(lim.get("memory")))
+    return {
+        "cpu_request": sum_limit(cpu_req), "cpu_limit": sum_limit(cpu_lim),
+        "mem_request": sum_limit(mem_req), "mem_limit": sum_limit(mem_lim),
+        "cpu_now": None, "cpu_peak": None, "cpu_avg": None,
+        "mem_now": None, "mem_peak": None,
+        "cpu_peak_util_pct": None, "mem_peak_util_pct": None,
+        "oom_count": 0, "pod_count": 0, "container_count": len(containers),
+    }
+
+
+def idle_workload_entries(declared, present_keys):
+    """Workload entries for declared workloads that have no running pods.
+
+    declared is a list of (kind, workload_obj). Any (kind, name) already in
+    present_keys (i.e. a workload with running pods, derived from pod owners) is
+    skipped. Returns workload dicts shaped like build_namespace_tree's, with
+    empty pods, template-derived totals, and idle=True. Sorted by (kind, name).
+    """
+    out = []
+    for kind, obj in declared:
+        name = obj.get("metadata", {}).get("name")
+        if not name or (kind, name) in present_keys:
+            continue
+        containers = (obj.get("spec", {}).get("template", {})
+                      .get("spec", {}).get("containers", []) or [])
+        out.append({
+            "kind": kind, "name": name, "idle": True,
+            "totals": _template_totals(containers), "pods": [],
+        })
+    return sorted(out, key=lambda w: (w["kind"], w["name"]))
+
+
 # ----------------------------------------------------------- thanos queries
 
 def usage_queries(namespace, window, step):
@@ -404,6 +449,10 @@ _RESOURCES = {
     "statefulsets": ("statefulsets", "/apis/apps/v1",  True),
     "daemonsets":   ("daemonsets",   "/apis/apps/v1",  True),
     "namespaces":   ("namespaces",   "/api/v1",        False),
+    # OpenShift: listing projects returns what the caller can see and doesn't
+    # need cluster-wide namespace list permission (matches
+    # fetch-cluster-state-loop.sh). Only used by the oc CLI backend.
+    "projects":     ("projects",     "/apis/project.openshift.io/v1", False),
 }
 
 
@@ -440,7 +489,10 @@ class CliK8sClient:
             return []
 
     def list_namespaces(self):
-        return self._list("namespaces", None)
+        # On OpenShift use `oc get projects` (visible to the caller, no cluster
+        # namespace-list RBAC needed); kubectl has no projects API.
+        resource = "projects" if self.binary == "oc" else "namespaces"
+        return self._list(resource, None)
 
     def list_pods(self, namespace=None):
         return self._list("pods", namespace)
@@ -729,8 +781,29 @@ def _run_oom_queries(thanos, namespace, window):
     return events
 
 
-def collect_namespace(fcu_k8s, namespace, thanos, window, step):
-    """Full per-namespace pipeline -> nested namespace tree dict."""
+def _declared_workloads(fcu_k8s, namespace):
+    """(kind, obj) for every Deployment/StatefulSet/DaemonSet in the namespace.
+    Tolerates clients that don't implement a lister (returns nothing for it)."""
+    declared = []
+    for kind, attr in (("Deployment", "list_deployments"),
+                       ("StatefulSet", "list_statefulsets"),
+                       ("DaemonSet", "list_daemonsets")):
+        lister = getattr(fcu_k8s, attr, None)
+        if lister is None:
+            continue
+        for obj in lister(namespace) or []:
+            declared.append((kind, obj))
+    return declared
+
+
+def collect_namespace(fcu_k8s, namespace, thanos, window, step,
+                      include_idle=True):
+    """Full per-namespace pipeline -> nested namespace tree dict.
+
+    When include_idle is set, declared Deployments/StatefulSets/DaemonSets with
+    no running pods are appended as idle workload rows (configured template
+    limits, zero usage) so the report lists them too. They do not affect the
+    namespace totals (no running pods reserve nothing)."""
     pods = fcu_k8s.list_pods(namespace)
     rs = fcu_k8s.list_replicasets(namespace)
     rs_index = {(r["metadata"]["namespace"], r["metadata"]["name"]): r
@@ -747,7 +820,16 @@ def collect_namespace(fcu_k8s, namespace, thanos, window, step):
 
     merged = merge_ooms(live, thanos_oom)
     attach_oom_counts(leaves, merged)
-    return build_namespace_tree(namespace, leaves, merged)
+    node = build_namespace_tree(namespace, leaves, merged)
+
+    if include_idle:
+        present = {(w["kind"], w["name"]) for w in node["workloads"]}
+        idle = idle_workload_entries(_declared_workloads(fcu_k8s, namespace),
+                                     present)
+        if idle:
+            node["workloads"] = sorted(node["workloads"] + idle,
+                                       key=lambda w: (w["kind"], w["name"]))
+    return node
 
 
 # ------------------------------------------------------------- flat rows / csv
@@ -922,7 +1004,9 @@ def render_text(trees, stream, levels=("namespace", "workload", "pod",
 
         if "workload" in levels:
             stream.write("\nWORKLOADS\n")
-            rows = [[f"{wl['kind']}/{wl['name']}", *_usage_cells(wl["totals"])]
+            rows = [[f"{wl['kind']}/{wl['name']}"
+                     + ("  (idle: 0 pods)" if wl.get("idle") else ""),
+                     *_usage_cells(wl["totals"])]
                     for wl in node["workloads"]]
             _print_table(["WORKLOAD", *_USAGE_HEADERS], rows, stream)
 
@@ -1013,6 +1097,9 @@ def build_parser():
     out.add_argument("--retention-days", type=int, default=0,
                      help="With --date-subdir, prune dated folders older than N "
                           "days (0 = keep everything).")
+    out.add_argument("--no-idle-workloads", action="store_true",
+                     help="Don't list declared Deployments/StatefulSets/"
+                          "DaemonSets that have no running pods.")
     return p
 
 
@@ -1092,7 +1179,8 @@ def main(argv=None):
         sys.stderr.write("no matching namespaces.\n")
         return 0
 
-    trees = [collect_namespace(k8s, ns, thanos, args.window, args.step)
+    trees = [collect_namespace(k8s, ns, thanos, args.window, args.step,
+                               include_idle=not args.no_idle_workloads)
              for ns in namespaces]
 
     formats = args.format or ["text"]

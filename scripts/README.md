@@ -719,6 +719,13 @@ request/limit/now/peak (+peak-util%), plus OOM counts. Usage comes from Thanos
 (`container_cpu_usage_seconds_total` rate, `container_memory_working_set_bytes`,
 current + `*_over_time` peak/avg over `--window`).
 
+Workloads are derived from pod `ownerReferences`, so Deployments, StatefulSets,
+and DaemonSets all appear. Declared workloads with **no running pods** (e.g. a
+StatefulSet scaled to 0) are also listed — marked `(idle: 0 pods)` with their
+pod-template configured limits and `-` usage — so nothing is hidden just because
+it's idle. These idle rows don't count toward the namespace totals (they reserve
+nothing). Pass `--no-idle-workloads` to omit them.
+
 ### Usage
 
 ```bash
@@ -808,7 +815,9 @@ the Python step — ask and we can wire that up.
 - Python 3.6.8+ (stdlib only) — runs on the RHEL 8 / OpenShift system `python3`
   as well as the `python:3.12-slim` CronJob image.
 - Local: `oc` or `kubectl` (`--kubectl`) with an active session; RBAC `get`/`list`
-  on pods, replicasets, deployments, statefulsets, daemonsets, namespaces.
+  on pods, replicasets, deployments, statefulsets, daemonsets, and namespaces.
+  (With `oc` it discovers namespaces via `oc get projects` — the projects you can
+  see — matching `fetch-cluster-state-loop.sh`; `kubectl` lists `namespaces`.)
 - In-cluster: the ServiceAccount RBAC from the manifest.
 - A reachable Thanos/Prometheus query API for usage columns (optional; degrades
   to `-` when absent).
