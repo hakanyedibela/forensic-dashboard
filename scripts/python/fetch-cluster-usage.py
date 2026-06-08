@@ -1013,12 +1013,61 @@ Blank usage cells mean Thanos had no data (or --no-thanos / Thanos was unreachab
 """
 
 
+LEGEND_TEXT_DE = """# Cluster-Nutzungsbericht — Legende
+
+Erzeugt von scripts/python/fetch-cluster-usage.py.
+
+## Dateien in diesem Ordner
+- `resources.csv` — CPU-/Speicher-Konfiguration vs. tatsächliche Nutzung, eine Zeile pro Ebene (siehe `level`).
+- `ooms.csv`      — eine Zeile pro OOM-getötetem Container.
+- `report.json`   — dieselben Daten verschachtelt (Namespace → Workload → Pod → Container) plus Aggregationen.
+- `by-stage/<stage>/` — (im obersten Ordner) dieselben Dateien, beschränkt auf eine Stage.
+
+## resources.csv — die Spalte `level` sagt, was jede Zeile aggregiert
+- `cluster`   — Gesamtsumme über alle Namespaces im Bericht.
+- `stage`     — Summe über alle Namespaces einer Stage (ref/test/prod/phase/pnext/other);
+                `stage` ist gesetzt, `namespace` ist leer.
+- `namespace` — Summe für einen Namespace.
+- `workload`  — ein Deployment / StatefulSet / DaemonSet (Pods gruppiert über ownerReferences).
+- `pod`       — ein Pod (Summe seiner Container).
+- `container` — ein Container (die feinste Ebene).
+
+Die Aggregationszeilen (`cluster`, `stage`) stehen zuerst, danach die Detailzeilen pro Namespace.
+Eine `workload`-Zeile mit `pod_count` = 0 ist *deklariert, aber inaktiv* (z. B. ein auf 0
+skaliertes StatefulSet): die Limits stammen aus dem Pod-Template, die Nutzungsspalten sind leer.
+
+## resources.csv Spalten
+- `level`, `stage`, `namespace`, `workload_kind`, `workload`, `pod`, `container`
+    — Identität der Zeile (leer, wo für die Ebene nicht zutreffend).
+- CPU-Spalten sind in **Cores**; Speicher-Spalten in **Bytes**.
+- `cpu_request` / `cpu_limit` / `mem_request` / `mem_limit`
+    — konfigurierte Requests/Limits (aus den Pod-Specs). Leer = irgendwo im Bereich nicht gesetzt/unbegrenzt.
+- `cpu_now` / `mem_now`   — Nutzung zum Berichtszeitpunkt (CPU = Rate über 5m; Speicher = Working Set).
+- `cpu_peak` / `mem_peak` — Spitzenwert über das Rückblickfenster (--window).
+- `cpu_avg`               — durchschnittliche CPU über das Fenster.
+- `cpu_peak_util_pct` / `mem_peak_util_pct` — Spitze ÷ Limit, in Prozent (leer, wenn kein Limit).
+- `oom_count`             — Anzahl OOM-getöteter Container im Bereich.
+- `pod_count` / `container_count` — wie viele Pods/Container die Zeile aggregiert.
+Leere Nutzungszellen bedeuten, dass Thanos keine Daten hatte (oder --no-thanos / Thanos nicht erreichbar).
+
+## ooms.csv Spalten
+- `stage`, `namespace`, `pod`, `container` — welcher Container OOM erlitten hat.
+- `source`        — `live` (aktueller Pod-Zustand), `thanos` (historisch) oder `both`.
+- `oom_events`    — Anzahl der OOM-Kills über das Fenster (aus Thanos).
+- `restart_count`, `exit_code` (137 = OOMKilled), `finished_at` — aus dem Live-Pod-Zustand.
+"""
+
+
 def write_legend(out_dir):
-    """Write LEGEND.md (column/row descriptions) into out_dir. Returns its path."""
+    """Write LEGEND.md (English) and LEGEND.de.md (German) into out_dir, both as
+    UTF-8 (they contain non-ASCII glyphs and umlauts, so the encoding is pinned
+    to survive a LANG=C container). Returns the path to LEGEND.md."""
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "LEGEND.md")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(LEGEND_TEXT)
+    with open(os.path.join(out_dir, "LEGEND.de.md"), "w", encoding="utf-8") as f:
+        f.write(LEGEND_TEXT_DE)
     return path
 
 
