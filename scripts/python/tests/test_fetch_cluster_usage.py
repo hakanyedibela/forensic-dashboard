@@ -809,3 +809,108 @@ def test_collect_namespace_idle_tolerates_minimal_client(fcu):
     node = fcu.collect_namespace(Minimal(), "ns1", thanos=None, window="24h",
                                  step="5m")
     assert node["workloads"] == []
+
+
+# --- stage / cluster rollups + legend --------------------------------------
+
+import csv as _csv
+
+
+def _node(ns, stage, totals, workloads=None, ooms=None):
+    return {"namespace": ns, "stage": stage, "totals": totals,
+            "workloads": workloads or [], "ooms": ooms or []}
+
+
+def _mk_totals(fcu, cpu_limit, cpu_peak, mem_limit, mem_peak, oom=0):
+    leaf = _leaf(cpu_limit=cpu_limit, cpu_peak=cpu_peak, cpu_now=cpu_peak,
+                 cpu_avg=cpu_peak, mem_limit=mem_limit, mem_peak=mem_peak,
+                 mem_now=mem_peak, oom_count=oom)
+    return fcu.rollup([leaf])
+
+
+def test_cluster_summary_sums_namespaces(fcu):
+    t1 = _mk_totals(fcu, 0.2, 0.1, 100, 50)
+    t2 = _mk_totals(fcu, 0.3, 0.15, 200, 80)
+    trees = [_node("a", "ref", t1), _node("b", "test", t2)]
+    c = fcu.cluster_summary(trees)
+    assert c["cpu_limit"] == pytest.approx(0.5)
+    assert c["mem_limit"] == 300
+    assert c["pod_count"] == 2
+    assert c["container_count"] == 2
+
+
+def test_stage_summaries_group_and_aggregate(fcu):
+    t = _mk_totals(fcu, 0.2, 0.1, 100, 50)
+    trees = [_node("a", "ref", t), _node("b", "ref", t), _node("c", "test", t)]
+    ss = dict(fcu.stage_summaries(trees))
+    assert sorted(ss) == ["ref", "test"]
+    assert ss["ref"]["container_count"] == 2
+    assert ss["test"]["container_count"] == 1
+
+
+def test_summary_rows_shape(fcu):
+    t = _mk_totals(fcu, 0.2, 0.1, 100, 50)
+    trees = [_node("a", "ref", t), _node("b", "test", t)]
+    rows = fcu.summary_rows(trees, kinds=("cluster", "stage"))
+    assert rows[0]["level"] == "cluster"
+    assert rows[0]["stage"] == "" and rows[0]["namespace"] == ""
+    stage_rows = [r for r in rows if r["level"] == "stage"]
+    assert {r["stage"] for r in stage_rows} == {"ref", "test"}
+    assert all(r["namespace"] == "" for r in stage_rows)
+
+
+def test_render_csv_includes_cluster_and_stage_rows(fcu):
+    t = _mk_totals(fcu, 0.2, 0.1, 100, 50)
+    trees = [_node("a", "ref", t)]
+    buf = io.StringIO()
+    fcu.render_resources_csv(trees, buf)
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    assert rows[0]["level"] == "cluster"
+    assert any(r["level"] == "stage" for r in rows)
+    assert any(r["level"] == "namespace" for r in rows)
+
+
+def test_render_csv_summary_kinds_stage_only(fcu):
+    t = _mk_totals(fcu, 0.2, 0.1, 100, 50)
+    buf = io.StringIO()
+    fcu.render_resources_csv([_node("a", "ref", t)], buf, summary_kinds=("stage",))
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    assert rows[0]["level"] == "stage"
+    assert not any(r["level"] == "cluster" for r in rows)
+
+
+def test_render_json_includes_summaries(fcu):
+    t = _mk_totals(fcu, 0.2, 0.1, 100, 50)
+    buf = io.StringIO()
+    fcu.render_json([_node("a", "ref", t)], buf, window="24h", cluster="c1")
+    obj = json.loads(buf.getvalue())
+    assert obj["cluster"] == "c1"            # server name unchanged
+    assert "cluster_totals" in obj
+    assert obj["stage_summaries"][0]["stage"] == "ref"
+
+
+def test_write_legend_creates_file(fcu, tmp_path):
+    fcu.write_legend(str(tmp_path))
+    txt = (tmp_path / "LEGEND.md").read_text()
+    for token in ("level", "cluster", "stage", "cpu_limit", "idle", "oom_events"):
+        assert token in txt
+
+
+def test_write_all_reports_combined_and_by_stage(fcu, tmp_path):
+    t = _mk_totals(fcu, 0.2, 0.1, 100, 50)
+    trees = [_node("pid-a-ref", "ref", t), _node("pid-b-test", "test", t)]
+    fcu.write_all_reports(trees, str(tmp_path), window="24h", cluster="c1")
+    # combined
+    assert (tmp_path / "resources.csv").exists()
+    assert (tmp_path / "LEGEND.md").exists()
+    combined = list(_csv.DictReader(
+        io.StringIO((tmp_path / "resources.csv").read_text())))
+    assert combined[0]["level"] == "cluster"
+    # per-stage folders
+    assert (tmp_path / "by-stage" / "ref" / "resources.csv").exists()
+    assert (tmp_path / "by-stage" / "test" / "report.json").exists()
+    assert (tmp_path / "by-stage" / "ref" / "LEGEND.md").exists()
+    stage_rows = list(_csv.DictReader(
+        io.StringIO((tmp_path / "by-stage" / "ref" / "resources.csv").read_text())))
+    assert stage_rows[0]["level"] == "stage" and stage_rows[0]["stage"] == "ref"
+    assert not any(r["level"] == "cluster" for r in stage_rows)
