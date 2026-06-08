@@ -483,7 +483,7 @@ def test_flatten_rows_one_per_level(fcu):
     assert levels == {"namespace", "workload", "pod", "container"}
     container_row = next(r for r in rows if r["level"] == "container")
     assert container_row["namespace"] == "ns1"
-    assert container_row["cpu_limit"] == pytest.approx(0.2)
+    assert container_row["cpu_limit_cores"] == pytest.approx(0.2)
 
 
 def test_render_csv_has_header_and_rows(fcu):
@@ -492,6 +492,18 @@ def test_render_csv_has_header_and_rows(fcu):
     text = buf.getvalue()
     assert text.splitlines()[0].startswith("level,stage,namespace")
     assert "container" in text
+
+
+def test_csv_headers_carry_units(fcu):
+    header = fcu.CSV_COLUMNS
+    for col in ("cpu_request_cores", "cpu_limit_cores", "cpu_now_cores",
+                "cpu_peak_cores", "cpu_avg_cores", "mem_request_bytes",
+                "mem_limit_bytes", "mem_now_bytes", "mem_peak_bytes",
+                "cpu_peak_util_pct", "mem_peak_util_pct"):
+        assert col in header
+    # the bare (unit-less) metric names must no longer be column headers
+    for bare in ("cpu_limit", "mem_now", "cpu_peak"):
+        assert bare not in header
 
 
 def test_render_json_structure(fcu):
