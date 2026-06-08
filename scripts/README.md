@@ -769,12 +769,26 @@ usually needs no auth.
 
 The CronJob writes the human-readable table to **stdout** (captured by your
 Loki/EFK stack — browse it in Grafana with no extra setup) **and** writes
-`resources.csv` / `ooms.csv` / `report.json` into a per-day folder on a PVC:
+machine-readable files into a per-day folder on a PVC. Each day's folder holds a
+combined report plus a `by-stage/<stage>/` sub-report per stage, and a
+`LEGEND.md` describing every column and `level` row:
 
 ```
-/reports/2026-06-07/{resources.csv,ooms.csv,report.json}
-/reports/2026-06-08/...
+/reports/2026-06-08/
+  resources.csv          # cluster + per-stage rollup rows, then ns/workload/pod/container detail
+  ooms.csv               # one row per OOM-killed container
+  report.json            # nested tree + cluster_totals + stage_summaries
+  LEGEND.md              # what each column and each `level` row means
+  by-stage/
+    ref/   {resources.csv, ooms.csv, report.json, LEGEND.md}   # only ref namespaces
+    test/  {...}
+    prod/  {...}
+    ...
 ```
+
+`resources.csv` has one row per scope, identified by its `level` column:
+`cluster` (grand total) → `stage` (per stage) → `namespace` → `workload` → `pod`
+→ `container`. CPU is in cores, memory in bytes; see `LEGEND.md` for the rest.
 
 `--date-subdir` gives each run its own dated folder (so a daily run keeps
 history instead of overwriting), and `--retention-days 30` prunes folders older
