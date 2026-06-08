@@ -404,6 +404,10 @@ _RESOURCES = {
     "statefulsets": ("statefulsets", "/apis/apps/v1",  True),
     "daemonsets":   ("daemonsets",   "/apis/apps/v1",  True),
     "namespaces":   ("namespaces",   "/api/v1",        False),
+    # OpenShift: listing projects returns what the caller can see and doesn't
+    # need cluster-wide namespace list permission (matches
+    # fetch-cluster-state-loop.sh). Only used by the oc CLI backend.
+    "projects":     ("projects",     "/apis/project.openshift.io/v1", False),
 }
 
 
@@ -440,7 +444,10 @@ class CliK8sClient:
             return []
 
     def list_namespaces(self):
-        return self._list("namespaces", None)
+        # On OpenShift use `oc get projects` (visible to the caller, no cluster
+        # namespace-list RBAC needed); kubectl has no projects API.
+        resource = "projects" if self.binary == "oc" else "namespaces"
+        return self._list(resource, None)
 
     def list_pods(self, namespace=None):
         return self._list("pods", namespace)
