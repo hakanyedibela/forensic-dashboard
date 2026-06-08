@@ -719,6 +719,13 @@ request/limit/now/peak (+peak-util%), plus OOM counts. Usage comes from Thanos
 (`container_cpu_usage_seconds_total` rate, `container_memory_working_set_bytes`,
 current + `*_over_time` peak/avg over `--window`).
 
+Workloads are derived from pod `ownerReferences`, so Deployments, StatefulSets,
+and DaemonSets all appear. Declared workloads with **no running pods** (e.g. a
+StatefulSet scaled to 0) are also listed — marked `(idle: 0 pods)` with their
+pod-template configured limits and `-` usage — so nothing is hidden just because
+it's idle. These idle rows don't count toward the namespace totals (they reserve
+nothing). Pass `--no-idle-workloads` to omit them.
+
 ### Usage
 
 ```bash
