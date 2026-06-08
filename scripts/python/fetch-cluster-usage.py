@@ -834,21 +834,36 @@ def collect_namespace(fcu_k8s, namespace, thanos, window, step,
 
 # ------------------------------------------------------------- flat rows / csv
 
-CSV_COLUMNS = [
-    "level", "stage", "namespace", "workload_kind", "workload", "pod",
-    "container", "cpu_request", "cpu_limit", "cpu_now", "cpu_peak", "cpu_avg",
-    "cpu_peak_util_pct", "mem_request", "mem_limit", "mem_now", "mem_peak",
-    "mem_peak_util_pct", "oom_count", "pod_count", "container_count",
+# (csv header, source key). Metric headers carry their unit so the CSV is
+# self-describing — CPU in cores, memory in bytes, util as a percent. The source
+# keys are the internal field names used everywhere else (rollup, JSON, leaves).
+CSV_FIELDS = [
+    ("level", "level"), ("stage", "stage"), ("namespace", "namespace"),
+    ("workload_kind", "workload_kind"), ("workload", "workload"),
+    ("pod", "pod"), ("container", "container"),
+    ("cpu_request_cores", "cpu_request"), ("cpu_limit_cores", "cpu_limit"),
+    ("cpu_now_cores", "cpu_now"), ("cpu_peak_cores", "cpu_peak"),
+    ("cpu_avg_cores", "cpu_avg"), ("cpu_peak_util_pct", "cpu_peak_util_pct"),
+    ("mem_request_bytes", "mem_request"), ("mem_limit_bytes", "mem_limit"),
+    ("mem_now_bytes", "mem_now"), ("mem_peak_bytes", "mem_peak"),
+    ("mem_peak_util_pct", "mem_peak_util_pct"),
+    ("oom_count", "oom_count"), ("pod_count", "pod_count"),
+    ("container_count", "container_count"),
 ]
+CSV_COLUMNS = [header for header, _ in CSV_FIELDS]
 
 
 def _row_from_totals(level, stage, namespace, totals, **ids):
-    row = {c: "" for c in CSV_COLUMNS}
-    row.update({"level": level, "stage": stage, "namespace": namespace})
-    row.update(ids)
-    for k, v in totals.items():
-        if k in row:
-            row[k] = v
+    """Build a CSV row keyed by the (unit-bearing) headers in CSV_FIELDS, drawing
+    identity from level/stage/namespace/ids and metrics from the totals dict."""
+    identity = {"level": level, "stage": stage, "namespace": namespace}
+    identity.update(ids)
+    row = {}
+    for header, key in CSV_FIELDS:
+        if key in identity:
+            row[header] = identity[key]
+        else:
+            row[header] = totals.get(key, "")
     return row
 
 
@@ -992,18 +1007,23 @@ Eine `workload`-Zeile mit `pod_count` = 0 ist *deklariert, aber inaktiv* (z. B. 
 skaliertes StatefulSet): die Limits stammen aus dem Pod-Template, die Nutzungsspalten sind leer.
 
 ## resources.csv Spalten
+Die Einheit steht im Spaltennamen: `_cores` = CPU in **Cores**, `_bytes` =
+Speicher in **Bytes**, `_pct` = Prozent. Beispiel: `cpu_now_cores=24.5` sind
+24,5 CPU-Cores; `mem_now_bytes=23092903` sind 23.092.903 Bytes (≈ 22 MiB).
 - `level`, `stage`, `namespace`, `workload_kind`, `workload`, `pod`, `container`
     — Identität der Zeile (leer, wo für die Ebene nicht zutreffend).
-- CPU-Spalten sind in **Cores**; Speicher-Spalten in **Bytes**.
-- `cpu_request` / `cpu_limit` / `mem_request` / `mem_limit`
+- `cpu_request_cores` / `cpu_limit_cores` / `mem_request_bytes` / `mem_limit_bytes`
     — konfigurierte Requests/Limits (aus den Pod-Specs). Leer = irgendwo im Bereich nicht gesetzt/unbegrenzt.
-- `cpu_now` / `mem_now`   — Nutzung zum Berichtszeitpunkt (CPU = Rate über 5m; Speicher = Working Set).
-- `cpu_peak` / `mem_peak` — Spitzenwert über das Rückblickfenster (--window).
-- `cpu_avg`               — durchschnittliche CPU über das Fenster.
+- `cpu_now_cores` / `mem_now_bytes`   — Nutzung zum Berichtszeitpunkt (CPU = Rate über 5m; Speicher = Working Set).
+- `cpu_peak_cores` / `mem_peak_bytes` — Spitzenwert über das Rückblickfenster (--window).
+- `cpu_avg_cores`                     — durchschnittliche CPU über das Fenster.
 - `cpu_peak_util_pct` / `mem_peak_util_pct` — Spitze ÷ Limit, in Prozent (leer, wenn kein Limit).
 - `oom_count`             — Anzahl OOM-getöteter Container im Bereich.
 - `pod_count` / `container_count` — wie viele Pods/Container die Zeile aggregiert.
 Leere Nutzungszellen bedeuten, dass Thanos keine Daten hatte (oder --no-thanos / Thanos nicht erreichbar).
+
+Hinweis: `report.json` verwendet die kurzen Schlüssel (`cpu_limit`, `mem_now`, …);
+die Einheiten sind dort dieselben (CPU in Cores, Speicher in Bytes).
 
 ## ooms.csv Spalten
 - `stage`, `namespace`, `pod`, `container` — welcher Container OOM erlitten hat.
