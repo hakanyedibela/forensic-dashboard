@@ -779,6 +779,7 @@ combined report plus a `by-stage/<stage>/` sub-report per stage, and a
   ooms.csv               # one row per OOM-killed container
   report.json            # nested tree + cluster_totals + stage_summaries
   LEGEND.md              # what each column and each `level` row means
+  LEGEND.de.md           # same legend in German (Legende)
   by-stage/
     ref/   {resources.csv, ooms.csv, report.json, LEGEND.md}   # only ref namespaces
     test/  {...}
