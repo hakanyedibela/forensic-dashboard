@@ -74,8 +74,22 @@ def parse_mem(s):
 
 
 def fmt_cores(v):
-    """Cores -> '0.100' style string. None -> '-'."""
-    return "-" if v is None else f"{v:.3f}"
+    """Cores -> Kubernetes-style human string. None -> '-', 0 -> '0'.
+
+    >=1 core: trimmed decimal ('24.5', '1'); sub-core: milli ('500m', '2.8m');
+    sub-milli: micro ('0.525µ'). Keeps tiny Thanos peaks readable instead of
+    flattening them to '0.000', and never uses scientific notation.
+    """
+    if v is None:
+        return "-"
+    if v == 0:
+        return "0"
+    a = abs(v)
+    if a >= 1:
+        return f"{v:.2f}".rstrip("0").rstrip(".")
+    if a >= 1e-3:
+        return f"{v * 1e3:.3g}m"
+    return f"{v * 1e6:.3g}µ"
 
 
 def fmt_bytes(n):
@@ -1013,6 +1027,7 @@ Erzeugt von scripts/python/fetch-cluster-usage.py.
 - `resources.csv`  — CPU-/Speicher-Konfiguration vs. tatsächliche Nutzung, eine Zeile pro Ebene (siehe `level`).
 - `namespaces.csv` — kompakte Übersicht: genau eine Zeile pro Namespace (Summe: verbraucht vs. limitiert), ohne Workload-/Pod-/Container-Details.
 - `ooms.csv`       — eine Zeile pro OOM-getötetem Container.
+- `summary.txt`    — menschenlesbare Tabelle (CPU in Cores/Milli, Speicher in Ki/Mi/Gi, % und OOM-Anzahl) — dieselben Zahlen wie die CSVs, nur kompakt formatiert.
 - `report.json`   — dieselben Daten verschachtelt (Namespace → Workload → Pod → Container) plus Aggregationen.
 - `by-stage/<stage>/` — (im obersten Ordner) dieselben Dateien, beschränkt auf eine Stage.
 
@@ -1082,6 +1097,9 @@ def write_report_files(trees, out_dir, window, cluster,
     with open(os.path.join(out_dir, "report.json"), "w") as f:
         render_json(trees, f, window=window, cluster=cluster,
                     summaries=bool(summary_kinds))
+    with open(os.path.join(out_dir, "summary.txt"), "w") as f:
+        f.write(f"Cluster usage — window {window}, cluster {cluster}\n")
+        render_text(trees, f)
     write_legend(out_dir)
     return out_dir
 
