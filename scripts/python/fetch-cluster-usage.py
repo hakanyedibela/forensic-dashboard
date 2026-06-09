@@ -1065,6 +1065,25 @@ def render_json(trees, stream, window, cluster, summaries=True):
     stream.write("\n")
 
 
+def render_stdout_formats(trees, formats, stream, window, cluster, levels):
+    """Write each requested --format to a single stream (stdout). Lets every
+    on-disk view also be produced without --output-dir, e.g. piped:
+    `... --format resources-human | column -s, -t`. 'none' suppresses stdout
+    entirely (pair with --output-dir to only write files)."""
+    if "none" in formats:
+        return
+    if "text" in formats:
+        render_text(trees, stream, levels=levels)
+    if "json" in formats:
+        render_json(trees, stream, window=window, cluster=cluster)
+    if "csv" in formats:
+        render_resources_csv(trees, stream)
+    if "resources-human" in formats:
+        render_resources_human_csv(trees, stream)
+    if "namespaces-human" in formats:
+        render_namespaces_human_csv(trees, stream)
+
+
 # ----------------------------------------------------- persisting to disk/PVC
 
 REPORT_DATE_FMT = "%Y-%m-%d"
@@ -1392,8 +1411,13 @@ def build_parser():
     out.add_argument("--level", default="namespace,workload,pod,container",
                      help="Comma list of text levels (default: all).")
     out.add_argument("--format", action="append",
-                     choices=["text", "json", "csv"],
-                     help="stdout format(s) (default: text).")
+                     choices=["text", "json", "csv", "resources-human",
+                              "namespaces-human", "none"],
+                     help="stdout format(s), repeatable (default: text). "
+                          "'csv' = raw resources.csv; 'resources-human' / "
+                          "'namespaces-human' = the unit-formatted CSVs; "
+                          "'none' = no stdout (pair with --output-dir to only "
+                          "write files).")
     out.add_argument("--output-dir",
                      help="Also write resources.csv, ooms.csv, report.json.")
     out.add_argument("--date-subdir", action="store_true",
@@ -1491,12 +1515,8 @@ def main(argv=None):
     formats = args.format or ["text"]
     levels = tuple(s.strip() for s in args.level.split(",") if s.strip())
     cluster = os.environ.get("KUBERNETES_SERVICE_HOST", "local")
-    if "text" in formats:
-        render_text(trees, sys.stdout, levels=levels)
-    if "json" in formats:
-        render_json(trees, sys.stdout, window=args.window, cluster=cluster)
-    if "csv" in formats:
-        render_resources_csv(trees, sys.stdout)
+    render_stdout_formats(trees, formats, sys.stdout, window=args.window,
+                          cluster=cluster, levels=levels)
 
     if args.output_dir:
         now = datetime.now(timezone.utc)
