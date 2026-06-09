@@ -560,6 +560,50 @@ def test_render_namespaces_human_csv_one_row_per_namespace(fcu):
     assert len(raw.getvalue().splitlines()) == len(human.getvalue().splitlines())
 
 
+def test_format_choices_include_human_csvs(fcu):
+    a = fcu.build_parser().parse_args(
+        ["--format", "resources-human", "--format", "namespaces-human"])
+    assert a.format == ["resources-human", "namespaces-human"]
+
+
+def test_render_stdout_formats_resources_human(fcu):
+    buf = io.StringIO()
+    fcu.render_stdout_formats([_sample_tree(fcu)], ["resources-human"], buf,
+                              window="7d", cluster="c1",
+                              levels=("namespace", "workload", "pod", "container"))
+    out = buf.getvalue()
+    assert out.splitlines()[0].startswith("level,stage,namespace")
+    assert "200m" in out and "e-" not in out
+
+
+def test_render_stdout_formats_namespaces_human(fcu):
+    buf = io.StringIO()
+    fcu.render_stdout_formats([_sample_tree(fcu)], ["namespaces-human"], buf,
+                              window="7d", cluster="c1", levels=("namespace",))
+    out = buf.getvalue()
+    assert out.splitlines()[0].startswith("stage,namespace")
+    assert "cpu_peak" in out.splitlines()[0]
+    assert "e-" not in out
+
+
+def test_format_choice_none_accepted(fcu):
+    assert fcu.build_parser().parse_args(["--format", "none"]).format == ["none"]
+
+
+def test_render_stdout_formats_none_writes_nothing(fcu):
+    buf = io.StringIO()
+    fcu.render_stdout_formats([_sample_tree(fcu)], ["none"], buf,
+                              window="7d", cluster="c1", levels=("namespace",))
+    assert buf.getvalue() == ""
+
+
+def test_render_stdout_formats_text_still_works(fcu):
+    buf = io.StringIO()
+    fcu.render_stdout_formats([_sample_tree(fcu)], ["text"], buf,
+                              window="7d", cluster="c1", levels=("namespace",))
+    assert "CPU peak" in buf.getvalue()
+
+
 def test_csv_headers_carry_units(fcu):
     header = fcu.CSV_COLUMNS
     for col in ("cpu_request_cores", "cpu_limit_cores", "cpu_now_cores",
