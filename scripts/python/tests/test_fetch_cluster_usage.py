@@ -31,9 +31,26 @@ def test_parse_mem(fcu, s, expected):
     assert fcu.parse_mem(s) == expected
 
 
-def test_fmt_cores(fcu):
-    assert fcu.fmt_cores(0.1) == "0.100"
-    assert fcu.fmt_cores(None) == "-"
+@pytest.mark.parametrize("v,expected", [
+    (None, "-"),
+    (0, "0"),
+    (0.0, "0"),
+    (24.5, "24.5"),          # >= 1 core -> trimmed decimal
+    (1.0, "1"),
+    (0.5, "500m"),           # sub-core -> milli
+    (0.1, "100m"),
+    (0.0028, "2.8m"),
+    (0.001, "1m"),           # milli/micro boundary
+    (5.25e-07, "0.525µ"),    # tiny peak -> micro, never "0.000"
+])
+def test_fmt_cores(fcu, v, expected):
+    assert fcu.fmt_cores(v) == expected
+
+
+def test_fmt_cores_never_scientific_or_zero_flattened(fcu):
+    # A real (tiny) Thanos peak must stay readable, not collapse to 0.000.
+    out = fcu.fmt_cores(2.8e-06)
+    assert "e" not in out and out != "0.000"
 
 
 def test_fmt_bytes(fcu):
@@ -663,6 +680,26 @@ def test_write_report_files(fcu, tmp_path):
     obj = json.loads(report.read_text())
     assert obj["namespaces"][0]["namespace"] == "ns1"
     assert out == str(tmp_path / "2026-06-07")
+
+
+def test_write_report_files_writes_human_summary(fcu, tmp_path):
+    out = fcu.write_report_files([_sample_tree(fcu)], str(tmp_path / "r"),
+                                 window="7d", cluster="c1")
+    summary = tmp_path / "r" / "summary.txt"
+    assert summary.exists()
+    text = summary.read_text()
+    # the readable table, not raw CSV numbers
+    assert "ns1" in text
+    assert "CPU peak" in text and "MEM peak" in text
+    assert "OOM" in text
+    assert out == str(tmp_path / "r")
+
+
+def test_write_all_reports_writes_per_stage_summary(fcu, tmp_path):
+    tree = _sample_tree(fcu)  # stage detected from "ns1" -> "other"
+    fcu.write_all_reports([tree], str(tmp_path / "r"), window="7d", cluster="c1")
+    assert (tmp_path / "r" / "summary.txt").exists()
+    assert (tmp_path / "r" / "by-stage" / tree["stage"] / "summary.txt").exists()
 
 
 def test_prune_old_reports_removes_only_old_date_dirs(fcu, tmp_path):
