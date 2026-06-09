@@ -764,6 +764,35 @@ def test_write_report_files_writes_namespaces_human_csv(fcu, tmp_path):
     assert "e-" not in text  # no scientific notation
 
 
+def test_report_files_with_micro_peak_are_utf8(fcu, tmp_path, monkeypatch):
+    # A micro-scale CPU peak renders as the µ sign; the files must be written as
+    # UTF-8 so a C/POSIX-locale CronJob doesn't hit UnicodeEncodeError. Simulate
+    # that locale: make text-mode open() default to ascii (as Linux LANG=C does)
+    # unless an explicit encoding is passed. Without encoding="utf-8" in the
+    # writer this raises; with it, it passes.
+    import builtins
+    real_open = builtins.open
+
+    def ascii_default_open(file, mode="r", *args, **kwargs):
+        if "b" not in mode and "encoding" not in kwargs and not args:
+            kwargs["encoding"] = "ascii"
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", ascii_default_open)
+
+    totals = fcu.rollup([])
+    totals["cpu_peak"] = 5.25e-07
+    node = {"namespace": "ns1", "stage": "ref", "totals": totals,
+            "ooms": [], "workloads": []}
+    fcu.write_report_files([node], str(tmp_path / "r"), window="7d", cluster="c1")
+
+    monkeypatch.setattr(builtins, "open", real_open)  # read back normally
+    for fname in ("summary.txt", "resources-human.csv", "namespaces-human.csv"):
+        raw = (tmp_path / "r" / fname).read_bytes()
+        assert b"\xc2\xb5" in raw, f"{fname} missing UTF-8 µ"     # b'\xc2\xb5' == 'µ'
+        raw.decode("utf-8")  # must be valid UTF-8 (raises otherwise)
+
+
 def test_write_all_reports_writes_per_stage_summary(fcu, tmp_path):
     tree = _sample_tree(fcu)  # stage detected from "ns1" -> "other"
     fcu.write_all_reports([tree], str(tmp_path / "r"), window="7d", cluster="c1")

@@ -1181,20 +1181,25 @@ def write_report_files(trees, out_dir, window, cluster,
     (created if needed). summary_kinds selects which rollup rows the CSV/JSON
     carry. Returns out_dir."""
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "resources.csv"), "w") as f:
+    # Explicit UTF-8 everywhere: the *-human.csv / summary.txt carry the µ sign
+    # (and summary.txt an em dash), which would raise UnicodeEncodeError under a
+    # C/POSIX-locale CronJob if left to the platform default encoding.
+    with open(os.path.join(out_dir, "resources.csv"), "w", encoding="utf-8") as f:
         render_resources_csv(trees, f, summary_kinds=summary_kinds)
-    with open(os.path.join(out_dir, "resources-human.csv"), "w") as f:
+    with open(os.path.join(out_dir, "resources-human.csv"), "w",
+              encoding="utf-8") as f:
         render_resources_human_csv(trees, f, summary_kinds=summary_kinds)
-    with open(os.path.join(out_dir, "namespaces.csv"), "w") as f:
+    with open(os.path.join(out_dir, "namespaces.csv"), "w", encoding="utf-8") as f:
         render_namespaces_csv(trees, f)
-    with open(os.path.join(out_dir, "namespaces-human.csv"), "w") as f:
+    with open(os.path.join(out_dir, "namespaces-human.csv"), "w",
+              encoding="utf-8") as f:
         render_namespaces_human_csv(trees, f)
-    with open(os.path.join(out_dir, "ooms.csv"), "w") as f:
+    with open(os.path.join(out_dir, "ooms.csv"), "w", encoding="utf-8") as f:
         render_ooms_csv(trees, f)
-    with open(os.path.join(out_dir, "report.json"), "w") as f:
+    with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
         render_json(trees, f, window=window, cluster=cluster,
                     summaries=bool(summary_kinds))
-    with open(os.path.join(out_dir, "summary.txt"), "w") as f:
+    with open(os.path.join(out_dir, "summary.txt"), "w", encoding="utf-8") as f:
         f.write(f"Cluster usage — window {window}, cluster {cluster}\n")
         render_text(trees, f)
     write_legend(out_dir)
