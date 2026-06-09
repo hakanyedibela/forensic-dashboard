@@ -41,10 +41,15 @@ def test_parse_mem(fcu, s, expected):
     (0.1, "100m"),
     (0.0028, "2.8m"),
     (0.001, "1m"),           # milli/micro boundary
-    (5.25e-07, "0.525µ"),    # tiny peak -> micro, never "0.000"
+    (5.25e-07, "0.525µ"),    # tiny peak -> micro (µ sign), never "0.000"
 ])
 def test_fmt_cores(fcu, v, expected):
     assert fcu.fmt_cores(v) == expected
+
+
+def test_fmt_cores_micro_uses_mu_sign(fcu):
+    out = fcu.fmt_cores(2.8e-06)
+    assert out.endswith("µ")
 
 
 def test_fmt_cores_never_scientific_or_zero_flattened(fcu):
@@ -511,6 +516,50 @@ def test_render_csv_has_header_and_rows(fcu):
     assert "container" in text
 
 
+def test_render_resources_human_csv_formats_values(fcu):
+    buf = io.StringIO()
+    fcu.render_resources_human_csv([_sample_tree(fcu)], buf)
+    lines = buf.getvalue().splitlines()
+    header = lines[0]
+    # identity columns stay; metric headers drop the raw-unit suffix because the
+    # value now carries its own unit (200m, 6.3Mi, 4.9%).
+    assert header.startswith("level,stage,namespace")
+    assert "cpu_peak" in header and "mem_peak" in header
+    assert "cpu_peak_cores" not in header and "mem_peak_bytes" not in header
+    body = "\n".join(lines[1:])
+    # formatted, human-readable values — never raw floats / scientific notation
+    assert "200m" in body          # cpu_limit 0.2 cores
+    assert "e-" not in body
+    assert "Mi" in body or "Ki" in body
+
+
+def test_render_resources_human_csv_row_count_matches_raw(fcu):
+    raw, human = io.StringIO(), io.StringIO()
+    fcu.render_resources_csv([_sample_tree(fcu)], raw)
+    fcu.render_resources_human_csv([_sample_tree(fcu)], human)
+    assert len(raw.getvalue().splitlines()) == len(human.getvalue().splitlines())
+
+
+def test_render_namespaces_human_csv_formats_values(fcu):
+    buf = io.StringIO()
+    fcu.render_namespaces_human_csv([_sample_tree(fcu)], buf)
+    lines = buf.getvalue().splitlines()
+    header = lines[0]
+    assert header.startswith("stage,namespace")
+    assert "cpu_peak" in header and "mem_peak" in header
+    assert "cpu_peak_cores" not in header and "mem_peak_bytes" not in header
+    body = "\n".join(lines[1:])
+    assert "e-" not in body  # no scientific notation
+    assert "Mi" in body or "Ki" in body
+
+
+def test_render_namespaces_human_csv_one_row_per_namespace(fcu):
+    raw, human = io.StringIO(), io.StringIO()
+    fcu.render_namespaces_csv([_sample_tree(fcu)], raw)
+    fcu.render_namespaces_human_csv([_sample_tree(fcu)], human)
+    assert len(raw.getvalue().splitlines()) == len(human.getvalue().splitlines())
+
+
 def test_csv_headers_carry_units(fcu):
     header = fcu.CSV_COLUMNS
     for col in ("cpu_request_cores", "cpu_limit_cores", "cpu_now_cores",
@@ -693,6 +742,26 @@ def test_write_report_files_writes_human_summary(fcu, tmp_path):
     assert "CPU peak" in text and "MEM peak" in text
     assert "OOM" in text
     assert out == str(tmp_path / "r")
+
+
+def test_write_report_files_writes_resources_human_csv(fcu, tmp_path):
+    fcu.write_report_files([_sample_tree(fcu)], str(tmp_path / "r"),
+                           window="7d", cluster="c1")
+    human = tmp_path / "r" / "resources-human.csv"
+    assert human.exists()
+    text = human.read_text()
+    assert text.splitlines()[0].startswith("level,stage,namespace")
+    assert "e-" not in text  # no scientific notation
+
+
+def test_write_report_files_writes_namespaces_human_csv(fcu, tmp_path):
+    fcu.write_report_files([_sample_tree(fcu)], str(tmp_path / "r"),
+                           window="7d", cluster="c1")
+    human = tmp_path / "r" / "namespaces-human.csv"
+    assert human.exists()
+    text = human.read_text()
+    assert text.splitlines()[0].startswith("stage,namespace")
+    assert "e-" not in text  # no scientific notation
 
 
 def test_write_all_reports_writes_per_stage_summary(fcu, tmp_path):

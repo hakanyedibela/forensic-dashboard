@@ -77,8 +77,8 @@ def fmt_cores(v):
     """Cores -> Kubernetes-style human string. None -> '-', 0 -> '0'.
 
     >=1 core: trimmed decimal ('24.5', '1'); sub-core: milli ('500m', '2.8m');
-    sub-milli: micro ('0.525µ'). Keeps tiny Thanos peaks readable instead of
-    flattening them to '0.000', and never uses scientific notation.
+    sub-milli: micro ('0.525µ', the SI µ sign). Keeps tiny Thanos peaks readable
+    instead of flattening them to '0.000', and never uses scientific notation.
     """
     if v is None:
         return "-"
@@ -888,6 +888,39 @@ METRIC_FIELDS = [(h, k) for h, k in CSV_FIELDS if k not in _IDENTITY_KEYS]
 NS_CSV_FIELDS = [("stage", "stage"), ("namespace", "namespace")] + METRIC_FIELDS
 NS_CSV_COLUMNS = [h for h, _ in NS_CSV_FIELDS]
 
+# Human-readable twin of resources.csv: same rows/columns, but each metric is
+# rendered with its unit inline (200m, 6.3Mi, 4.9%) instead of a raw float. The
+# unit-bearing header suffix (_cores/_bytes) is dropped because the value now
+# carries the unit itself; counts and identity columns pass through unchanged.
+_CPU_METRIC_KEYS = {"cpu_request", "cpu_limit", "cpu_now", "cpu_peak", "cpu_avg"}
+_MEM_METRIC_KEYS = {"mem_request", "mem_limit", "mem_now", "mem_peak"}
+_PCT_METRIC_KEYS = {"cpu_peak_util_pct", "mem_peak_util_pct"}
+_HEADER_TO_KEY = dict(CSV_FIELDS)
+
+
+def _human_header(header):
+    """Drop the raw-unit suffix from a CSV header ('cpu_peak_cores' -> 'cpu_peak')."""
+    for suf in ("_cores", "_bytes"):
+        if header.endswith(suf):
+            return header[: -len(suf)]
+    return header
+
+
+HUMAN_CSV_COLUMNS = [_human_header(h) for h, _ in CSV_FIELDS]
+NS_HUMAN_CSV_COLUMNS = [_human_header(h) for h, _ in NS_CSV_FIELDS]
+
+
+def _human_metric(key, value):
+    """Format one raw cell for the human CSV, chosen by its source key."""
+    v = None if value == "" else value
+    if key in _CPU_METRIC_KEYS:
+        return fmt_cores(v)
+    if key in _MEM_METRIC_KEYS:
+        return fmt_bytes(v)
+    if key in _PCT_METRIC_KEYS:
+        return fmt_pct(v)
+    return "" if v is None else v  # identity strings + counts pass through
+
 
 def aggregate_totals(totals_list):
     """Combine a list of level-`totals` dicts into one. Same None-semantics as
@@ -968,6 +1001,18 @@ def render_resources_csv(trees, stream, summary_kinds=("cluster", "stage")):
         writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
 
 
+def render_resources_human_csv(trees, stream, summary_kinds=("cluster", "stage")):
+    """Human-readable twin of render_resources_csv: identical rows, but every
+    metric is formatted with its unit inline (200m, 6.3Mi, 4.9%). Same
+    summary_kinds semantics."""
+    writer = csv.DictWriter(stream, fieldnames=HUMAN_CSV_COLUMNS,
+                            extrasaction="ignore")
+    writer.writeheader()
+    for row in summary_rows(trees, summary_kinds) + flatten_rows(trees):
+        writer.writerow({_human_header(h): _human_metric(_HEADER_TO_KEY[h], v)
+                         for h, v in row.items()})
+
+
 def render_namespaces_csv(trees, stream):
     """Concise one-row-per-namespace summary: total configured vs. real CPU/mem
     (no workload/pod/container detail). Sorted by stage then namespace."""
@@ -979,6 +1024,19 @@ def render_namespaces_csv(trees, stream):
         for header, key in METRIC_FIELDS:
             v = node["totals"].get(key)
             row[header] = "" if v is None else v
+        writer.writerow(row)
+
+
+def render_namespaces_human_csv(trees, stream):
+    """Human-readable twin of render_namespaces_csv: one row per namespace, each
+    metric formatted with its unit inline (200m, 6.3Mi, 4.9%)."""
+    writer = csv.DictWriter(stream, fieldnames=NS_HUMAN_CSV_COLUMNS,
+                            extrasaction="ignore")
+    writer.writeheader()
+    for node in sorted(trees, key=lambda n: (n["stage"], n["namespace"])):
+        row = {"stage": node["stage"], "namespace": node["namespace"]}
+        for header, key in METRIC_FIELDS:
+            row[_human_header(header)] = _human_metric(key, node["totals"].get(key))
         writer.writerow(row)
 
 
@@ -1025,7 +1083,9 @@ Erzeugt von scripts/python/fetch-cluster-usage.py.
 
 ## Dateien in diesem Ordner
 - `resources.csv`  — CPU-/Speicher-Konfiguration vs. tatsächliche Nutzung, eine Zeile pro Ebene (siehe `level`).
+- `resources-human.csv` — dieselben Zeilen wie `resources.csv`, aber jeder Wert mit Einheit (z. B. `200m`, `6.3Mi`, `4.9%`) statt Rohzahl; CPU-Mikrowerte als `µ` (z. B. `0.525µ`).
 - `namespaces.csv` — kompakte Übersicht: genau eine Zeile pro Namespace (Summe: verbraucht vs. limitiert), ohne Workload-/Pod-/Container-Details.
+- `namespaces-human.csv` — dieselben Zeilen wie `namespaces.csv`, aber jeder Wert mit Einheit (z. B. `200m`, `6.3Mi`, `4.9%`) statt Rohzahl.
 - `ooms.csv`       — eine Zeile pro OOM-getötetem Container.
 - `summary.txt`    — menschenlesbare Tabelle (CPU in Cores/Milli, Speicher in Ki/Mi/Gi, % und OOM-Anzahl) — dieselben Zahlen wie die CSVs, nur kompakt formatiert.
 - `report.json`   — dieselben Daten verschachtelt (Namespace → Workload → Pod → Container) plus Aggregationen.
@@ -1063,6 +1123,39 @@ Leere Nutzungszellen bedeuten, dass Thanos keine Daten hatte (oder --no-thanos /
 Hinweis: `report.json` verwendet die kurzen Schlüssel (`cpu_limit`, `mem_now`, …);
 die Einheiten sind dort dieselben (CPU in Cores, Speicher in Bytes).
 
+## Einheiten in `resources-human.csv`, `namespaces-human.csv` und `summary.txt`
+Hier steht die Einheit **direkt am Wert** (statt im Spaltennamen), damit kleine
+Zahlen lesbar bleiben und nicht als `0.000` oder in wissenschaftlicher Notation
+(`5.25e-07`) erscheinen.
+
+### CPU — Cores mit metrischem Präfix
+Das Präfix verschiebt das Komma; die Buchstaben unterscheiden sich um den Faktor
+1000:
+- (ohne Suffix) = **Cores**, z. B. `24.5` = 24,5 Cores.
+- `m` = **Milli** = Tausendstel Core (×10⁻³). Beispiel: `200m` = 0,2 Cores; `1m` = 0,001 Cores.
+- `µ` = **Mikro** = Millionstel Core (×10⁻⁶). Beispiel: `0.525µ` = 0,000000525 Cores; `148µ` = 0,000148 Cores.
+
+Umrechnung: `1` Core = `1000m` = `1 000 000µ`, also **`1m` = `1000µ`**.
+- Cores → Milli: ×1000   (0,2 → `200m`)
+- Cores → Mikro: ×1 000 000   (0,000148 → `148µ`)
+
+Achtung Groß-/Kleinschreibung: `m` (klein) = Milli; `M` (groß) wäre Mega (×10⁶).
+`µ` ist das SI-Zeichen für Mikro. (Kubernetes selbst schreibt Mikro als `u`; diese
+menschenlesbaren Dateien verwenden bewusst das Zeichen `µ`.)
+
+Faustregel im Bericht: konfigurierte Limits/Requests liegen meist im Milli-Bereich
+(`100m`, `500m`), die gemessenen Spitzen auf einem fast leeren Cluster im
+Mikro-Bereich (`76.8µ`).
+
+### Speicher — binäre Präfixe (Faktor 1024)
+`Ki`/`Mi`/`Gi`/`Ti` (Kibi/Mebi/Gibi/Tebi), je Stufe ×1024:
+- `1Ki` = 1024 Bytes; `1Mi` = 1024 Ki = 1 048 576 Bytes; `1Gi` = 1024 Mi.
+- Beispiel: `6.3Mi` ≈ 6 606 029 Bytes; `344.0Ki` = 352 256 Bytes.
+
+### Prozent
+`_pct`-Werte (z. B. `4.9%`) sind Spitze ÷ Limit × 100 — unverändert gegenüber den
+Roh-CSVs.
+
 ## ooms.csv Spalten
 - `stage`, `namespace`, `pod`, `container` — welcher Container OOM erlitten hat.
 - `source`        — `live` (aktueller Pod-Zustand), `thanos` (historisch) oder `both`.
@@ -1090,8 +1183,12 @@ def write_report_files(trees, out_dir, window, cluster,
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "resources.csv"), "w") as f:
         render_resources_csv(trees, f, summary_kinds=summary_kinds)
+    with open(os.path.join(out_dir, "resources-human.csv"), "w") as f:
+        render_resources_human_csv(trees, f, summary_kinds=summary_kinds)
     with open(os.path.join(out_dir, "namespaces.csv"), "w") as f:
         render_namespaces_csv(trees, f)
+    with open(os.path.join(out_dir, "namespaces-human.csv"), "w") as f:
+        render_namespaces_human_csv(trees, f)
     with open(os.path.join(out_dir, "ooms.csv"), "w") as f:
         render_ooms_csv(trees, f)
     with open(os.path.join(out_dir, "report.json"), "w") as f:
