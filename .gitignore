@@ -9,3 +9,4 @@ oom-loop-*/
 # Python bytecode
 __pycache__/
 *.pyc
+/reports-usage/

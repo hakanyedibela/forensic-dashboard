@@ -74,19 +74,21 @@ def parse_mem(s):
 
 
 def fmt_cores(v):
-    """Cores -> Kubernetes-style human string. None -> '-', 0 -> '0'.
+    """Cores -> Kubernetes-style human string. None -> '-', 0 -> '0c'.
 
-    >=1 core: trimmed decimal ('24.5', '1'); sub-core: milli ('500m', '2.8m');
-    sub-milli: micro ('0.525µ', the SI µ sign). Keeps tiny Thanos peaks readable
-    instead of flattening them to '0.000', and never uses scientific notation.
-    """
+    >=1 core: trimmed decimal + 'c' ('24.5c', '1c'); sub-core: milli ('500m',
+    '2.8m'); sub-milli: micro ('0.525µ', the SI µ sign). The 'c' (cores) suffix
+    keeps every CPU value text — without it a bare '18.5' is read by German-locale
+    Excel as a date (18. Mai) or a thousands-grouped number. Tiny Thanos peaks
+    stay readable instead of flattening to '0.000', and never use scientific
+    notation."""
     if v is None:
         return "-"
     if v == 0:
-        return "0"
+        return "0c"
     a = abs(v)
     if a >= 1:
-        return f"{v:.2f}".rstrip("0").rstrip(".")
+        return f"{v:.2f}".rstrip("0").rstrip(".") + "c"
     if a >= 1e-3:
         return f"{v * 1e3:.3g}m"
     return f"{v * 1e6:.3g}µ"
@@ -181,6 +183,12 @@ def util_pct(usage, limit):
 # Canonical numeric fields every level carries.
 LIMIT_FIELDS = ("cpu_request", "cpu_limit", "mem_request", "mem_limit")
 USAGE_FIELDS = ("cpu_now", "cpu_peak", "cpu_avg", "mem_now", "mem_peak")
+# Namespace ResourceQuota "Used" counters (requests/limits booked vs. the Hard
+# cap). Only meaningful at namespace level and above (a quota is namespace-scoped
+# — there is no per-pod/container quota); stage/cluster sum the namespaces, and
+# workload/pod/container rows leave these None. Filled by collect_namespace().
+QUOTA_USED_FIELDS = ("cpu_request_used", "cpu_limit_used",
+                     "mem_request_used", "mem_limit_used")
 
 
 def rollup(leaves):
@@ -195,6 +203,10 @@ def rollup(leaves):
         agg[f] = sum_limit([leaf.get(f) for leaf in leaves])
     for f in USAGE_FIELDS:
         agg[f] = sum_usage([leaf.get(f) for leaf in leaves])
+    # Quota "Used" counters don't come from pod specs; they're set on the
+    # namespace totals from the ResourceQuota (collect_namespace). None here.
+    for f in QUOTA_USED_FIELDS:
+        agg[f] = None
     agg["cpu_peak_util_pct"] = util_pct(agg["cpu_peak"], agg["cpu_limit"])
     agg["mem_peak_util_pct"] = util_pct(agg["mem_peak"], agg["mem_limit"])
     agg["oom_count"] = sum(leaf.get("oom_count", 0) for leaf in leaves)
@@ -226,6 +238,76 @@ def merge_ooms(live, thanos):
         else:
             by_key[k] = {**o, "source": "thanos"}
     return [by_key[k] for k in sorted(by_key)]
+
+
+# --------------------------------------------------- namespace ResourceQuota
+
+# Logical pair -> (ResourceQuota resource names, parser). A ResourceQuota counts
+# requests.cpu / limits.cpu / requests.memory / limits.memory; bare `cpu` and
+# `memory` are the legacy aliases for requests.cpu / requests.memory, so accept
+# either spelling.
+_QUOTA_RESOURCES = {
+    "cpu_request": (("requests.cpu", "cpu"), parse_cpu),
+    "cpu_limit":   (("limits.cpu",), parse_cpu),
+    "mem_request": (("requests.memory", "memory"), parse_mem),
+    "mem_limit":   (("limits.memory",), parse_mem),
+}
+
+
+def _quota_pick(qmap, keys, parse):
+    """First present-and-parseable value among keys in a quota hard/used map."""
+    for k in keys:
+        if k in qmap:
+            v = parse(qmap[k])
+            if v is not None:
+                return v
+    return None
+
+
+def parse_quota(items):
+    """Reduce a namespace's ResourceQuota objects to one dict of configured Hard
+    caps + booked Used amounts for cpu/mem requests & limits.
+
+    Keys: cpu_request_hard / cpu_limit_hard / mem_request_hard / mem_limit_hard
+    plus the matching *_used (None where the quota doesn't track that resource).
+    Across multiple quotas the binding Hard is the smallest cap and Used the
+    largest booked value (they agree in practice — Used is the namespace's
+    consumption). Empty/None input -> all None.
+    """
+    hard = {f"{name}_hard": None for name in _QUOTA_RESOURCES}
+    used = {f"{name}_used": None for name in _QUOTA_RESOURCES}
+    for item in items or []:
+        status = item.get("status", {}) or {}
+        h = status.get("hard", {}) or {}
+        u = status.get("used", {}) or {}
+        for name, (keys, parse) in _QUOTA_RESOURCES.items():
+            hv = _quota_pick(h, keys, parse)
+            if hv is not None:
+                cur = hard[f"{name}_hard"]
+                hard[f"{name}_hard"] = hv if cur is None else min(cur, hv)
+            uv = _quota_pick(u, keys, parse)
+            if uv is not None:
+                cur = used[f"{name}_used"]
+                used[f"{name}_used"] = uv if cur is None else max(cur, uv)
+    return {**hard, **used}
+
+
+def apply_quota_to_totals(totals, quota):
+    """Overlay a namespace's ResourceQuota onto its rollup totals in place: the
+    configured request/limit columns become the quota Hard caps and the Used
+    counters are filled. Peak-util% is recomputed against the new Hard limits;
+    measured usage/peak/avg and the pod/container/oom counts are left as-is."""
+    totals["cpu_request"] = quota["cpu_request_hard"]
+    totals["cpu_limit"] = quota["cpu_limit_hard"]
+    totals["mem_request"] = quota["mem_request_hard"]
+    totals["mem_limit"] = quota["mem_limit_hard"]
+    for f in QUOTA_USED_FIELDS:
+        totals[f] = quota[f]
+    totals["cpu_peak_util_pct"] = util_pct(totals.get("cpu_peak"),
+                                           totals["cpu_limit"])
+    totals["mem_peak_util_pct"] = util_pct(totals.get("mem_peak"),
+                                           totals["mem_limit"])
+    return totals
 
 
 # ------------------------------------------------------- pod -> leaf records
@@ -345,6 +427,8 @@ def _template_totals(containers):
         "mem_request": sum_limit(mem_req), "mem_limit": sum_limit(mem_lim),
         "cpu_now": None, "cpu_peak": None, "cpu_avg": None,
         "mem_now": None, "mem_peak": None,
+        "cpu_request_used": None, "cpu_limit_used": None,
+        "mem_request_used": None, "mem_limit_used": None,
         "cpu_peak_util_pct": None, "mem_peak_util_pct": None,
         "oom_count": 0, "pod_count": 0, "container_count": len(containers),
     }
@@ -458,6 +542,7 @@ def attach_oom_counts(leaves, merged_ooms):
 # logical -> (cli_plural, api_group_path, is_namespaced)
 _RESOURCES = {
     "pods":         ("pods",         "/api/v1",        True),
+    "resourcequotas": ("resourcequotas", "/api/v1",    True),
     "replicasets":  ("replicasets",  "/apis/apps/v1",  True),
     "deployments":  ("deployments",  "/apis/apps/v1",  True),
     "statefulsets": ("statefulsets", "/apis/apps/v1",  True),
@@ -511,6 +596,9 @@ class CliK8sClient:
     def list_pods(self, namespace=None):
         return self._list("pods", namespace)
 
+    def list_resourcequotas(self, namespace=None):
+        return self._list("resourcequotas", namespace)
+
     def list_replicasets(self, namespace=None):
         return self._list("replicasets", namespace)
 
@@ -561,6 +649,9 @@ class RestK8sClient:
 
     def list_pods(self, namespace=None):
         return self._list("pods", namespace)
+
+    def list_resourcequotas(self, namespace=None):
+        return self._list("resourcequotas", namespace)
 
     def list_replicasets(self, namespace=None):
         return self._list("replicasets", namespace)
@@ -836,6 +927,15 @@ def collect_namespace(fcu_k8s, namespace, thanos, window, step,
     attach_oom_counts(leaves, merged)
     node = build_namespace_tree(namespace, leaves, merged)
 
+    # Namespace request/limit columns come from the ResourceQuota Hard caps (and
+    # the new *_used columns from its Used counters) rather than the summed pod
+    # specs. Only when a quota exists; otherwise the totals keep the pod-spec
+    # rollup so namespaces without a quota still show their configured totals.
+    lister = getattr(fcu_k8s, "list_resourcequotas", None)
+    quotas = lister(namespace) if lister else []
+    if quotas:
+        apply_quota_to_totals(node["totals"], parse_quota(quotas))
+
     if include_idle:
         present = {(w["kind"], w["name"]) for w in node["workloads"]}
         idle = idle_workload_entries(_declared_workloads(fcu_k8s, namespace),
@@ -856,10 +956,16 @@ CSV_FIELDS = [
     ("workload_kind", "workload_kind"), ("workload", "workload"),
     ("pod", "pod"), ("container", "container"),
     ("cpu_request_cores", "cpu_request"), ("cpu_limit_cores", "cpu_limit"),
-    ("cpu_now_cores", "cpu_now"), ("cpu_peak_cores", "cpu_peak"),
+    ("cpu_now_cores", "cpu_now"),
+    ("cpu_request_used_cores", "cpu_request_used"),
+    ("cpu_limit_used_cores", "cpu_limit_used"),
+    ("cpu_peak_cores", "cpu_peak"),
     ("cpu_avg_cores", "cpu_avg"), ("cpu_peak_util_pct", "cpu_peak_util_pct"),
     ("mem_request_bytes", "mem_request"), ("mem_limit_bytes", "mem_limit"),
-    ("mem_now_bytes", "mem_now"), ("mem_peak_bytes", "mem_peak"),
+    ("mem_now_bytes", "mem_now"),
+    ("mem_request_used_bytes", "mem_request_used"),
+    ("mem_limit_used_bytes", "mem_limit_used"),
+    ("mem_peak_bytes", "mem_peak"),
     ("mem_peak_util_pct", "mem_peak_util_pct"),
     ("oom_count", "oom_count"), ("pod_count", "pod_count"),
     ("container_count", "container_count"),
@@ -892,8 +998,10 @@ NS_CSV_COLUMNS = [h for h, _ in NS_CSV_FIELDS]
 # rendered with its unit inline (200m, 6.3Mi, 4.9%) instead of a raw float. The
 # unit-bearing header suffix (_cores/_bytes) is dropped because the value now
 # carries the unit itself; counts and identity columns pass through unchanged.
-_CPU_METRIC_KEYS = {"cpu_request", "cpu_limit", "cpu_now", "cpu_peak", "cpu_avg"}
-_MEM_METRIC_KEYS = {"mem_request", "mem_limit", "mem_now", "mem_peak"}
+_CPU_METRIC_KEYS = {"cpu_request", "cpu_limit", "cpu_now", "cpu_peak", "cpu_avg",
+                    "cpu_request_used", "cpu_limit_used"}
+_MEM_METRIC_KEYS = {"mem_request", "mem_limit", "mem_now", "mem_peak",
+                    "mem_request_used", "mem_limit_used"}
 _PCT_METRIC_KEYS = {"cpu_peak_util_pct", "mem_peak_util_pct"}
 _HEADER_TO_KEY = dict(CSV_FIELDS)
 
@@ -930,6 +1038,10 @@ def aggregate_totals(totals_list):
     for f in LIMIT_FIELDS:
         agg[f] = sum_limit([t.get(f) for t in totals_list])
     for f in USAGE_FIELDS:
+        agg[f] = sum_usage([t.get(f) for t in totals_list])
+    # Roll up each namespace's quota "Used" counters (sum; None only if every
+    # contributing namespace lacks a quota).
+    for f in QUOTA_USED_FIELDS:
         agg[f] = sum_usage([t.get(f) for t in totals_list])
     agg["cpu_peak_util_pct"] = util_pct(agg["cpu_peak"], agg["cpu_limit"])
     agg["mem_peak_util_pct"] = util_pct(agg["mem_peak"], agg["mem_limit"])
@@ -1130,8 +1242,16 @@ Speicher in **Bytes**, `_pct` = Prozent. Beispiel: `cpu_now_cores=24.5` sind
 - `level`, `stage`, `namespace`, `workload_kind`, `workload`, `pod`, `container`
     — Identität der Zeile (leer, wo für die Ebene nicht zutreffend).
 - `cpu_request_cores` / `cpu_limit_cores` / `mem_request_bytes` / `mem_limit_bytes`
-    — konfigurierte Requests/Limits (aus den Pod-Specs). Leer = irgendwo im Bereich nicht gesetzt/unbegrenzt.
+    — konfigurierte Requests/Limits. Auf Ebene `namespace` (und summiert in `stage`/`cluster`)
+      stammen diese aus der **ResourceQuota** des Namespace (Spalte *Hard* von
+      `requests.cpu`/`limits.cpu`/`requests.memory`/`limits.memory`); auf Ebene
+      `workload`/`pod`/`container` aus den Pod-Specs. Leer = keine Quota bzw. irgendwo
+      nicht gesetzt/unbegrenzt. (Hat ein Namespace keine Quota, bleibt die Summe der Pod-Specs.)
 - `cpu_now_cores` / `mem_now_bytes`   — Nutzung zum Berichtszeitpunkt (CPU = Rate über 5m; Speicher = Working Set).
+- `cpu_request_used_cores` / `cpu_limit_used_cores` / `mem_request_used_bytes` / `mem_limit_used_bytes`
+    — gebuchte Nutzung laut ResourceQuota (Spalte *Used*: was Requests/Limits der laufenden
+      Pods vom Hard-Kontingent belegen). Nur auf Ebene `namespace` gesetzt (in `stage`/`cluster`
+      summiert); auf `workload`/`pod`/`container` leer, da Quotas namespace-weit gelten.
 - `cpu_peak_cores` / `mem_peak_bytes` — Spitzenwert über das Rückblickfenster (--window).
 - `cpu_avg_cores`                     — durchschnittliche CPU über das Fenster.
 - `cpu_peak_util_pct` / `mem_peak_util_pct` — Spitze ÷ Limit, in Prozent (leer, wenn kein Limit).
@@ -1145,22 +1265,28 @@ die Einheiten sind dort dieselben (CPU in Cores, Speicher in Bytes).
 ## Einheiten in `resources-human.csv`, `namespaces-human.csv` und `summary.txt`
 Hier steht die Einheit **direkt am Wert** (statt im Spaltennamen), damit kleine
 Zahlen lesbar bleiben und nicht als `0.000` oder in wissenschaftlicher Notation
-(`5.25e-07`) erscheinen.
+(`5.25e-07`) erscheinen. Außerdem trägt **jeder** CPU-Wert eine Einheit (`c`/`m`/`µ`),
+damit Excel (deutsche Locale) z. B. `18.5` nicht als Datum (18. Mai) oder als
+tausender-gruppierte Zahl interpretiert — `18.5c` bleibt Text. Für Excel daher
+bevorzugt die `*-human.csv` öffnen (die Roh-`resources.csv` enthält bewusst nackte
+Zahlen für die maschinelle Weiterverarbeitung).
 
 ### CPU — Cores mit metrischem Präfix
 Das Präfix verschiebt das Komma; die Buchstaben unterscheiden sich um den Faktor
 1000:
-- (ohne Suffix) = **Cores**, z. B. `24.5` = 24,5 Cores.
+- `c` = **Cores**, z. B. `24.5c` = 24,5 Cores; `1c` = 1 Core.
 - `m` = **Milli** = Tausendstel Core (×10⁻³). Beispiel: `200m` = 0,2 Cores; `1m` = 0,001 Cores.
 - `µ` = **Mikro** = Millionstel Core (×10⁻⁶). Beispiel: `0.525µ` = 0,000000525 Cores; `148µ` = 0,000148 Cores.
 
-Umrechnung: `1` Core = `1000m` = `1 000 000µ`, also **`1m` = `1000µ`**.
+Umrechnung: `1c` = `1000m` = `1 000 000µ`, also **`1m` = `1000µ`**.
 - Cores → Milli: ×1000   (0,2 → `200m`)
 - Cores → Mikro: ×1 000 000   (0,000148 → `148µ`)
 
 Achtung Groß-/Kleinschreibung: `m` (klein) = Milli; `M` (groß) wäre Mega (×10⁶).
 `µ` ist das SI-Zeichen für Mikro. (Kubernetes selbst schreibt Mikro als `u`; diese
-menschenlesbaren Dateien verwenden bewusst das Zeichen `µ`.)
+menschenlesbaren Dateien verwenden bewusst das Zeichen `µ`.) Das `c` steht hier für
+**Cores** (die Basiseinheit), nicht für das SI-Zenti — Zenti-Cores kommen im Bericht
+nicht vor.
 
 Faustregel im Bericht: konfigurierte Limits/Requests liegen meist im Milli-Bereich
 (`100m`, `500m`), die gemessenen Spitzen auf einem fast leeren Cluster im
@@ -1284,17 +1410,23 @@ def _usage_cells(t):
     """Common CPU/mem columns for a totals dict."""
     return [
         fmt_cores(t.get("cpu_request")), fmt_cores(t.get("cpu_limit")),
-        fmt_cores(t.get("cpu_now")), fmt_cores(t.get("cpu_peak")),
+        fmt_cores(t.get("cpu_now")),
+        fmt_cores(t.get("cpu_request_used")), fmt_cores(t.get("cpu_limit_used")),
+        fmt_cores(t.get("cpu_peak")),
         fmt_pct(t.get("cpu_peak_util_pct")),
         fmt_bytes(t.get("mem_request")), fmt_bytes(t.get("mem_limit")),
-        fmt_bytes(t.get("mem_now")), fmt_bytes(t.get("mem_peak")),
+        fmt_bytes(t.get("mem_now")),
+        fmt_bytes(t.get("mem_request_used")), fmt_bytes(t.get("mem_limit_used")),
+        fmt_bytes(t.get("mem_peak")),
         fmt_pct(t.get("mem_peak_util_pct")),
         t.get("oom_count", 0),
     ]
 
 
-_USAGE_HEADERS = ["CPU req", "CPU lim", "CPU now", "CPU peak", "CPU %",
-                  "MEM req", "MEM lim", "MEM now", "MEM peak", "MEM %", "OOM"]
+_USAGE_HEADERS = ["CPU req", "CPU lim", "CPU now",
+                  "CPU req-used", "CPU lim-used", "CPU peak", "CPU %",
+                  "MEM req", "MEM lim", "MEM now",
+                  "MEM req-used", "MEM lim-used", "MEM peak", "MEM %", "OOM"]
 
 
 def render_text(trees, stream, levels=("namespace", "workload", "pod",
