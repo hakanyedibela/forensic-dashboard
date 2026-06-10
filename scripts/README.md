@@ -790,6 +790,14 @@ combined report plus a `by-stage/<stage>/` sub-report per stage, and a
 `cluster` (grand total) → `stage` (per stage) → `namespace` → `workload` → `pod`
 → `container`. CPU is in cores, memory in bytes; see `LEGEND.md` for the rest.
 
+At the `namespace` level (and summed into `stage`/`cluster`), the request/limit
+columns come from the namespace's **ResourceQuota** *Hard* caps, and the
+`*_request_used` / `*_limit_used` columns (next to `*_now`) from its *Used*
+counters — i.e. how much the running pods book against the quota. `workload`/
+`pod`/`container` rows keep their summed pod-spec requests/limits (quotas are
+namespace-scoped, so the `_used` columns are empty there). A namespace without a
+quota falls back to the summed pod specs.
+
 `--date-subdir` gives each run its own dated folder (so a daily run keeps
 history instead of overwriting), and `--retention-days 30` prunes folders older
 than 30 days (only date-named folders are ever removed). The manifest provisions
@@ -829,7 +837,7 @@ the Python step — ask and we can wire that up.
 - Python 3.6.8+ (stdlib only) — runs on the RHEL 8 / OpenShift system `python3`
   as well as the `python:3.12-slim` CronJob image.
 - Local: `oc` or `kubectl` (`--kubectl`) with an active session; RBAC `get`/`list`
-  on pods, replicasets, deployments, statefulsets, daemonsets, and namespaces.
+  on pods, replicasets, deployments, statefulsets, daemonsets, resourcequotas, and namespaces.
   (With `oc` it discovers namespaces via `oc get projects` — the projects you can
   see — matching `fetch-cluster-state-loop.sh`; `kubectl` lists `namespaces`.)
 - In-cluster: the ServiceAccount RBAC from the manifest.

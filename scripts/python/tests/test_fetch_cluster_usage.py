@@ -33,10 +33,10 @@ def test_parse_mem(fcu, s, expected):
 
 @pytest.mark.parametrize("v,expected", [
     (None, "-"),
-    (0, "0"),
-    (0.0, "0"),
-    (24.5, "24.5"),          # >= 1 core -> trimmed decimal
-    (1.0, "1"),
+    (0, "0c"),
+    (0.0, "0c"),
+    (24.5, "24.5c"),         # >= 1 core -> trimmed decimal + 'c' (cores) suffix
+    (1.0, "1c"),
     (0.5, "500m"),           # sub-core -> milli
     (0.1, "100m"),
     (0.0028, "2.8m"),
@@ -45,6 +45,13 @@ def test_parse_mem(fcu, s, expected):
 ])
 def test_fmt_cores(fcu, v, expected):
     assert fcu.fmt_cores(v) == expected
+
+
+def test_fmt_cores_ge_one_carries_unit_not_excel_date(fcu):
+    # A bare '18.5' is read by German-locale Excel as a date; the 'c' suffix
+    # keeps CPU cells textual. Every >=1-core value must end in 'c'.
+    for v in (18.5, 1.2, 10.0, 24.0):
+        assert fcu.fmt_cores(v).endswith("c")
 
 
 def test_fmt_cores_micro_uses_mu_sign(fcu):
@@ -1149,3 +1156,182 @@ def test_write_all_reports_combined_and_by_stage(fcu, tmp_path):
         io.StringIO((tmp_path / "by-stage" / "ref" / "resources.csv").read_text())))
     assert stage_rows[0]["level"] == "stage" and stage_rows[0]["stage"] == "ref"
     assert not any(r["level"] == "cluster" for r in stage_rows)
+
+
+# --- namespace ResourceQuota (Hard caps + Used counters) --------------------
+
+def _quota(hard=None, used=None, name="compute"):
+    return {"metadata": {"name": name, "namespace": "ns1"},
+            "spec": {"hard": hard or {}},
+            "status": {"hard": hard or {}, "used": used or {}}}
+
+
+def test_parse_quota_hard_and_used(fcu):
+    q = fcu.parse_quota([_quota(
+        hard={"requests.cpu": "5", "limits.cpu": "10",
+              "requests.memory": "10Gi", "limits.memory": "20Gi"},
+        used={"requests.cpu": "1", "limits.cpu": "6",
+              "requests.memory": "2Gi", "limits.memory": "4Gi"})])
+    assert q["cpu_request_hard"] == pytest.approx(5.0)
+    assert q["cpu_limit_hard"] == pytest.approx(10.0)
+    assert q["mem_request_hard"] == 10 * 1024**3
+    assert q["mem_limit_hard"] == 20 * 1024**3
+    assert q["cpu_request_used"] == pytest.approx(1.0)
+    assert q["cpu_limit_used"] == pytest.approx(6.0)
+    assert q["mem_request_used"] == 2 * 1024**3
+    assert q["mem_limit_used"] == 4 * 1024**3
+
+
+def test_parse_quota_accepts_bare_cpu_memory_aliases(fcu):
+    # `cpu`/`memory` are the legacy aliases for requests.cpu / requests.memory.
+    q = fcu.parse_quota([_quota(hard={"cpu": "2", "memory": "4Gi"},
+                                used={"cpu": "500m", "memory": "1Gi"})])
+    assert q["cpu_request_hard"] == pytest.approx(2.0)
+    assert q["mem_request_hard"] == 4 * 1024**3
+    assert q["cpu_request_used"] == pytest.approx(0.5)
+    assert q["mem_request_used"] == 1024**3
+
+
+def test_parse_quota_empty_is_all_none(fcu):
+    q = fcu.parse_quota([])
+    assert all(v is None for v in q.values())
+    assert set(q) == {
+        "cpu_request_hard", "cpu_limit_hard", "mem_request_hard",
+        "mem_limit_hard", "cpu_request_used", "cpu_limit_used",
+        "mem_request_used", "mem_limit_used"}
+
+
+def test_parse_quota_multiple_takes_min_hard_max_used(fcu):
+    # Two quotas capping limits.cpu: the binding Hard is the smaller cap.
+    q = fcu.parse_quota([
+        _quota(hard={"limits.cpu": "10"}, used={"limits.cpu": "6"}, name="a"),
+        _quota(hard={"limits.cpu": "4"}, used={"limits.cpu": "6"}, name="b")])
+    assert q["cpu_limit_hard"] == pytest.approx(4.0)
+    assert q["cpu_limit_used"] == pytest.approx(6.0)
+
+
+def test_apply_quota_to_totals_overrides_and_recomputes_util(fcu):
+    totals = fcu.rollup([_leaf(cpu_limit=0.2, cpu_peak=2.0,
+                               mem_limit=128 * 1024**2, mem_peak=1024**3)])
+    q = fcu.parse_quota([_quota(
+        hard={"requests.cpu": "5", "limits.cpu": "10",
+              "requests.memory": "8Gi", "limits.memory": "16Gi"},
+        used={"requests.cpu": "1", "limits.cpu": "6",
+              "requests.memory": "2Gi", "limits.memory": "4Gi"})])
+    fcu.apply_quota_to_totals(totals, q)
+    assert totals["cpu_limit"] == pytest.approx(10.0)      # Hard, not pod 0.2
+    assert totals["cpu_request"] == pytest.approx(5.0)
+    assert totals["cpu_limit_used"] == pytest.approx(6.0)
+    assert totals["mem_request_used"] == 2 * 1024**3
+    # peak-util% recomputed against the Hard limit (2.0 / 10 = 20%)
+    assert totals["cpu_peak_util_pct"] == pytest.approx(20.0)
+    # measured usage is untouched
+    assert totals["cpu_peak"] == pytest.approx(2.0)
+
+
+class QuotaFakeK8s:
+    def __init__(self, pods=None, quotas=None):
+        self._pods = pods or []
+        self._quotas = quotas or []
+
+    def list_pods(self, namespace=None):
+        return self._pods
+
+    def list_replicasets(self, namespace=None):
+        return []
+
+    def list_resourcequotas(self, namespace=None):
+        return self._quotas
+
+
+def test_collect_namespace_uses_quota_for_namespace_totals(fcu):
+    pods = [{
+        "metadata": {"name": "web-1", "namespace": "ns1", "labels": {}},
+        "spec": {"nodeName": "n1", "containers": [
+            {"name": "web", "resources": {
+                "requests": {"cpu": "50m", "memory": "64Mi"},
+                "limits": {"cpu": "200m", "memory": "128Mi"}}}]},
+        "status": {"containerStatuses": []},
+    }]
+    quotas = [_quota(
+        hard={"requests.cpu": "5", "limits.cpu": "10",
+              "requests.memory": "10Gi", "limits.memory": "20Gi"},
+        used={"requests.cpu": "1", "limits.cpu": "6",
+              "requests.memory": "2Gi", "limits.memory": "4Gi"})]
+    node = fcu.collect_namespace(QuotaFakeK8s(pods=pods, quotas=quotas), "ns1",
+                                 thanos=None, window="24h", step="5m")
+    t = node["totals"]
+    # namespace request/limit columns come from the quota Hard caps
+    assert t["cpu_limit"] == pytest.approx(10.0)
+    assert t["cpu_request"] == pytest.approx(5.0)
+    assert t["mem_limit"] == 20 * 1024**3
+    # the new Used columns are populated from the quota Used counters
+    assert t["cpu_limit_used"] == pytest.approx(6.0)
+    assert t["cpu_request_used"] == pytest.approx(1.0)
+    assert t["mem_request_used"] == 2 * 1024**3
+    # container level is unchanged (still the pod-spec value, not the quota)
+    leaf = node["workloads"][0]["pods"][0]["containers"][0]
+    assert leaf["cpu_limit"] == pytest.approx(0.2)
+    assert leaf.get("cpu_limit_used") is None
+
+
+def test_collect_namespace_no_quota_keeps_pod_spec_totals(fcu):
+    pods = [{
+        "metadata": {"name": "web-1", "namespace": "ns1", "labels": {}},
+        "spec": {"nodeName": "n1", "containers": [
+            {"name": "web", "resources": {
+                "limits": {"cpu": "200m", "memory": "128Mi"}}}]},
+        "status": {"containerStatuses": []},
+    }]
+    node = fcu.collect_namespace(QuotaFakeK8s(pods=pods, quotas=[]), "ns1",
+                                 thanos=None, window="24h", step="5m")
+    # no quota -> namespace totals stay the summed pod specs
+    assert node["totals"]["cpu_limit"] == pytest.approx(0.2)
+    assert node["totals"]["cpu_limit_used"] is None
+
+
+def test_cli_list_resourcequotas_args(fcu):
+    seen = []
+    client = fcu.CliK8sClient(
+        binary="oc", run=lambda a: (seen.append(a) or '{"items": []}'))
+    client.list_resourcequotas("ns1")
+    assert seen[0] == ["get", "resourcequotas", "-n", "ns1", "-o", "json"]
+
+
+def test_rest_list_resourcequotas_url(fcu):
+    seen = {}
+    client = fcu.RestK8sClient(host="https://k8s:6443", token="t",
+                               get_json=lambda url: (seen.update(url=url) or
+                                                     {"items": []}))
+    client.list_resourcequotas("ns1")
+    assert seen["url"] == "https://k8s:6443/api/v1/namespaces/ns1/resourcequotas"
+
+
+def test_aggregate_totals_sums_quota_used(fcu):
+    # stage/cluster roll-ups sum the per-namespace quota Used counters.
+    t1 = fcu.rollup([_leaf()])
+    t2 = fcu.rollup([_leaf()])
+    t1["cpu_limit_used"], t2["cpu_limit_used"] = 6.0, 4.0
+    t1["mem_request_used"], t2["mem_request_used"] = 1024**3, 1024**3
+    agg = fcu.aggregate_totals([t1, t2])
+    assert agg["cpu_limit_used"] == pytest.approx(10.0)
+    assert agg["mem_request_used"] == 2 * 1024**3
+
+
+def test_csv_has_quota_used_columns_next_to_now(fcu):
+    cols = fcu.CSV_COLUMNS
+    for col in ("cpu_request_used_cores", "cpu_limit_used_cores",
+                "mem_request_used_bytes", "mem_limit_used_bytes"):
+        assert col in cols
+    # the new CPU used columns sit between cpu_now and cpu_peak
+    assert (cols.index("cpu_now_cores") < cols.index("cpu_request_used_cores")
+            < cols.index("cpu_limit_used_cores") < cols.index("cpu_peak_cores"))
+    assert (cols.index("mem_now_bytes") < cols.index("mem_request_used_bytes")
+            < cols.index("mem_limit_used_bytes") < cols.index("mem_peak_bytes"))
+
+
+def test_usage_headers_have_used_columns(fcu):
+    for h in ("CPU req-used", "CPU lim-used", "MEM req-used", "MEM lim-used"):
+        assert h in fcu._USAGE_HEADERS
+    hs = fcu._USAGE_HEADERS
+    assert hs.index("CPU now") < hs.index("CPU req-used") < hs.index("CPU peak")
