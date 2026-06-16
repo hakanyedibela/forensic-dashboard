@@ -236,7 +236,8 @@ def rollup(leaves):
 
 def _qualifies(peak, current_limit, frac):
     """A resource qualifies for a recommendation when it has no current limit
-    (unbounded -> always) or its peak exceeds `frac` of the current limit."""
+    (unbounded -> always) or its peak exceeds `frac` of the current limit.
+    `frac` is the utilisation threshold as a fraction in (0, 1]."""
     if current_limit is None:
         return True
     return peak > frac * current_limit
@@ -248,6 +249,9 @@ def compute_recommendation(totals, target_util=80.0):
     where frac = target_util/100. Returns a dict with keys cpu_request_rec,
     cpu_limit_rec, mem_request_rec, mem_limit_rec — each None when that resource
     has no peak or is not hot."""
+    if not 0.0 < target_util <= 100.0:
+        raise ValueError(
+            f"target_util must be in (0, 100], got {target_util!r}")
     frac = target_util / 100.0
     rec = {"cpu_request_rec": None, "cpu_limit_rec": None,
            "mem_request_rec": None, "mem_limit_rec": None}
