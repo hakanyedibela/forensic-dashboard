@@ -234,6 +234,36 @@ def rollup(leaves):
     return agg
 
 
+def _qualifies(peak, current_limit, frac):
+    """A resource qualifies for a recommendation when it has no current limit
+    (unbounded -> always) or its peak exceeds `frac` of the current limit."""
+    if current_limit is None:
+        return True
+    return peak > frac * current_limit
+
+
+def compute_recommendation(totals, target_util=80.0):
+    """Recommended request/limit for one workload's `totals`, restricted to
+    'hot' resources. request = round_up(peak); limit = round_up(peak / frac)
+    where frac = target_util/100. Returns a dict with keys cpu_request_rec,
+    cpu_limit_rec, mem_request_rec, mem_limit_rec — each None when that resource
+    has no peak or is not hot."""
+    frac = target_util / 100.0
+    rec = {"cpu_request_rec": None, "cpu_limit_rec": None,
+           "mem_request_rec": None, "mem_limit_rec": None}
+
+    cpu_peak = totals.get("cpu_peak")
+    if cpu_peak is not None and _qualifies(cpu_peak, totals.get("cpu_limit"), frac):
+        rec["cpu_request_rec"] = round_up_cpu_10m(cpu_peak)
+        rec["cpu_limit_rec"] = round_up_cpu_10m(cpu_peak / frac)
+
+    mem_peak = totals.get("mem_peak")
+    if mem_peak is not None and _qualifies(mem_peak, totals.get("mem_limit"), frac):
+        rec["mem_request_rec"] = round_up_mem_mi(mem_peak)
+        rec["mem_limit_rec"] = round_up_mem_mi(mem_peak / frac)
+    return rec
+
+
 # ----------------------------------------------------------------- OOM merge
 
 def _oom_key(o):

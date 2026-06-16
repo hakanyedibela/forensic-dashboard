@@ -1361,3 +1361,48 @@ def test_round_up_cpu_10m(fcu, cores, expected):
 ])
 def test_round_up_mem_mi(fcu, b, expected):
     assert fcu.round_up_mem_mi(b) == expected
+
+
+def test_compute_recommendation_cpu_hot(fcu):
+    # peak 0.9 cores, current limit 1.0 -> 90% > 80% -> qualifies.
+    totals = {"cpu_peak": 0.9, "cpu_limit": 1.0, "mem_peak": None, "mem_limit": None}
+    rec = fcu.compute_recommendation(totals, target_util=80.0)
+    assert rec["cpu_request_rec"] == pytest.approx(0.9, abs=1e-9)   # round_up(0.9)=0.90
+    # limit = 0.9 / 0.8 = 1.125 -> round up to 10m -> 1.13
+    assert rec["cpu_limit_rec"] == pytest.approx(1.13, abs=1e-9)
+    # peak as % of new limit must be <= target
+    assert 0.9 / rec["cpu_limit_rec"] * 100 <= 80.0 + 1e-9
+    assert rec["mem_request_rec"] is None and rec["mem_limit_rec"] is None
+
+
+def test_compute_recommendation_cpu_cold_skipped(fcu):
+    # peak 0.5 of limit 1.0 -> 50% <= 80% -> does NOT qualify.
+    totals = {"cpu_peak": 0.5, "cpu_limit": 1.0, "mem_peak": None, "mem_limit": None}
+    rec = fcu.compute_recommendation(totals, target_util=80.0)
+    assert all(v is None for v in rec.values())
+
+
+def test_compute_recommendation_per_resource(fcu):
+    # CPU cold, MEM hot -> only MEM filled.
+    mi = 1024 * 1024
+    totals = {"cpu_peak": 0.1, "cpu_limit": 1.0,
+              "mem_peak": 95 * mi, "mem_limit": 100 * mi}
+    rec = fcu.compute_recommendation(totals, target_util=80.0)
+    assert rec["cpu_request_rec"] is None and rec["cpu_limit_rec"] is None
+    assert rec["mem_request_rec"] == 95 * mi                      # round_up(95Mi)
+    # 95Mi / 0.8 = 118.75Mi -> round up to 119Mi
+    assert rec["mem_limit_rec"] == 119 * mi
+
+
+def test_compute_recommendation_unbounded_no_limit(fcu):
+    # peak present, no current limit -> always qualifies.
+    totals = {"cpu_peak": 0.3, "cpu_limit": None, "mem_peak": None, "mem_limit": None}
+    rec = fcu.compute_recommendation(totals, target_util=80.0)
+    assert rec["cpu_request_rec"] == pytest.approx(0.3, abs=1e-9)
+    assert rec["cpu_limit_rec"] == pytest.approx(0.38, abs=1e-9)  # 0.375 -> 0.38
+
+
+def test_compute_recommendation_no_peak(fcu):
+    totals = {"cpu_peak": None, "cpu_limit": 1.0, "mem_peak": None, "mem_limit": None}
+    rec = fcu.compute_recommendation(totals, target_util=80.0)
+    assert all(v is None for v in rec.values())
