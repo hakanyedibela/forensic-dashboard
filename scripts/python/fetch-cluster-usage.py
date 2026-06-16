@@ -268,6 +268,50 @@ def compute_recommendation(totals, target_util=80.0):
     return rec
 
 
+# base field -> the matching recommendation key in compute_recommendation output.
+_REC_BASES = {"cpu_request": "cpu_request_rec", "cpu_limit": "cpu_limit_rec",
+              "mem_request": "mem_request_rec", "mem_limit": "mem_limit_rec"}
+
+
+def _quota_status(total, quota):
+    """no-quota when the namespace has no cap; EXCEEDS when the summed
+    recommendation is above the cap; OK otherwise (including nothing to place)."""
+    if quota is None:
+        return "no-quota"
+    if total is None:
+        return "OK"
+    return "EXCEEDS" if total > quota else "OK"
+
+
+def namespace_recommendation_summary(node, target_util=80.0):
+    """Per-namespace gate: for each workload use the recommended value where the
+    resource is hot, else its current configured value; sum per dimension
+    (unset contributors skipped) and compare to the namespace quota hard cap.
+    Returns stage/namespace, per-dimension *_rec_sum / *_quota / *_status, and
+    an overall quota_action (INCREASE_QUOTA if any dimension EXCEEDS, else OK)."""
+    collected = {base: [] for base in _REC_BASES}
+    for wl in node["workloads"]:
+        rec = compute_recommendation(wl["totals"], target_util)
+        for base, rkey in _REC_BASES.items():
+            val = rec[rkey]
+            if val is None:
+                val = wl["totals"].get(base)   # cold/no-peak -> keep current
+            collected[base].append(val)
+
+    result = {"stage": node["stage"], "namespace": node["namespace"]}
+    exceeds = False
+    for base in _REC_BASES:
+        total = sum_usage(collected[base])     # skip None contributors
+        quota = node["totals"].get(base)
+        status = _quota_status(total, quota)
+        result[base + "_rec_sum"] = total
+        result[base + "_quota"] = quota
+        result[base + "_status"] = status
+        exceeds = exceeds or status == "EXCEEDS"
+    result["quota_action"] = "INCREASE_QUOTA" if exceeds else "OK"
+    return result
+
+
 # ----------------------------------------------------------------- OOM merge
 
 def _oom_key(o):
