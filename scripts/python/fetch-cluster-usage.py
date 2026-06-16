@@ -8,6 +8,7 @@ import argparse
 import atexit
 import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -109,6 +110,24 @@ def fmt_bytes(n):
 def fmt_pct(v):
     """Percentage float -> '95.0%'. None -> '-'."""
     return "-" if v is None else f"{v:.1f}%"
+
+
+def round_up_cpu_10m(cores):
+    """Round CPU cores UP to the next 10 millicores (0.01 cores). None -> None.
+    An exact multiple is left unchanged (the 1e-9 nudge absorbs float noise so
+    100m does not creep to 110m)."""
+    if cores is None:
+        return None
+    return math.ceil(cores * 1000.0 / 10.0 - 1e-9) * 10 / 1000.0
+
+
+def round_up_mem_mi(b):
+    """Round bytes UP to the next Mi (1048576 bytes). None -> None. Exact
+    multiples unchanged."""
+    if b is None:
+        return None
+    mi = 1024 * 1024
+    return math.ceil(b / mi - 1e-9) * mi
 
 
 # ------------------------------------------------------------ stage detection

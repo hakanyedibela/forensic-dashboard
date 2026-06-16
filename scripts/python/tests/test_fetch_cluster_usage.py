@@ -1335,3 +1335,31 @@ def test_usage_headers_have_used_columns(fcu):
         assert h in fcu._USAGE_HEADERS
     hs = fcu._USAGE_HEADERS
     assert hs.index("CPU now") < hs.index("CPU req-used") < hs.index("CPU peak")
+
+
+import math as _math  # noqa: F401  (sanity that math import path works)
+
+
+@pytest.mark.parametrize("cores,expected", [
+    (0.10, 0.10),          # exact 100m stays 100m (no spurious bump)
+    (0.101, 0.11),         # 101m -> next 10m = 110m
+    (0.1001, 0.11),        # just over 100m -> 110m
+    (0.0, 0.0),
+    (None, None),
+])
+def test_round_up_cpu_10m(fcu, cores, expected):
+    got = fcu.round_up_cpu_10m(cores)
+    if expected is None:
+        assert got is None
+    else:
+        assert got == pytest.approx(expected, abs=1e-9)
+
+
+@pytest.mark.parametrize("b,expected", [
+    (1024 * 1024, 1024 * 1024),            # exact 1Mi stays 1Mi
+    (1024 * 1024 + 1, 2 * 1024 * 1024),    # just over 1Mi -> 2Mi
+    (0, 0),
+    (None, None),
+])
+def test_round_up_mem_mi(fcu, b, expected):
+    assert fcu.round_up_mem_mi(b) == expected
