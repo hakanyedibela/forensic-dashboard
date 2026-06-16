@@ -301,7 +301,12 @@ def namespace_recommendation_summary(node, target_util=80.0):
     result = {"stage": node["stage"], "namespace": node["namespace"]}
     exceeds = False
     for base in _REC_BASES:
-        total = sum_usage(collected[base])     # skip None contributors
+        # sum_usage (not sum_limit): a workload with neither a recommendation
+        # nor a configured value contributes None and is skipped, rather than
+        # blanking the whole namespace total. This is deliberately optimistic —
+        # a single fully-unspecified workload should not hide the rest of the
+        # namespace's footprint from the quota check.
+        total = sum_usage(collected[base])
         quota = node["totals"].get(base)
         status = _quota_status(total, quota)
         result[base + "_rec_sum"] = total
