@@ -5,17 +5,33 @@ Component: `scripts/python/fetch-cluster-usage.py`
 
 ## Goal
 
-For every workload, recommend new `cpu_request` / `cpu_limit` and
-`mem_request` / `mem_limit` values sized from the observed peak usage, so that
-the measured `cpu_peak` and `mem_peak` never exceed **80%** of the new limit
-(20% headroom). Then verify, per namespace, that the **sum** of the
-recommended values still fits inside the namespace ResourceQuota. When the sum
+For workloads that are currently **hot** — whose measured `cpu_peak` or
+`mem_peak` already exceeds **80%** of their current limit — recommend new
+`cpu_request` / `cpu_limit` and `mem_request` / `mem_limit` values sized from
+the observed peak, so that the peak no longer exceeds **80%** of the new limit
+(20% headroom). Workloads that already sit at or below 80% are **not**
+recommended (the report only surfaces at-risk workloads). Then verify, per
+namespace, that the **sum** of the resulting values (recommended for hot
+resources, current configured for the rest) still fits inside the namespace
+ResourceQuota. When the sum
 would exceed the quota, the report must make it clearly visible that the
 namespace quota has to be increased **before** the recommendations can be
 applied.
 
 ## Locked decisions
 
+- **Qualification filter (per resource, independent for CPU and MEM):** a
+  resource is recommended only when its current peak exceeds the target % of
+  its **current** limit, i.e. `peak > (target_util/100) * current_limit`.
+  A resource at or below the target is left blank. A workload appears in the
+  per-workload report only if it qualifies on at least one resource; if both
+  CPU and MEM are at/below target, the workload is omitted entirely.
+  - **Unbounded resource:** a resource that has a peak but **no current limit**
+    has no headroom guarantee and cannot be expressed as a % of a limit — it is
+    treated as **qualifying** (always recommended).
+  - A resource with **no peak** cannot exceed the threshold, so it never
+    qualifies (this subsumes the missing-peak handling: such columns stay
+    blank, and a both-peaks-missing workload is omitted).
 - **Limit formula:** `limit = ceil_up(peak / 0.80)`. This places `peak` at
   exactly 80% (or just under, after rounding up) of the new limit.
 - **Request formula:** `request = peak` (1.0×). CPU bursts into the headroom;
@@ -23,11 +39,9 @@ applied.
 - **Rounding (always UP, so peak stays ≤ 80%):** CPU rounded up to the nearest
   **10 millicores** (0.01 cores); memory rounded up to the nearest **Mi**
   (1048576 bytes).
-- **Missing peak:** per-resource. If a workload has `cpu_peak` but no
-  `mem_peak`, fill the CPU recommendation columns and leave the memory columns
-  blank (and vice-versa). Skip the workload row entirely only when **both**
-  peaks are missing.
 - **Headroom target is configurable** via `--recommend-util` (default `80`).
+  The same `target_util` value is used both for the qualification threshold and
+  for the limit sizing.
 - **Quota check basis:** compare summed recommendations against the namespace
   ResourceQuota on **both requests and limits** (CPU and memory). Flag the
   namespace if **any** of the four dimensions exceeds its quota.
@@ -57,10 +71,14 @@ def compute_recommendation(totals: dict, target_util: float = 80.0) -> dict:
     (each float|int or None when the corresponding peak is absent)."""
 ```
 
-`compute_recommendation` reads `cpu_peak` / `mem_peak` from a workload's
-`totals`. For each resource that has a peak:
+`compute_recommendation` reads `cpu_peak` / `mem_peak` and the current
+`cpu_limit` / `mem_limit` from a workload's `totals`. For each resource it
+first applies the **qualification filter**: the resource qualifies when it has
+a peak AND (`current_limit is None` OR `peak > (target_util/100) *
+current_limit`). For a qualifying resource:
 `request = round_up(peak)`, `limit = round_up(peak / (target_util/100))`.
-The resource's columns are `None` when its peak is `None`.
+A non-qualifying resource's columns are `None`. When neither resource
+qualifies, the caller omits the workload from the per-workload report.
 
 ### Namespace gate
 
@@ -95,7 +113,7 @@ def namespace_recommendation_summary(ns_node, target_util) -> dict:
 
 All written to the output dir and each `by-stage/<stage>/` folder.
 
-### 1. `recommendations.csv` — one row per workload (both-peaks-missing skipped)
+### 1. `recommendations.csv` — one row per qualifying (hot) workload
 
 Columns:
 ```
@@ -106,7 +124,8 @@ mem_peak_bytes, mem_request_cur_bytes, mem_limit_cur_bytes,
 mem_request_rec_bytes, mem_limit_rec_bytes
 ```
 Current values are included so old-vs-new is visible in one row. Recommendation
-cells are blank for a resource whose peak is missing.
+cells are blank for a resource that does not qualify (at/below target, or no
+peak). Only workloads qualifying on at least one resource appear.
 
 ### 2. `recommendations-namespaces.csv` — one row per namespace (quota gate)
 
@@ -133,11 +152,13 @@ suffixes (as the existing human CSVs do).
 ### 5. `recommendations.txt` — human-readable, styled like `summary.txt`
 
 Per namespace:
-- A workload table: `WORKLOAD | CPU peak | CPU req cur→rec | CPU lim cur→rec |
-  MEM peak | MEM req cur→rec | MEM lim cur→rec`.
-- A **NAMESPACE QUOTA CHECK** block: summed recommendation vs quota per
-  dimension, with a prominent `>>> INCREASE QUOTA FIRST <<<` marker when
-  `quota_action = INCREASE_QUOTA`.
+- A workload table listing only the qualifying (hot) workloads:
+  `WORKLOAD | CPU peak | CPU req cur→rec | CPU lim cur→rec | MEM peak |
+  MEM req cur→rec | MEM lim cur→rec`. A namespace with no hot workloads shows
+  a short "no workloads over target" line instead of an empty table.
+- A **NAMESPACE QUOTA CHECK** block: summed value (recommended for hot
+  resources, current for the rest) vs quota per dimension, with a prominent
+  `>>> INCREASE QUOTA FIRST <<<` marker when `quota_action = INCREASE_QUOTA`.
 
 ## CLI
 
@@ -148,22 +169,30 @@ Per namespace:
 
 ## Edge cases
 
-- **All peaks missing (current sample data):** `recommendations.csv` /
-  `-human.csv` and `recommendations.txt` workload sections come out empty
-  (header only / no workload rows). The namespace gate falls back entirely to
-  current configured request/limit, so `recommendations-namespaces.csv` still
-  reports a meaningful quota comparison.
+- **All peaks missing (current sample data):** nothing qualifies, so
+  `recommendations.csv` / `-human.csv` and `recommendations.txt` workload
+  sections come out empty (header only / no workload rows). The namespace gate
+  falls back entirely to current configured request/limit, so
+  `recommendations-namespaces.csv` still reports a meaningful quota comparison
+  (current totals vs quota).
+- **No hot workloads but usage data present:** same as above — empty
+  per-workload report, namespace gate reflects current vs quota.
+- **Unbounded resource (peak but no current limit):** always qualifies; a
+  recommended limit is produced from the peak.
 - **Namespace without quota:** all four statuses `no-quota`, `quota_action`
   `OK`, never flagged.
-- **Idle / zero-pod workloads:** no peak → skipped in the per-workload CSV;
-  their current configured request/limit still counts toward the namespace sum
-  only if they carry configured values.
+- **Idle / zero-pod workloads:** no peak → never qualify, omitted from the
+  per-workload report; their current configured request/limit still counts
+  toward the namespace sum only if they carry configured values.
 
 ## Testing
 
 Unit tests (in `scripts/python/tests/`):
 - `compute_recommendation`: formula correctness; rounding-up keeps
-  `peak ≤ target_util%` of the limit; partial-peak (CPU-only / MEM-only);
+  `peak ≤ target_util%` of the limit; **qualification filter** — resource at
+  or below target → None; resource above target → recommended; per-resource
+  independence (CPU hot, MEM cold → CPU only); unbounded resource (peak, no
+  limit) → recommended; both at/below target → all-None (workload omitted);
   both-missing → all-None.
 - `round_up_cpu_10m` / `round_up_mem_mi`: boundary values round up, exact
   multiples unchanged.
