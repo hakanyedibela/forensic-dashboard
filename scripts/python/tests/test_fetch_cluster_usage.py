@@ -1420,3 +1420,66 @@ def test_qualifies_boundary(fcu, peak, limit, frac, expected):
 def test_compute_recommendation_rejects_bad_target(fcu):
     with pytest.raises(ValueError):
         fcu.compute_recommendation({"cpu_peak": 0.9, "cpu_limit": 1.0}, target_util=0.0)
+
+
+def _ns_node(workloads, quota):
+    """Build a minimal namespace node: workloads is a list of totals dicts;
+    quota is the namespace totals carrying the ResourceQuota hard caps."""
+    return {
+        "stage": "test", "namespace": "ns-x",
+        "workloads": [{"kind": "Deployment", "name": f"w{i}", "totals": t}
+                      for i, t in enumerate(workloads)],
+        "totals": quota,
+    }
+
+
+def test_namespace_summary_exceeds(fcu):
+    # One hot CPU workload: peak 0.9/limit 1.0 -> limit_rec 1.13; quota cpu_limit 1.0.
+    node = _ns_node(
+        [{"cpu_peak": 0.9, "cpu_limit": 1.0, "cpu_request": 0.5,
+          "mem_peak": None, "mem_limit": None, "mem_request": None}],
+        {"cpu_request": 1.0, "cpu_limit": 1.0,
+         "mem_request": None, "mem_limit": None})
+    s = fcu.namespace_recommendation_summary(node, target_util=80.0)
+    assert s["cpu_limit_rec_sum"] == pytest.approx(1.13, abs=1e-9)
+    assert s["cpu_limit_status"] == "EXCEEDS"
+    assert s["quota_action"] == "INCREASE_QUOTA"
+
+
+def test_namespace_summary_ok(fcu):
+    # Hot workload but quota is generous.
+    node = _ns_node(
+        [{"cpu_peak": 0.9, "cpu_limit": 1.0, "cpu_request": 0.5,
+          "mem_peak": None, "mem_limit": None, "mem_request": None}],
+        {"cpu_request": 10.0, "cpu_limit": 10.0,
+         "mem_request": None, "mem_limit": None})
+    s = fcu.namespace_recommendation_summary(node, target_util=80.0)
+    assert s["cpu_limit_status"] == "OK"
+    assert s["quota_action"] == "OK"
+
+
+def test_namespace_summary_no_quota(fcu):
+    node = _ns_node(
+        [{"cpu_peak": 0.9, "cpu_limit": 1.0, "cpu_request": 0.5,
+          "mem_peak": None, "mem_limit": None, "mem_request": None}],
+        {"cpu_request": None, "cpu_limit": None,
+         "mem_request": None, "mem_limit": None})
+    s = fcu.namespace_recommendation_summary(node, target_util=80.0)
+    assert s["cpu_limit_status"] == "no-quota"
+    assert s["quota_action"] == "OK"
+
+
+def test_namespace_summary_mixed_fallback(fcu):
+    # w0 is cold -> falls back to its current cpu_limit (0.2);
+    # w1 is hot -> uses recommended cpu_limit (0.9/0.8=1.125 -> 1.13).
+    # sum = 0.2 + 1.13 = 1.33 > quota 1.0 -> EXCEEDS.
+    node = _ns_node(
+        [{"cpu_peak": 0.05, "cpu_limit": 0.2, "cpu_request": 0.1,
+          "mem_peak": None, "mem_limit": None, "mem_request": None},
+         {"cpu_peak": 0.9, "cpu_limit": 1.0, "cpu_request": 0.5,
+          "mem_peak": None, "mem_limit": None, "mem_request": None}],
+        {"cpu_request": 5.0, "cpu_limit": 1.0,
+         "mem_request": None, "mem_limit": None})
+    s = fcu.namespace_recommendation_summary(node, target_util=80.0)
+    assert s["cpu_limit_rec_sum"] == pytest.approx(1.33, abs=1e-9)
+    assert s["cpu_limit_status"] == "EXCEEDS"
