@@ -1483,3 +1483,19 @@ def test_namespace_summary_mixed_fallback(fcu):
     s = fcu.namespace_recommendation_summary(node, target_util=80.0)
     assert s["cpu_limit_rec_sum"] == pytest.approx(1.33, abs=1e-9)
     assert s["cpu_limit_status"] == "EXCEEDS"
+    assert s["quota_action"] == "INCREASE_QUOTA"
+
+
+def test_namespace_summary_memory_exceeds(fcu):
+    # Hot memory workload: peak 95Mi / limit 100Mi -> 95% > 80% -> mem_limit_rec
+    # = 95Mi/0.8 = 118.75Mi -> 119Mi; namespace mem_limit quota 100Mi -> EXCEEDS.
+    mi = 1024 * 1024
+    node = _ns_node(
+        [{"cpu_peak": None, "cpu_limit": None, "cpu_request": None,
+          "mem_peak": 95 * mi, "mem_limit": 100 * mi, "mem_request": 60 * mi}],
+        {"cpu_request": None, "cpu_limit": None,
+         "mem_request": 1000 * mi, "mem_limit": 100 * mi})
+    s = fcu.namespace_recommendation_summary(node, target_util=80.0)
+    assert s["mem_limit_rec_sum"] == 119 * mi
+    assert s["mem_limit_status"] == "EXCEEDS"
+    assert s["quota_action"] == "INCREASE_QUOTA"
