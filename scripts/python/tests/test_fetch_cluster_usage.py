@@ -1406,3 +1406,17 @@ def test_compute_recommendation_no_peak(fcu):
     totals = {"cpu_peak": None, "cpu_limit": 1.0, "mem_peak": None, "mem_limit": None}
     rec = fcu.compute_recommendation(totals, target_util=80.0)
     assert all(v is None for v in rec.values())
+
+
+@pytest.mark.parametrize("peak,limit,frac,expected", [
+    (0.8, 1.0, 0.8, False),    # exactly at threshold -> not hot (strict >)
+    (0.81, 1.0, 0.8, True),    # just over threshold -> hot
+    (0.5, None, 0.8, True),    # no current limit -> always qualifies
+])
+def test_qualifies_boundary(fcu, peak, limit, frac, expected):
+    assert fcu._qualifies(peak, limit, frac) is expected
+
+
+def test_compute_recommendation_rejects_bad_target(fcu):
+    with pytest.raises(ValueError):
+        fcu.compute_recommendation({"cpu_peak": 0.9, "cpu_limit": 1.0}, target_util=0.0)
