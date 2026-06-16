@@ -1337,13 +1337,10 @@ def test_usage_headers_have_used_columns(fcu):
     assert hs.index("CPU now") < hs.index("CPU req-used") < hs.index("CPU peak")
 
 
-import math as _math  # noqa: F401  (sanity that math import path works)
-
-
 @pytest.mark.parametrize("cores,expected", [
     (0.10, 0.10),          # exact 100m stays 100m (no spurious bump)
     (0.101, 0.11),         # 101m -> next 10m = 110m
-    (0.1001, 0.11),        # just over 100m -> 110m
+    (0.001, 0.01),         # 1m -> next 10m = 10m
     (0.0, 0.0),
     (None, None),
 ])
@@ -1358,6 +1355,7 @@ def test_round_up_cpu_10m(fcu, cores, expected):
 @pytest.mark.parametrize("b,expected", [
     (1024 * 1024, 1024 * 1024),            # exact 1Mi stays 1Mi
     (1024 * 1024 + 1, 2 * 1024 * 1024),    # just over 1Mi -> 2Mi
+    (1, 1024 * 1024),                       # sub-Mi positive -> 1Mi
     (0, 0),
     (None, None),
 ])
