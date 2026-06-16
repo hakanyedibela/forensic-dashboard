@@ -1254,6 +1254,87 @@ def render_namespaces_human_csv(trees, stream):
         writer.writerow(row)
 
 
+# (csv header, source key) for the per-workload recommendation CSV. Current
+# (cur) values sit beside the recommended (rec) ones so old-vs-new is one row.
+REC_FIELDS = [
+    ("stage", "stage"), ("namespace", "namespace"),
+    ("workload_kind", "workload_kind"), ("workload", "workload"),
+    ("cpu_peak_cores", "cpu_peak"),
+    ("cpu_request_cur_cores", "cpu_request"),
+    ("cpu_limit_cur_cores", "cpu_limit"),
+    ("cpu_request_rec_cores", "cpu_request_rec"),
+    ("cpu_limit_rec_cores", "cpu_limit_rec"),
+    ("mem_peak_bytes", "mem_peak"),
+    ("mem_request_cur_bytes", "mem_request"),
+    ("mem_limit_cur_bytes", "mem_limit"),
+    ("mem_request_rec_bytes", "mem_request_rec"),
+    ("mem_limit_rec_bytes", "mem_limit_rec"),
+]
+REC_COLUMNS = [h for h, _ in REC_FIELDS]
+REC_HUMAN_COLUMNS = [_human_header(h) for h, _ in REC_FIELDS]
+
+_REC_CPU_KEYS = {"cpu_peak", "cpu_request", "cpu_limit",
+                 "cpu_request_rec", "cpu_limit_rec"}
+_REC_MEM_KEYS = {"mem_peak", "mem_request", "mem_limit",
+                 "mem_request_rec", "mem_limit_rec"}
+
+
+def _rec_human(key, value):
+    """Format one recommendation cell with its unit (cores/bytes); identity
+    strings pass through."""
+    if key in _REC_CPU_KEYS:
+        return fmt_cores(value)
+    if key in _REC_MEM_KEYS:
+        return fmt_bytes(value)
+    return "" if value is None else value
+
+
+def recommendation_rows(trees, target_util=80.0):
+    """One dict per qualifying (hot) workload, keyed by REC_FIELDS source keys.
+    A workload is included only if it qualifies on at least one resource."""
+    rows = []
+    for node in sorted(trees, key=lambda n: (n["stage"], n["namespace"])):
+        for wl in node["workloads"]:
+            rec = compute_recommendation(wl["totals"], target_util)
+            if all(v is None for v in rec.values()):
+                continue
+            t = wl["totals"]
+            rows.append({
+                "stage": node["stage"], "namespace": node["namespace"],
+                "workload_kind": wl["kind"], "workload": wl["name"],
+                "cpu_peak": t.get("cpu_peak"),
+                "cpu_request": t.get("cpu_request"),
+                "cpu_limit": t.get("cpu_limit"),
+                "cpu_request_rec": rec["cpu_request_rec"],
+                "cpu_limit_rec": rec["cpu_limit_rec"],
+                "mem_peak": t.get("mem_peak"),
+                "mem_request": t.get("mem_request"),
+                "mem_limit": t.get("mem_limit"),
+                "mem_request_rec": rec["mem_request_rec"],
+                "mem_limit_rec": rec["mem_limit_rec"],
+            })
+    return rows
+
+
+def render_recommendations_csv(trees, stream, target_util=80.0):
+    """Per-workload recommendation CSV (only hot workloads; raw numbers)."""
+    writer = csv.DictWriter(stream, fieldnames=REC_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for row in recommendation_rows(trees, target_util):
+        writer.writerow({h: ("" if row.get(k) is None else row.get(k))
+                         for h, k in REC_FIELDS})
+
+
+def render_recommendations_human_csv(trees, stream, target_util=80.0):
+    """Human-readable twin: same rows, each metric formatted with its unit."""
+    writer = csv.DictWriter(stream, fieldnames=REC_HUMAN_COLUMNS,
+                            extrasaction="ignore")
+    writer.writeheader()
+    for row in recommendation_rows(trees, target_util):
+        writer.writerow({_human_header(h): _rec_human(k, row.get(k))
+                         for h, k in REC_FIELDS})
+
+
 def render_ooms_csv(trees, stream):
     cols = ["stage", "namespace", "pod", "container", "source", "oom_events",
             "restart_count", "exit_code", "finished_at"]

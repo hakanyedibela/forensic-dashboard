@@ -1499,3 +1499,56 @@ def test_namespace_summary_memory_exceeds(fcu):
     assert s["mem_limit_rec_sum"] == 119 * mi
     assert s["mem_limit_status"] == "EXCEEDS"
     assert s["quota_action"] == "INCREASE_QUOTA"
+
+
+def _hot_cpu_tree():
+    # Complete enough for write_report_files (resources.csv / summary.txt need
+    # workloads[*]["pods"] and node totals counts) as well as the rec renderers.
+    return [{
+        "stage": "test", "namespace": "ns-x",
+        "totals": {"cpu_request": 5.0, "cpu_limit": 5.0,
+                   "mem_request": None, "mem_limit": None,
+                   "pod_count": 2, "container_count": 2, "oom_count": 0},
+        "workloads": [
+            {"kind": "Deployment", "name": "hot", "pods": [], "totals":
+                {"cpu_peak": 0.9, "cpu_limit": 1.0, "cpu_request": 0.5,
+                 "mem_peak": None, "mem_limit": None, "mem_request": None}},
+            {"kind": "Deployment", "name": "cold", "pods": [], "totals":
+                {"cpu_peak": 0.1, "cpu_limit": 1.0, "cpu_request": 0.5,
+                 "mem_peak": None, "mem_limit": None, "mem_request": None}},
+        ],
+        "ooms": [],
+    }]
+
+
+def test_render_recommendations_csv_only_hot(fcu):
+    buf = io.StringIO()
+    fcu.render_recommendations_csv(_hot_cpu_tree(), buf, target_util=80.0)
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    assert [r["workload"] for r in rows] == ["hot"]          # cold omitted
+    assert rows[0]["cpu_limit_rec_cores"] == "1.13"
+    assert rows[0]["mem_limit_rec_bytes"] == ""              # no mem peak -> blank
+
+
+def test_render_recommendations_csv_empty_when_no_peaks(fcu):
+    tree = [{
+        "stage": "test", "namespace": "ns-x",
+        "totals": {"cpu_request": None, "cpu_limit": None,
+                   "mem_request": None, "mem_limit": None},
+        "workloads": [{"kind": "Deployment", "name": "w", "totals":
+            {"cpu_peak": None, "cpu_limit": 1.0, "cpu_request": 0.5,
+             "mem_peak": None, "mem_limit": None, "mem_request": None}}],
+        "ooms": [],
+    }]
+    buf = io.StringIO()
+    fcu.render_recommendations_csv(tree, buf, target_util=80.0)
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    assert rows == []                                        # header only
+
+
+def test_render_recommendations_human_csv_units(fcu):
+    buf = io.StringIO()
+    fcu.render_recommendations_human_csv(_hot_cpu_tree(), buf, target_util=80.0)
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    assert rows[0]["cpu_limit_rec"] == "1.13c"              # cores formatted
+    assert rows[0]["cpu_peak"] == "900m"
