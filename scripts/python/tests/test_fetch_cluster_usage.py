@@ -1552,3 +1552,73 @@ def test_render_recommendations_human_csv_units(fcu):
     rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
     assert rows[0]["cpu_limit_rec"] == "1.13c"              # cores formatted
     assert rows[0]["cpu_peak"] == "900m"
+
+
+# --- recommendations wired into stdout --format and the report files ----------
+
+def test_format_choice_recommendations_accepted(fcu):
+    a = fcu.build_parser().parse_args(["--format", "recommendations",
+                                       "--format", "recommendations-human"])
+    assert a.format == ["recommendations", "recommendations-human"]
+
+
+def test_render_stdout_formats_recommendations(fcu):
+    buf = io.StringIO()
+    fcu.render_stdout_formats(_hot_cpu_tree(), ["recommendations"], buf,
+                              window="7d", cluster="c1", levels=("namespace",))
+    out = buf.getvalue()
+    assert "cpu_limit_rec_cores" in out.splitlines()[0]
+    rows = list(_csv.DictReader(io.StringIO(out)))
+    assert [r["workload"] for r in rows] == ["hot"]          # cold omitted
+    assert rows[0]["cpu_limit_rec_cores"] == "1.13"
+
+
+def test_render_stdout_formats_recommendations_human(fcu):
+    buf = io.StringIO()
+    fcu.render_stdout_formats(_hot_cpu_tree(), ["recommendations-human"], buf,
+                              window="7d", cluster="c1", levels=("namespace",))
+    out = buf.getvalue()
+    assert "1.13c" in out                                    # cores formatted
+    assert "e-" not in out                                   # no sci notation
+
+
+def test_render_stdout_formats_recommendations_honours_target_util(fcu):
+    buf = io.StringIO()
+    fcu.render_stdout_formats(_hot_cpu_tree(), ["recommendations"], buf,
+                              window="7d", cluster="c1", levels=("namespace",),
+                              target_util=50.0)
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    assert rows[0]["cpu_limit_rec_cores"] == "1.8"           # 0.9 / 0.5
+
+
+def test_target_util_flag_default_is_80(fcu):
+    assert fcu.build_parser().parse_args([]).target_util == 80.0
+
+
+def test_target_util_flag_parses(fcu):
+    assert fcu.build_parser().parse_args(["--target-util", "70"]).target_util == 70.0
+
+
+def test_write_report_files_writes_recommendations_csvs(fcu, tmp_path):
+    fcu.write_report_files(_hot_cpu_tree(), str(tmp_path / "r"),
+                           window="7d", cluster="c1")
+    raw = tmp_path / "r" / "recommendations.csv"
+    human = tmp_path / "r" / "recommendations-human.csv"
+    assert raw.exists() and human.exists()
+    rows = list(_csv.DictReader(io.StringIO(raw.read_text())))
+    assert [r["workload"] for r in rows] == ["hot"]          # cold omitted
+    assert rows[0]["cpu_limit_rec_cores"] == "1.13"
+    assert "1.13c" in human.read_text()
+
+
+def test_write_report_files_recommendations_honour_target_util(fcu, tmp_path):
+    fcu.write_report_files(_hot_cpu_tree(), str(tmp_path / "r"),
+                           window="7d", cluster="c1", target_util=50.0)
+    rows = list(_csv.DictReader(
+        io.StringIO((tmp_path / "r" / "recommendations.csv").read_text())))
+    assert rows[0]["cpu_limit_rec_cores"] == "1.8"
+
+
+def test_legend_documents_recommendations(fcu):
+    assert "recommendations.csv" in fcu.LEGEND_TEXT
+    assert "recommendations-human.csv" in fcu.LEGEND_TEXT
