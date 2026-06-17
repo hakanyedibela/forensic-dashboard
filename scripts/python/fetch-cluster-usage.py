@@ -1360,7 +1360,8 @@ def render_json(trees, stream, window, cluster, summaries=True):
     stream.write("\n")
 
 
-def render_stdout_formats(trees, formats, stream, window, cluster, levels):
+def render_stdout_formats(trees, formats, stream, window, cluster, levels,
+                          target_util=80.0):
     """Write each requested --format to a single stream (stdout). Lets every
     on-disk view also be produced without --output-dir, e.g. piped:
     `... --format resources-human | column -s, -t`. 'none' suppresses stdout
@@ -1377,6 +1378,10 @@ def render_stdout_formats(trees, formats, stream, window, cluster, levels):
         render_resources_human_csv(trees, stream)
     if "namespaces-human" in formats:
         render_namespaces_human_csv(trees, stream)
+    if "recommendations" in formats:
+        render_recommendations_csv(trees, stream, target_util=target_util)
+    if "recommendations-human" in formats:
+        render_recommendations_human_csv(trees, stream, target_util=target_util)
 
 
 # ----------------------------------------------------- persisting to disk/PVC
@@ -1400,6 +1405,8 @@ Erzeugt von scripts/python/fetch-cluster-usage.py.
 - `resources-human.csv` — dieselben Zeilen wie `resources.csv`, aber jeder Wert mit Einheit (z. B. `200m`, `6.3Mi`, `4.9%`) statt Rohzahl; CPU-Mikrowerte als `µ` (z. B. `0.525µ`).
 - `namespaces.csv` — kompakte Übersicht: genau eine Zeile pro Namespace (Summe: verbraucht vs. limitiert), ohne Workload-/Pod-/Container-Details.
 - `namespaces-human.csv` — dieselben Zeilen wie `namespaces.csv`, aber jeder Wert mit Einheit (z. B. `200m`, `6.3Mi`, `4.9%`) statt Rohzahl.
+- `recommendations.csv` — Empfehlung zum Right-Sizing: eine Zeile pro **heißem** Workload (Spitze nahe/über dem Limit), aktuelle Werte neben den empfohlenen. Rohzahlen.
+- `recommendations-human.csv` — dieselben Zeilen wie `recommendations.csv`, aber jeder Wert mit Einheit (z. B. `200m`, `1.13c`, `6.3Mi`) statt Rohzahl.
 - `ooms.csv`       — eine Zeile pro OOM-getötetem Container.
 - `summary.txt`    — menschenlesbare Tabelle (CPU in Cores/Milli, Speicher in Ki/Mi/Gi, % und OOM-Anzahl) — dieselben Zahlen wie die CSVs, nur kompakt formatiert.
 - `report.json`   — dieselben Daten verschachtelt (Namespace → Workload → Pod → Container) plus Aggregationen.
@@ -1484,6 +1491,25 @@ Mikro-Bereich (`76.8µ`).
 `_pct`-Werte (z. B. `4.9%`) sind Spitze ÷ Limit × 100 — unverändert gegenüber den
 Roh-CSVs.
 
+## recommendations.csv Spalten
+Right-Sizing-Vorschlag pro Workload, abgeleitet aus dem Spitzenverbrauch über
+das Fenster (--window). Enthält **nur heiße** Workloads: ein Workload erscheint,
+wenn seine CPU- **oder** Speicher-Spitze kein Limit hat (unbegrenzt) oder die
+Zielauslastung überschreitet — ruhige Workloads werden weggelassen. Die
+Empfehlung pro Dimension: `request = aufgerundet(Spitze)`,
+`limit = aufgerundet(Spitze ÷ target_util)`, mit `target_util` = `--target-util`/100
+(Standard 80 %). CPU wird auf 10 Millicores, Speicher auf Mebibyte aufgerundet.
+- `stage`, `namespace`, `workload_kind`, `workload` — Identität des Workloads.
+- `cpu_peak_cores` / `mem_peak_bytes` — gemessene Spitze über das Fenster (Basis der Empfehlung).
+- `cpu_request_cur_cores` / `cpu_limit_cur_cores` / `mem_request_cur_bytes` / `mem_limit_cur_bytes`
+    — die **aktuell** konfigurierten Requests/Limits (`cur`), leer wenn nicht gesetzt.
+- `cpu_request_rec_cores` / `cpu_limit_rec_cores` / `mem_request_rec_bytes` / `mem_limit_rec_bytes`
+    — die **empfohlenen** Werte (`rec`). Leer, wenn diese Dimension nicht heiß ist
+      (also keine Änderung nötig). `cur` und `rec` stehen nebeneinander, damit
+      alt-vs-neu in einer Zeile vergleichbar ist.
+In `recommendations-human.csv` tragen alle Werte ihre Einheit (CPU `c`/`m`/`µ`,
+Speicher `Ki`/`Mi`/`Gi`) — siehe Einheiten-Abschnitt oben.
+
 ## ooms.csv Spalten
 - `stage`, `namespace`, `pod`, `container` — welcher Container OOM erlitten hat.
 - `source`        — `live` (aktueller Pod-Zustand), `thanos` (historisch) oder `both`.
@@ -1504,10 +1530,10 @@ def write_legend(out_dir):
 
 
 def write_report_files(trees, out_dir, window, cluster,
-                       summary_kinds=("cluster", "stage")):
+                       summary_kinds=("cluster", "stage"), target_util=80.0):
     """Write resources.csv, ooms.csv, report.json and LEGEND.md into out_dir
     (created if needed). summary_kinds selects which rollup rows the CSV/JSON
-    carry. Returns out_dir."""
+    carry. target_util drives the recommendation CSVs. Returns out_dir."""
     os.makedirs(out_dir, exist_ok=True)
     # Explicit UTF-8 everywhere: the *-human.csv / summary.txt carry the µ sign
     # (and summary.txt an em dash), which would raise UnicodeEncodeError under a
@@ -1522,6 +1548,12 @@ def write_report_files(trees, out_dir, window, cluster,
     with open(os.path.join(out_dir, "namespaces-human.csv"), "w",
               encoding="utf-8") as f:
         render_namespaces_human_csv(trees, f)
+    with open(os.path.join(out_dir, "recommendations.csv"), "w",
+              encoding="utf-8") as f:
+        render_recommendations_csv(trees, f, target_util=target_util)
+    with open(os.path.join(out_dir, "recommendations-human.csv"), "w",
+              encoding="utf-8") as f:
+        render_recommendations_human_csv(trees, f, target_util=target_util)
     with open(os.path.join(out_dir, "ooms.csv"), "w", encoding="utf-8") as f:
         render_ooms_csv(trees, f)
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
@@ -1534,15 +1566,17 @@ def write_report_files(trees, out_dir, window, cluster,
     return out_dir
 
 
-def write_all_reports(trees, out_dir, window, cluster):
+def write_all_reports(trees, out_dir, window, cluster, target_util=80.0):
     """Combined report (cluster + per-stage rollups) at out_dir, plus a
     self-contained per-stage report under out_dir/by-stage/<stage>/."""
     write_report_files(trees, out_dir, window, cluster,
-                       summary_kinds=("cluster", "stage"))
+                       summary_kinds=("cluster", "stage"),
+                       target_util=target_util)
     for stage, stage_nodes in sorted(group_by_stage(trees).items()):
         write_report_files(stage_nodes,
                            os.path.join(out_dir, "by-stage", stage),
-                           window, cluster, summary_kinds=("stage",))
+                           window, cluster, summary_kinds=("stage",),
+                           target_util=target_util)
     return out_dir
 
 
@@ -1727,12 +1761,19 @@ def build_parser():
                      help="Comma list of text levels (default: all).")
     out.add_argument("--format", action="append",
                      choices=["text", "json", "csv", "resources-human",
-                              "namespaces-human", "none"],
+                              "namespaces-human", "recommendations",
+                              "recommendations-human", "none"],
                      help="stdout format(s), repeatable (default: text). "
                           "'csv' = raw resources.csv; 'resources-human' / "
                           "'namespaces-human' = the unit-formatted CSVs; "
+                          "'recommendations' / 'recommendations-human' = the "
+                          "per-workload right-sizing CSV (raw / unit-formatted); "
                           "'none' = no stdout (pair with --output-dir to only "
                           "write files).")
+    out.add_argument("--target-util", type=float, default=80.0,
+                     metavar="PCT",
+                     help="Target peak utilisation %% for recommendations: "
+                          "limit = peak / (PCT/100) (default: 80).")
     out.add_argument("--output-dir",
                      help="Also write resources.csv, ooms.csv, report.json.")
     out.add_argument("--date-subdir", action="store_true",
@@ -1831,13 +1872,15 @@ def main(argv=None):
     levels = tuple(s.strip() for s in args.level.split(",") if s.strip())
     cluster = os.environ.get("KUBERNETES_SERVICE_HOST", "local")
     render_stdout_formats(trees, formats, sys.stdout, window=args.window,
-                          cluster=cluster, levels=levels)
+                          cluster=cluster, levels=levels,
+                          target_util=args.target_util)
 
     if args.output_dir:
         now = datetime.now(timezone.utc)
         target = (dated_output_dir(args.output_dir, now)
                   if args.date_subdir else args.output_dir)
-        write_all_reports(trees, target, args.window, cluster)
+        write_all_reports(trees, target, args.window, cluster,
+                          target_util=args.target_util)
         sys.stderr.write(f"wrote reports to {target} "
                          f"(combined + by-stage/, see LEGEND.md)\n")
         if args.date_subdir and args.retention_days > 0:
