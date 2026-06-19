@@ -100,11 +100,11 @@ patch:                       # strategic-merge body, applied verbatim
             resources:
               requests: {cpu: "250m", memory: "200Mi"}
               limits:   {cpu: "320m", memory: "256Mi"}
-current:                     # informational only; not applied
-  web:
-    requests: {cpu: "250m", memory: "200Mi"}
-    limits:   {cpu: "250m", memory: "200Mi"}
 ```
+
+The old→new summary lives in the per-document header comment (above
+`apiVersion`); there is no separate `current` block in the document body — the
+manifest stays lean and the applier only ever reads `target` and `patch`.
 
 Notes:
 - `target.kind` / `name` / `namespace` come from the workload node
@@ -116,8 +116,6 @@ Notes:
   the paired non-hot value is emitted at its current value so the merge does
   not leave an unpaired request/limit. A dimension with no current value and no
   recommendation is omitted.
-- `current` mirrors the live configured values per container for human review;
-  the applier never reads it.
 
 #### Quota guard (skip + warn)
 
@@ -152,8 +150,8 @@ Per document, build argv:
   surprises) and passed via `--patch`.
 - **Dry-run (default):** `--dry-run=server` is included. The API server
   validates against the live object (schema, admission, quota). Print, per
-  workload, the `old→new` summary (from the doc's header comment / `current`
-  vs `patch`) and the kubectl result line.
+  workload, the `old→new` summary (from the doc's header comment) and the
+  kubectl result line.
 - **Execute (`--execute`):** same call without `--dry-run`. Print
   applied/failed per workload and a final summary. Exit non-zero if any patch
   failed.
