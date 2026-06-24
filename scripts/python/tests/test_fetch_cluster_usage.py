@@ -1622,3 +1622,152 @@ def test_write_report_files_recommendations_honour_target_util(fcu, tmp_path):
 def test_legend_documents_recommendations(fcu):
     assert "recommendations.csv" in fcu.LEGEND_TEXT
     assert "recommendations-human.csv" in fcu.LEGEND_TEXT
+
+
+# --- namespace storage quota (per-storageclass requests.storage) ------------
+
+_SC = "storageclass.storage.k8s.io/requests.storage"
+
+
+def test_parse_storage_quota_classes_and_bytes(fcu):
+    s = fcu.parse_storage_quota([_quota(
+        hard={f"block-silver.{_SC}": "100Gi", f"file-gold.{_SC}": "10Gi",
+              "requests.cpu": "5"},
+        used={f"block-silver.{_SC}": "0", f"file-gold.{_SC}": "5Gi"})])
+    assert s["block-silver"]["hard"] == 100 * 1024**3
+    assert s["block-silver"]["used"] == 0
+    assert s["file-gold"]["hard"] == 10 * 1024**3
+    assert s["file-gold"]["used"] == 5 * 1024**3
+    # non-storage quota keys are ignored
+    assert "requests.cpu" not in s
+
+
+def test_parse_storage_quota_empty(fcu):
+    assert fcu.parse_storage_quota([]) == {}
+    assert fcu.parse_storage_quota(None) == {}
+
+
+def test_parse_storage_quota_min_hard_max_used(fcu):
+    # across multiple quotas: smallest hard cap binds, largest used books
+    s = fcu.parse_storage_quota([
+        _quota(hard={f"file-silver.{_SC}": "50Gi"},
+               used={f"file-silver.{_SC}": "10Gi"}),
+        _quota(hard={f"file-silver.{_SC}": "20Gi"},
+               used={f"file-silver.{_SC}": "12Gi"})])
+    assert s["file-silver"]["hard"] == 20 * 1024**3
+    assert s["file-silver"]["used"] == 12 * 1024**3
+
+
+def test_parse_storage_quota_noobaa_dotted_class(fcu):
+    s = fcu.parse_storage_quota([_quota(
+        hard={f"openshift-storage.noobaa.io.{_SC}": "1Ti"})])
+    assert s["openshift-storage.noobaa.io"]["hard"] == 1024**4
+
+
+def test_collect_namespace_populates_storage(fcu):
+    pods = [{
+        "metadata": {"name": "web-1", "namespace": "ns1", "labels": {}},
+        "spec": {"nodeName": "n1", "containers": [
+            {"name": "web", "resources": {}}]},
+        "status": {"containerStatuses": []},
+    }]
+    quotas = [_quota(hard={f"file-gold.{_SC}": "10Gi"},
+                     used={f"file-gold.{_SC}": "3Gi"})]
+    node = fcu.collect_namespace(QuotaFakeK8s(pods=pods, quotas=quotas), "ns1",
+                                 thanos=None, window="24h", step="5m")
+    assert node["storage"]["file-gold"]["hard"] == 10 * 1024**3
+    assert node["storage"]["file-gold"]["used"] == 3 * 1024**3
+
+
+def test_collect_namespace_storage_defaults_empty(fcu):
+    pods = [{
+        "metadata": {"name": "web-1", "namespace": "ns1", "labels": {}},
+        "spec": {"nodeName": "n1", "containers": [{"name": "web",
+                                                   "resources": {}}]},
+        "status": {"containerStatuses": []},
+    }]
+    node = fcu.collect_namespace(QuotaFakeK8s(pods=pods, quotas=[]), "ns1",
+                                 thanos=None, window="24h", step="5m")
+    assert node["storage"] == {}
+
+
+def _storage_node(namespace, stage, storage):
+    return {"namespace": namespace, "stage": stage,
+            "totals": {"pod_count": 0, "container_count": 0, "oom_count": 0},
+            "workloads": [], "ooms": [], "storage": storage}
+
+
+def test_storage_rows_one_per_namespace_missing_is_zero(fcu):
+    trees = [
+        _storage_node("pid-b", "test", {"file-gold": {"used": 5, "hard": 10}}),
+        _storage_node("pid-a", "test", {}),
+    ]
+    rows = fcu.storage_rows(trees)
+    # sorted by (stage, namespace)
+    assert [r["namespace"] for r in rows] == ["pid-a", "pid-b"]
+    # every canonical class present, absent -> 0 (dense matrix)
+    for cls in fcu.STORAGE_CLASSES:
+        assert rows[0][f"{cls}_used"] == 0
+        assert rows[0][f"{cls}_hard"] == 0
+    assert rows[1]["file-gold_used"] == 5
+    assert rows[1]["file-gold_hard"] == 10
+
+
+def test_storage_classes_union_surfaces_unknown_class(fcu):
+    trees = [_storage_node("ns1", "test",
+                           {"surprise-class": {"used": 1, "hard": 2}})]
+    classes = fcu.storage_classes_in(trees)
+    assert classes[:len(fcu.STORAGE_CLASSES)] == fcu.STORAGE_CLASSES
+    assert "surprise-class" in classes  # appended, not dropped
+
+
+def test_render_storage_csv_header_and_values(fcu):
+    trees = [_storage_node("ns1", "test",
+                           {"block-silver": {"used": 0, "hard": 100 * 1024**3}})]
+    buf = io.StringIO()
+    fcu.render_storage_csv(trees, buf)
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    assert "block-silver_used_bytes" in rows[0]
+    assert "block-silver_hard_bytes" in rows[0]
+    assert rows[0]["block-silver_hard_bytes"] == str(100 * 1024**3)
+    assert rows[0]["block-silver_used_bytes"] == "0"
+    assert rows[0]["namespace"] == "ns1"
+
+
+def test_render_storage_human_csv_formats_bytes(fcu):
+    trees = [_storage_node("ns1", "test",
+                           {"file-gold": {"used": 0, "hard": 10 * 1024**3}})]
+    buf = io.StringIO()
+    fcu.render_storage_human_csv(trees, buf)
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    # header drops the _bytes suffix, values carry the unit inline
+    assert "file-gold_hard" in rows[0]
+    assert "file-gold_hard_bytes" not in rows[0]
+    assert rows[0]["file-gold_hard"] == "10.0Gi"
+    assert rows[0]["file-gold_used"] == "0.0B"   # 0 stays 0, not '-'
+
+
+def test_stdout_format_storage(fcu):
+    trees = [_storage_node("ns1", "test",
+                           {"file-gold": {"used": 0, "hard": 1024}})]
+    buf = io.StringIO()
+    fcu.render_stdout_formats(trees, ["storage"], buf, window="24h",
+                              cluster="c", levels=["namespace"])
+    assert "file-gold_used_bytes" in buf.getvalue()
+    buf2 = io.StringIO()
+    fcu.render_stdout_formats(trees, ["storage-human"], buf2, window="24h",
+                              cluster="c", levels=["namespace"])
+    assert "file-gold_hard" in buf2.getvalue()
+
+
+def test_write_report_files_includes_storage(fcu, tmp_path):
+    trees = [_storage_node("ns1", "test",
+                           {"file-gold": {"used": 0, "hard": 1024}})]
+    fcu.write_report_files(trees, str(tmp_path), window="24h", cluster="c")
+    assert (tmp_path / "storage.csv").exists()
+    assert (tmp_path / "storage-human.csv").exists()
+
+
+def test_legend_documents_storage(fcu):
+    assert "storage.csv" in fcu.LEGEND_TEXT
+    assert "storage-human.csv" in fcu.LEGEND_TEXT
