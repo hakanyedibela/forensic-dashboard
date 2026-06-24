@@ -1,5 +1,6 @@
 import io
 import json
+import sys
 
 
 def _patch_doc(ns="ns1", kind="Deployment", name="web"):
@@ -122,3 +123,21 @@ def test_load_manifest_roundtrip(apprec, tmp_path):
     path.write_text(json.dumps(_manifest([_patch_doc()])))
     m = apprec.load_manifest(str(path))
     assert m["patches"][0]["name"] == "web"
+
+
+# --- subprocess_runner (real subprocess, Python 3.6-compatible kwargs) -------
+
+def test_subprocess_runner_captures_output(apprec):
+    # Exercises the real subprocess.run call path (the injected-runner tests
+    # bypass it). Guards against re-introducing capture_output/text=, which are
+    # Python 3.7+ and break on the RHEL 8 / OpenShift system python3 (3.6).
+    rc, out, err = apprec.subprocess_runner(
+        [sys.executable, "-c", "import sys; print('hi'); sys.stderr.write('e')"])
+    assert rc == 0
+    assert out.strip() == "hi"          # stdout captured as text
+    assert err.strip() == "e"           # stderr captured as text
+
+
+def test_subprocess_runner_nonzero_exit(apprec):
+    rc, out, err = apprec.subprocess_runner([sys.executable, "-c", "import sys; sys.exit(3)"])
+    assert rc == 3
