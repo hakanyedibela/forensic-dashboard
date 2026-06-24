@@ -136,11 +136,15 @@ dimensions exceed (`*_status == "EXCEEDS"`) with their sum vs quota.
 
 ### 2. Applier — `scripts/python/apply-recommendations.py`
 
-Standalone script. Parses the multi-doc YAML, iterates the `ResourcePatch`
-documents, shells out to `kubectl` (or `oc`).
+Standalone script. Reads the machine-readable **JSON sidecar**
+(`recommendations-apply.json`) with the stdlib `json` module — **no PyYAML
+dependency** — iterates the `ResourcePatch` entries, and shells out to `kubectl`
+(or `oc`). The `recommendations-apply.yaml` stays the human-reviewable artifact;
+the renderer emits both from one `build_apply_plan` model so they never drift.
 
 CLI:
-- `--manifest PATH` (required) — path to `recommendations-apply.yaml`.
+- `--manifest PATH` — path to `recommendations-apply.json` (default:
+  `recommendations-apply.json` in the working directory).
 - `--execute` — perform real changes. Absent ⇒ dry-run only.
 - `--context NAME` — kube context (passed as `--context`).
 - `--oc` — use the `oc` binary instead of `kubectl`.
@@ -173,16 +177,19 @@ Per document, build argv:
 
 The applier shells out (subprocess) to kubectl/oc rather than using a
 Kubernetes client library, matching the repo's existing kubectl/oc-driven
-scripts. It is a locally-run dev tool (not the in-cluster CronJob), so it may
-use **PyYAML** (`yaml.safe_load_all`) to parse the manifest; it fails with a
-clear message if PyYAML is absent. The patch body is re-serialized to JSON
-(stdlib `json`) for the `--patch` argument (JSON is valid input to
-`kubectl patch` and avoids shell-quoting pitfalls).
+scripts. It is **stdlib-only** like the rest of the pipeline: it reads the JSON
+sidecar with `json.load` (no PyYAML), so it runs in any fresh shell without a
+`pip install`. The patch body is serialized to JSON (stdlib `json`) for the
+`--patch` argument (JSON is valid input to `kubectl patch` and avoids
+shell-quoting pitfalls).
 
 ## Output files
 
-- `recommendations-apply.yaml` — added to the output dir and every
-  `by-stage/<stage>/` folder, alongside the existing recommendation files.
+- `recommendations-apply.yaml` — human-reviewable patch manifest, added to the
+  output dir and every `by-stage/<stage>/` folder, alongside the existing
+  recommendation files.
+- `recommendations-apply.json` — machine-readable sidecar (same patches),
+  consumed by `apply-recommendations.py`. Written next to the YAML.
 
 ## Edge cases
 
