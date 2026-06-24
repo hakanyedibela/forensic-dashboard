@@ -50,8 +50,13 @@ def _is_not_found(stdout, stderr):
 
 
 def subprocess_runner(argv):
-    """Default runner: run argv, return (returncode, stdout, stderr)."""
-    proc = subprocess.run(argv, capture_output=True, text=True)
+    """Default runner: run argv, return (returncode, stdout, stderr).
+
+    Uses stdout/stderr=PIPE + universal_newlines rather than capture_output /
+    text (which are Python 3.7+) so the script runs on the RHEL 8 / OpenShift
+    system python3 (3.6.8), matching the rest of the repo's 3.6.8+ target."""
+    proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          universal_newlines=True)
     return proc.returncode, proc.stdout, proc.stderr
 
 
