@@ -1965,3 +1965,39 @@ def test_stdout_format_recommendations_apply(fcu):
 def test_legend_documents_apply_manifest(fcu):
     assert "recommendations-apply.yaml" in fcu.LEGEND_TEXT
     assert "apply-recommendations.py" in fcu.LEGEND_TEXT
+
+
+# --- apply manifests collected into a single apply/ folder ------------------
+
+def _apply_ns(fcu, name, stage):
+    leaves = [_cleaf("web", cpu_peak=0.9, cpu_limit=1.0, cpu_request=0.5,
+                     mem_peak=50 * MI, mem_limit=128 * MI, mem_request=64 * MI)]
+    wl = _wl_with_containers(fcu, "Deployment", "web", leaves)
+    return {"stage": stage, "namespace": name,
+            "totals": {"cpu_request": 10.0, "cpu_limit": 10.0,
+                       "mem_request": 100 * 1024**3, "mem_limit": 100 * 1024**3,
+                       "pod_count": 1, "container_count": 1, "oom_count": 0},
+            "workloads": [wl], "ooms": [], "storage": {}}
+
+
+def test_write_apply_manifests_folder(fcu, tmp_path):
+    trees = [_apply_ns(fcu, "pid-1-app-test-01", "test"),
+             _apply_ns(fcu, "pid-2-app-prod-01", "prod")]
+    fcu.write_apply_manifests(trees, str(tmp_path / "apply"))
+    apply = tmp_path / "apply"
+    # combined (all stages) + one pair per stage
+    for f in ("all.yaml", "all.json", "test.yaml", "test.json",
+              "prod.yaml", "prod.json"):
+        assert (apply / f).exists(), f
+    allobj = json.loads((apply / "all.json").read_text())
+    assert {p["namespace"] for p in allobj["patches"]} == {
+        "pid-1-app-test-01", "pid-2-app-prod-01"}
+    prodobj = json.loads((apply / "prod.json").read_text())
+    assert [p["namespace"] for p in prodobj["patches"]] == ["pid-2-app-prod-01"]
+
+
+def test_write_all_reports_includes_apply_folder(fcu, tmp_path):
+    trees = [_apply_ns(fcu, "pid-1-app-test-01", "test")]
+    fcu.write_all_reports(trees, str(tmp_path), window="24h", cluster="c")
+    assert (tmp_path / "apply" / "all.json").exists()
+    assert (tmp_path / "apply" / "test.json").exists()

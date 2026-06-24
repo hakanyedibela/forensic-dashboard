@@ -1773,6 +1773,7 @@ Erzeugt von scripts/python/fetch-cluster-usage.py.
 - `summary.txt`    — menschenlesbare Tabelle (CPU in Cores/Milli, Speicher in Ki/Mi/Gi, % und OOM-Anzahl) — dieselben Zahlen wie die CSVs, nur kompakt formatiert.
 - `report.json`   — dieselben Daten verschachtelt (Namespace → Workload → Pod → Container) plus Aggregationen.
 - `by-stage/<stage>/` — (im obersten Ordner) dieselben Dateien, beschränkt auf eine Stage.
+- `apply/` — (im obersten Ordner) sammelt **nur** die Apply-Manifeste an einem Ort, damit `apply-recommendations.py` nicht jeden `by-stage/`-Ordner durchsuchen muss: `all.yaml`/`all.json` (alle Namespaces zusammen) plus je Stage ein `<stage>.yaml`/`<stage>.json` (für einen gestaffelten Rollout — erst test, dann prod).
 
 ## resources.csv — die Spalte `level` sagt, was jede Zeile aggregiert
 - `cluster`   — Gesamtsumme über alle Namespaces im Bericht.
@@ -1986,9 +1987,33 @@ def write_report_files(trees, out_dir, window, cluster,
     return out_dir
 
 
+def write_apply_manifest_pair(trees, path_noext, target_util=80.0):
+    """Write `<path_noext>.yaml` + `<path_noext>.json` apply manifests for
+    `trees` (the human-reviewable YAML and the applier's JSON sidecar)."""
+    with open(path_noext + ".yaml", "w", encoding="utf-8") as f:
+        render_recommendations_apply_yaml(trees, f, target_util=target_util)
+    with open(path_noext + ".json", "w", encoding="utf-8") as f:
+        render_recommendations_apply_json(trees, f, target_util=target_util)
+
+
+def write_apply_manifests(trees, apply_dir, target_util=80.0):
+    """Collect every recommendations-apply manifest into one folder so
+    apply-recommendations.py never has to hunt through by-stage/. Writes
+    `all.{yaml,json}` (the full set across all namespaces) plus one
+    `<stage>.{yaml,json}` per stage for a staged rollout (apply test first, then
+    prod). Returns apply_dir."""
+    os.makedirs(apply_dir, exist_ok=True)
+    write_apply_manifest_pair(trees, os.path.join(apply_dir, "all"), target_util)
+    for stage, stage_nodes in sorted(group_by_stage(trees).items()):
+        write_apply_manifest_pair(stage_nodes,
+                                  os.path.join(apply_dir, stage), target_util)
+    return apply_dir
+
+
 def write_all_reports(trees, out_dir, window, cluster, target_util=80.0):
     """Combined report (cluster + per-stage rollups) at out_dir, plus a
-    self-contained per-stage report under out_dir/by-stage/<stage>/."""
+    self-contained per-stage report under out_dir/by-stage/<stage>/ and an
+    out_dir/apply/ folder gathering every recommendations-apply manifest."""
     write_report_files(trees, out_dir, window, cluster,
                        summary_kinds=("cluster", "stage"),
                        target_util=target_util)
@@ -1997,6 +2022,7 @@ def write_all_reports(trees, out_dir, window, cluster, target_util=80.0):
                            os.path.join(out_dir, "by-stage", stage),
                            window, cluster, summary_kinds=("stage",),
                            target_util=target_util)
+    write_apply_manifests(trees, os.path.join(out_dir, "apply"), target_util)
     return out_dir
 
 

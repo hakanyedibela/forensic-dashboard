@@ -789,12 +789,25 @@ combined report plus a `by-stage/<stage>/` sub-report per stage, and a
   ooms.csv                    # one row per OOM-killed container
   report.json                 # nested tree + cluster_totals + stage_summaries
   LEGEND.md                   # Legende (German): was jede Spalte und jede `level`-Zeile bedeutet
+  apply/                      # all apply manifests gathered in one place (see below)
+    all.yaml   all.json       # every namespace, combined
+    test.yaml  test.json      # one pair per stage — for a staged rollout
+    prod.yaml  prod.json
+    ...
   by-stage/
     ref/   {the same files}   # only ref namespaces
     test/  {...}
     prod/  {...}
     ...
 ```
+
+The **`apply/` folder** gathers only the apply manifests so you never have to
+dig through `by-stage/`: `all.json` is the full set across every namespace, and
+each `<stage>.json` is that stage alone. Point the applier straight at one of
+them — e.g. `--manifest reports/usage/apply/all.json` for everything, or
+`apply/test.json` then `apply/prod.json` to roll out stage by stage. (The
+top-level `recommendations-apply.json` is the same as `apply/all.json` — the
+folder just keeps the manifests together and split by stage.)
 
 `resources.csv` has one row per scope, identified by its `level` column:
 `cluster` (grand total) → `stage` (per stage) → `namespace` → `workload` → `pod`
@@ -943,22 +956,27 @@ any fresh shell with just `kubectl`/`oc` on `PATH`.
 ### Usage
 
 ```bash
-# 1. generate the manifest (part of a normal report run)
+# 1. generate the reports + apply manifests (part of a normal report run)
 python3 scripts/python/fetch-cluster-usage.py --kubectl --output-dir ./reports/usage
+#    -> manifests gathered under ./reports/usage/apply/  (all.json + one per stage)
 
 # 2. preview — server-side dry-run, validates against the live cluster, changes nothing
-./apply-recommendations.py --manifest ./reports/usage/recommendations-apply.json
+./apply-recommendations.py --manifest ./reports/usage/apply/all.json
 
 # 3. apply for real
-./apply-recommendations.py --manifest ./reports/usage/recommendations-apply.json --execute
+./apply-recommendations.py --manifest ./reports/usage/apply/all.json --execute
+
+# staged rollout: test first, verify, then prod
+./apply-recommendations.py --manifest ./reports/usage/apply/test.json --execute
+./apply-recommendations.py --manifest ./reports/usage/apply/prod.json --execute
+
+# write a text report of what was applied (one line per recommendation)
+./apply-recommendations.py --manifest ./reports/usage/apply/all.json --execute \
+  --report ./reports/usage/apply-report.txt
 
 # OpenShift (oc) + a specific kube context
 ./apply-recommendations.py --oc --context prod-cluster \
-  --manifest ./reports/usage/recommendations-apply.json --execute
-
-# custom kubectl binary path
-./apply-recommendations.py --kubectl /usr/local/bin/kubectl \
-  --manifest ./reports/usage/recommendations-apply.json
+  --manifest ./reports/usage/apply/all.json --execute
 ```
 
 ### Example output (dry-run)
@@ -984,6 +1002,28 @@ done: 1 processed, 0 failed
 | `--context NAME` | kube context (passed through as `--context`). |
 | `--oc` | Use the `oc` binary instead of `kubectl`. |
 | `--kubectl PATH` | kubectl binary path (default `kubectl`). |
+| `--report PATH` | Also write a text report of the run to `PATH`: one line per **applied** recommendation (`<namespace>/<kind> <name>  <container: old→new>`), with a header (mode, timestamp, counts) and a `#`-comment footer listing anything not applied — failures, not-found workloads, and quota-skipped namespaces. |
+
+### Applied-recommendations report (`--report`)
+
+`--report PATH` records what the run did, with **one line per applied
+recommendation** so it's easy to diff, grep, or paste into a change ticket. It
+works in dry-run too (the header marks the mode), so you can capture the
+intended change set before executing. Example:
+
+```
+# apply-recommendations report — EXECUTE (mutating) — 2026-06-24T19:16:31Z
+# 2 applied, 0 failed, 1 not found, 1 namespace(s) skipped (quota)
+# Applied recommendations (one line each):
+pid-1060-...-417-prodda/Deployment monitoring-console  monitoring-console: cpu req 250m→250m, lim 500m→500m | mem req 238Mi→401Mi, lim 317Mi→501Mi
+pid-1060-...-417-prodda/Deployment web  web: cpu req 500m→900m, lim 1000m→1130m
+#
+# SKIPPED — workload not found on the cluster:
+#   pid-9-gone-prod-01/Deployment ghost
+#
+# SKIPPED namespaces (raise the ResourceQuota first):
+#   pid-1000-...-shared-prodda: cpu_limit sum 163766m > quota 155000m; mem_limit sum 542402Mi > quota 534057Mi
+```
 
 ### Behaviour notes
 
