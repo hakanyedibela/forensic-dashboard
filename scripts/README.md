@@ -13,7 +13,8 @@ Helper scripts for working with the OOM observability stack from the command lin
 | [`oom-usage.py`](#oom-usagepy) | Recover **memory and CPU usage at OOM time** by querying Prometheus/Thanos for each OOMKilled container's last terminated timestamp. |
 | [`oom-history.py`](#oom-historypy) | Walk each Deployment's **rollout history** (revisions / ReplicaSets) and report OOM status + pre-OOM logs per revision — answers "which version of the deployment started OOMing?". |
 | [`oom-rootcause.py`](#oom-rootcausepy) | **Deep root-cause report per OOMKilled pod** in one shot: workload, node, neighbors, events, PVCs, HPA/VPA, services, NetworkPolicies, LimitRanges, ResourceQuotas, Prometheus memory/CPU/network/storage trends, pre-OOM logs, and a verdict (Pattern A/B/C/D/E) with concrete remediation commands. Use this when you need to answer **why** an OOM happened — leak vs spike vs under-provisioned vs node-pressure vs startup. |
-| [`fetch-cluster-usage.py`](#fetch-cluster-usagepy) | Report configured CPU/memory **limits & requests vs. real Thanos usage** (current + peak over a window) rolled up at **namespace / workload / pod / container**, plus an **OOM-killed** list from live pod state + Thanos history. Runs locally (oc/kubectl) and in-cluster as a CronJob. |
+| [`fetch-cluster-usage.py`](#fetch-cluster-usagepy) | Report configured CPU/memory **limits & requests vs. real Thanos usage** (current + peak over a window) rolled up at **namespace / workload / pod / container**, plus an **OOM-killed** list from live pod state + Thanos history. Also emits **right-sizing recommendations**, a per-namespace **storage-quota** report, and an applyable **patch manifest** of the recommended resources. Runs locally (oc/kubectl) and in-cluster as a CronJob. |
+| [`apply-recommendations.py`](#apply-recommendationspy) | Apply the recommended CPU/memory resources from `fetch-cluster-usage.py` to the cluster. Reads `recommendations-apply.json`, shells out to `kubectl`/`oc patch`. **Server-side dry-run by default**; real changes need `--execute`. Namespaces whose recommendations would exceed their ResourceQuota are skipped with a warning. |
 
 ---
 
@@ -775,12 +776,21 @@ combined report plus a `by-stage/<stage>/` sub-report per stage, and a
 
 ```
 /reports/2026-06-08/
-  resources.csv          # cluster + per-stage rollup rows, then ns/workload/pod/container detail
-  ooms.csv               # one row per OOM-killed container
-  report.json            # nested tree + cluster_totals + stage_summaries
-  LEGEND.md              # Legende (German): was jede Spalte und jede `level`-Zeile bedeutet
+  resources.csv               # cluster + per-stage rollup rows, then ns/workload/pod/container detail
+  resources-human.csv         # same rows, every value with its unit (200m, 6.3Mi, 4.9%)
+  namespaces.csv              # one row per namespace (used vs. limited summary)
+  namespaces-human.csv        # same, unit-formatted
+  recommendations.csv         # per-workload right-sizing (only hot workloads; raw numbers)
+  recommendations-human.csv   # same, unit-formatted
+  recommendations-apply.yaml  # applyable patch manifest (one ResourcePatch per hot workload)
+  recommendations-apply.json  # machine-readable twin, consumed by apply-recommendations.py
+  storage.csv                 # per-namespace storage quota by StorageClass (used/hard bytes)
+  storage-human.csv           # same, unit-formatted
+  ooms.csv                    # one row per OOM-killed container
+  report.json                 # nested tree + cluster_totals + stage_summaries
+  LEGEND.md                   # Legende (German): was jede Spalte und jede `level`-Zeile bedeutet
   by-stage/
-    ref/   {resources.csv, ooms.csv, report.json, LEGEND.md}   # only ref namespaces
+    ref/   {the same files}   # only ref namespaces
     test/  {...}
     prod/  {...}
     ...
@@ -797,6 +807,57 @@ counters — i.e. how much the running pods book against the quota. `workload`/
 `pod`/`container` rows keep their summed pod-spec requests/limits (quotas are
 namespace-scoped, so the `_used` columns are empty there). A namespace without a
 quota falls back to the summed pod specs.
+
+#### Right-sizing recommendations
+
+`recommendations.csv` (raw) and `recommendations-human.csv` (unit-formatted)
+carry one row per **hot** workload — a workload whose CPU or memory peak over
+`--window` is unbounded or above the target utilisation (`--target-util`, default
+80 %). For each hot dimension: `request = round_up(peak)`,
+`limit = round_up(peak / target_util)` (CPU to the next 10m, memory to the next
+Mi). Quiet workloads are omitted.
+
+#### Storage quota report
+
+`storage.csv` (raw bytes) and `storage-human.csv` (unit-formatted) give one row
+per namespace with two columns per StorageClass — `<class>_used_bytes` and
+`<class>_hard_bytes` — read from the namespace's ResourceQuota
+(`<class>.storageclass.storage.k8s.io/requests.storage`, *Used* vs. *Hard*). A
+fixed set of StorageClasses is always emitted (a class the namespace's quota
+doesn't mention shows `0`, so the matrix is dense); any extra class found in the
+data is appended rather than dropped.
+
+#### Apply manifest
+
+`recommendations-apply.yaml` turns the recommendations into an applyable,
+reviewable patch: one `ResourcePatch` document per hot workload that sets the
+recommended container `requests`/`limits` as a strategic-merge patch — **workload
+resources only, never the ResourceQuota.** A namespace whose summed
+recommendations would exceed its ResourceQuota is **skipped entirely** and named
+in a `SKIPPED` header comment (raise the quota first, then re-export).
+`recommendations-apply.json` is the machine-readable twin that
+[`apply-recommendations.py`](#apply-recommendationspy) consumes (stdlib JSON — no
+YAML dependency). See that section for the dry-run / execute workflow.
+
+Each of these views can also be streamed to stdout without `--output-dir` via
+`--format`, e.g.:
+
+```bash
+# preview the recommendations table
+python3 scripts/python/fetch-cluster-usage.py --kubectl --format recommendations-human
+
+# the storage-quota matrix, unit-formatted
+python3 scripts/python/fetch-cluster-usage.py --kubectl --format storage-human
+
+# just the apply manifest (pipe straight to a file or kubectl review)
+python3 scripts/python/fetch-cluster-usage.py --kubectl --format recommendations-apply
+
+# only write files, no stdout (pair with --output-dir)
+python3 scripts/python/fetch-cluster-usage.py --kubectl --format none --output-dir ./reports/usage
+```
+
+`--target-util PCT` (default 80) drives both the recommendation CSVs and the
+apply manifest.
 
 `--date-subdir` gives each run its own dated folder (so a daily run keeps
 history instead of overwriting), and `--retention-days 30` prunes folders older
@@ -843,3 +904,104 @@ the Python step — ask and we can wire that up.
 - In-cluster: the ServiceAccount RBAC from the manifest.
 - A reachable Thanos/Prometheus query API for usage columns (optional; degrades
   to `-` when absent).
+
+---
+
+## `apply-recommendations.py`
+
+Closes the loop on `fetch-cluster-usage.py`: it takes the recommended CPU/memory
+resources and **applies them to the cluster** — safely. It reads the
+`recommendations-apply.json` sidecar (the machine-readable twin of
+`recommendations-apply.yaml`) and, for each workload, shells out to
+`kubectl`/`oc patch --type=strategic` to update the container `requests`/`limits`.
+It **only touches workload resources, never the ResourceQuota.**
+
+Two safety properties are built in:
+
+- **Server-side dry-run by default.** With no flag, every patch runs with
+  `--dry-run=server`: the API server validates it against the live object
+  (schema, admission, quota) and reports the result, but **nothing changes**.
+  Real mutation requires the explicit `--execute` flag.
+- **Quota-exceeding namespaces are skipped at the source.** Any namespace whose
+  summed recommendations would exceed its ResourceQuota was already left out of
+  the manifest by `fetch-cluster-usage.py` (listed in its `SKIPPED` block). The
+  applier re-prints that warning so the caveat is visible at apply time — raise
+  the quota manually, re-run the export, then re-apply.
+
+Stdlib only (`json` + `subprocess`): no PyYAML, no Kubernetes client — it runs in
+any fresh shell with just `kubectl`/`oc` on `PATH`.
+
+### Requirements
+
+- Python 3.6.8+ (standard library only)
+- `kubectl` (default) or `oc` (`--oc`) on `PATH`, with an active session pointed
+  at the cluster you want to change
+- RBAC: `patch` on the target workload kinds (`deployments`, `statefulsets`, …)
+  in the affected namespaces
+- A `recommendations-apply.json` produced by `fetch-cluster-usage.py`
+
+### Usage
+
+```bash
+# 1. generate the manifest (part of a normal report run)
+python3 scripts/python/fetch-cluster-usage.py --kubectl --output-dir ./reports/usage
+
+# 2. preview — server-side dry-run, validates against the live cluster, changes nothing
+./apply-recommendations.py --manifest ./reports/usage/recommendations-apply.json
+
+# 3. apply for real
+./apply-recommendations.py --manifest ./reports/usage/recommendations-apply.json --execute
+
+# OpenShift (oc) + a specific kube context
+./apply-recommendations.py --oc --context prod-cluster \
+  --manifest ./reports/usage/recommendations-apply.json --execute
+
+# custom kubectl binary path
+./apply-recommendations.py --kubectl /usr/local/bin/kubectl \
+  --manifest ./reports/usage/recommendations-apply.json
+```
+
+### Example output (dry-run)
+
+```
+apply-recommendations: DRY-RUN (server, no changes) — 1 workload(s)
+SKIPPED namespaces (raise the ResourceQuota first, then re-export):
+  pid-9-api-prod-01: cpu_limit sum 4000m > quota 1000m; mem_limit sum 10Gi > quota 1Gi
+  pid-3-web-prod-01/Deployment web  web: cpu req 500m→900m, lim 1000m→1130m | mem req 150Mi→200Mi, lim 200Mi→250Mi
+  OK   pid-3-web-prod-01/Deployment web
+done: 1 processed, 0 failed
+```
+
+`--execute` runs the same calls without `--dry-run=server`; each line then shows
+`OK` / `SKIP` / `FAIL` for the real patch.
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `--manifest PATH` | Path to `recommendations-apply.json`. Default: `recommendations-apply.json` in the current directory. |
+| `--execute` | Apply for real. Without it the run is a server-side dry-run that changes nothing. |
+| `--context NAME` | kube context (passed through as `--context`). |
+| `--oc` | Use the `oc` binary instead of `kubectl`. |
+| `--kubectl PATH` | kubectl binary path (default `kubectl`). |
+
+### Behaviour notes
+
+- **Dry-run is the default on purpose.** You have to opt in to mutate the
+  cluster. Run the dry-run first and read the `old→new` lines before `--execute`.
+- **A workload deleted between export and apply is non-fatal.** If `kubectl`
+  reports `NotFound`, that workload is marked `SKIP (not found)` and the run
+  continues to the next one.
+- **Strategic-merge keeps untouched fields.** Only the hot dimensions are in the
+  patch; cold `requests`/`limits` keys and other container fields are merged by
+  key on the live object, so nothing else is disturbed. Multi-container workloads
+  are patched per container name.
+- **Exit code reflects success.** `0` when every patch succeeded (or there was
+  nothing to apply); `1` if any patch failed under `--execute`; `2` if the
+  manifest is missing or unreadable.
+
+### Exit codes
+
+- `0` — completed (all patches OK, or header-only manifest with nothing to apply)
+- `1` — at least one patch failed under `--execute`
+- `2` — manifest not found / unreadable

@@ -8,11 +8,24 @@ _spec = importlib.util.spec_from_file_location("fetch_cluster_usage", _PATH)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
+_APPLY_PATH = (pathlib.Path(__file__).resolve().parent.parent
+               / "apply-recommendations.py")
+_apply_spec = importlib.util.spec_from_file_location("apply_recommendations",
+                                                     _APPLY_PATH)
+_apply_mod = importlib.util.module_from_spec(_apply_spec)
+_apply_spec.loader.exec_module(_apply_mod)
+
 
 @pytest.fixture
 def fcu():
     """The loaded fetch-cluster-usage module under test."""
     return _mod
+
+
+@pytest.fixture
+def apprec():
+    """The loaded apply-recommendations module under test."""
+    return _apply_mod
 
 
 class FakeThanos:
