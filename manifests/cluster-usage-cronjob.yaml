@@ -1,34 +1,37 @@
-# Cluster-wide CronJob that runs fetch-cluster-usage.py against all pid-*
-# namespaces and logs the report. The script is shipped via a ConfigMap so no
-# image build / registry is needed -- the job runs stock python:3.12-slim.
+# Cluster-wide CronJob: every 5 days it (1) runs fetch-cluster-usage.py against
+# all pid-* namespaces, (2) runs apply-recommendations.py in **server-side
+# dry-run** (validates the right-sizing patches against the live cluster and
+# writes apply-report.txt — it changes nothing), and (3) pushes all generated
+# reports to a GitLab repository over HTTPS with a Personal Access Token.
 #
-# OpenShift (production) note: thanos-querier requires the ServiceAccount to be
-# allowed to read metrics. Uncomment the cluster-monitoring-view binding below
-# and set THANOS_URL to the querier route/service.
+# No image build and no runtime internet egress are needed: a static `oc` binary
+# is copied out of a pinned CLI image into a shared emptyDir, the two stdlib-only
+# Python scripts are shipped via a ConfigMap, and an alpine/git container does the
+# push. (Container *images* are still pulled — mirror them in an airgapped setup.)
 #
-# RKE2 (local test): the kube-prometheus-stack Thanos/Prometheus service in the
-# monitoring namespace typically needs no auth; set THANOS_URL accordingly or
-# let auto-discovery handle it.
+# ── Pipeline (initContainers run sequentially; all must succeed before push) ──
+#   get-oc  (origin-cli)   cp $(command -v oc) -> /tools/oc
+#   fetch   (python:slim)  fetch-cluster-usage.py --in-cluster -> /work
+#   apply   (python:slim)  apply-recommendations.py --oc (dry-run) -> /work/apply-report.txt
+#   push    (alpine/git)   git clone+commit+push /work -> <repo>/<subdir>/<date>/
 #
-# Regenerate the ConfigMap after editing the script:
-#   oc create configmap cluster-usage-script \
-#     --from-file=fetch-cluster-usage.py=scripts/python/fetch-cluster-usage.py \
-#     -n forensic-usage --dry-run=client -o yaml
+# ── One-time setup ──
+# 1) Create the namespace + RBAC + CronJob:
+#       oc apply -f manifests/cluster-usage-cronjob.yaml
+# 2) Populate the scripts ConfigMap from the real sources (re-run after edits):
+#       oc create configmap cluster-usage-scripts \
+#         --from-file=fetch-cluster-usage.py=scripts/python/fetch-cluster-usage.py \
+#         --from-file=apply-recommendations.py=scripts/python/apply-recommendations.py \
+#         -n forensic-usage --dry-run=client -o yaml | oc apply -f -
+# 3) Create the GitLab PAT secret (never commit the token):
+#       oc create secret generic gitlab-push \
+#         --from-literal=pat='glpat-xxxxxxxxxxxxxxxxxxxx' \
+#         -n forensic-usage
+# 4) Set the GitLab target in the CronJob env below (GITLAB_HOST / GITLAB_PROJECT_PATH /
+#    GIT_BRANCH / GIT_NAME / GIT_EMAIL / REPORT_SUBDIR) and THANOS_URL.
 #
-# Persistence: the job writes the human-readable report to stdout (captured by
-# Loki/EFK) AND writes resources.csv / ooms.csv / report.json into a per-day
-# folder on a PVC: /reports/<YYYY-MM-DD>/. --retention-days prunes old folders.
-#
-# Retrieving the files (PVC is not browsable on its own):
-#   # one-off copy of a day's reports to your machine:
-#   oc run usage-reader --image=busybox --restart=Never -n forensic-usage \
-#     --overrides='{"spec":{"containers":[{"name":"r","image":"busybox","command":["sleep","3600"],
-#       "volumeMounts":[{"name":"r","mountPath":"/reports","readOnly":true}]}],
-#       "volumes":[{"name":"r","persistentVolumeClaim":{"claimName":"cluster-usage-reports"}}]}}'
-#   oc cp forensic-usage/usage-reader:/reports ./usage-reports
-#   oc delete pod usage-reader -n forensic-usage
-# Or run the optional read-only viewer Deployment at the bottom of this file
-# (needs a ReadWriteMany PVC, or the same node as the CronJob for ReadWriteOnce).
+# To flip the apply step to actually patch the cluster, add "--execute" to the
+# apply container args. Read the warning above that arg before doing so.
 ---
 apiVersion: v1
 kind: Namespace
@@ -52,6 +55,14 @@ rules:
   - apiGroups: ["apps"]
     resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
     verbs: ["get", "list"]
+  # The apply step does a server-side dry-run (oc patch --dry-run=server). The API
+  # server still runs an authorization check for it, so the SA needs patch/update
+  # on the workload kinds even though nothing is mutated. Removing "--execute"
+  # from the apply args keeps it dry-run; these verbs are also what a future
+  # --execute would use, so scope them tightly to Deployments/StatefulSets.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -81,35 +92,31 @@ subjects:
 #     name: cluster-usage
 #     namespace: forensic-usage
 ---
-# Report storage. Reports are tiny (CSV/JSON), so 1Gi is generous even with a
-# long --retention-days. Prefer ReadWriteMany if your storage class supports it
-# (OpenShift ODF/NFS; Longhorn-RWX on RKE2) so the viewer below can read while
-# the CronJob writes; ReadWriteOnce works too (single writer) but a reader pod
-# must land on the same node. Set storageClassName to your default if needed.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: cluster-usage-reports
-  namespace: forensic-usage
-spec:
-  accessModes: ["ReadWriteOnce"]   # change to ReadWriteMany if supported
-  resources:
-    requests:
-      storage: 1Gi
-  # storageClassName: <your-storage-class>
----
+# Both stdlib-only scripts, shipped without an image build. Repopulate from the
+# real sources with the `oc create configmap cluster-usage-scripts ...` command
+# in the header after editing either script.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: cluster-usage-script
+  name: cluster-usage-scripts
   namespace: forensic-usage
 data:
   fetch-cluster-usage.py: |
-    # PLACEHOLDER -- replace with the real script via:
-    #   oc create configmap cluster-usage-script \
-    #     --from-file=fetch-cluster-usage.py=scripts/python/fetch-cluster-usage.py \
-    #     -n forensic-usage --dry-run=client -o yaml | oc apply -f -
-    raise SystemExit("ConfigMap not populated; see manifest header")
+    raise SystemExit("ConfigMap not populated; see manifest header (step 2)")
+  apply-recommendations.py: |
+    raise SystemExit("ConfigMap not populated; see manifest header (step 2)")
+---
+# GitLab Personal Access Token for the push step. DO NOT commit a real token —
+# this is a placeholder; create the secret out-of-band (header, step 3). The PAT
+# needs `write_repository` scope on the target project.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gitlab-push
+  namespace: forensic-usage
+type: Opaque
+stringData:
+  pat: "REPLACE_ME_OR_CREATE_OUT_OF_BAND"
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -117,7 +124,16 @@ metadata:
   name: cluster-usage
   namespace: forensic-usage
 spec:
-  schedule: "0 6 * * *"   # daily 06:00; matches the default 24h window
+  # Every 5 days at 06:00. Caveat: cron "*/5" on day-of-month resets at each
+  # month boundary (…26, 31, 1, 6…), so the gap across month-ends can be 1–4
+  # days rather than exactly 5. This is the conventional CronJob approximation;
+  # for exact 5-day spacing you'd need an external scheduler.
+  schedule: "0 6 */5 * *"
+  # Interpret `schedule` in this zone instead of UTC. Requires Kubernetes 1.27+
+  # / OpenShift 4.14+ (the kube-controller-manager CronJob controller resolves
+  # IANA tz names). On older clusters this field is ignored and the schedule
+  # falls back to UTC — set the time accordingly or drop this line.
+  timeZone: "Europe/Berlin"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
@@ -128,95 +144,166 @@ spec:
         spec:
           serviceAccountName: cluster-usage
           restartPolicy: Never
-          # Writability: python:3.12-slim runs as root and writes the PVC fine
-          # on RKE2. On OpenShift the restricted SCC assigns a random UID and an
-          # fsGroup from the namespace range and chowns the volume to it, so the
-          # default below is usually enough. If writes fail with "Permission
-          # denied", uncomment fsGroup and set it to a GID your SCC allows.
+          # On OpenShift the restricted SCC assigns a random UID + an fsGroup from
+          # the namespace range and makes the emptyDirs group-writable, which is
+          # enough for the steps below (they write /tools, /work, /gitwork only).
+          # If git complains it cannot write, uncomment fsGroup with a GID your
+          # SCC allows.
           securityContext: {}
             # fsGroup: 0
-          containers:
-            - name: cluster-usage
+
+          initContainers:
+            # 1) Stage a static `oc` binary into the shared /tools emptyDir so the
+            #    Python apply step (a slim image without oc) can shell out to it.
+            #    origin-cli is the publicly pullable community oc image (no auth).
+            - name: get-oc
+              image: quay.io/openshift/origin-cli:4.15
+              command:
+                - sh
+                - -c
+                - 'cp "$(command -v oc)" /tools/oc && chmod +x /tools/oc && /tools/oc version --client'
+              volumeMounts:
+                - name: tools
+                  mountPath: /tools
+              resources:
+                requests: { cpu: 25m, memory: 64Mi }
+                limits:   { cpu: 200m, memory: 128Mi }
+
+            # 2) Generate the reports (CSV/JSON/YAML + the apply/ manifests) into
+            #    /work. --in-cluster uses the SA token + REST API (no oc needed).
+            #    Also logs the text report to stdout (captured by Loki/EFK).
+            - name: fetch
               image: python:3.12-slim
               command: ["python3", "/app/fetch-cluster-usage.py"]
-              # text -> stdout (Loki); CSV/JSON -> /reports/<date>/; keep 30 days
               args:
                 - "--in-cluster"
                 - "--window"
-                - "24h"
+                - "120h"            # 5 days, matching the cadence; tune as needed
                 - "--format"
-                - "text"
+                - "text"            # -> stdout (Loki); files still go to --output-dir
                 - "--output-dir"
-                - "/reports"
-                - "--date-subdir"
-                - "--retention-days"
-                - "30"
+                - "/work"
+                - "--target-util"
+                - "80"
               env:
-                # Force UTF-8 for stdout (the text report contains the µ sign
-                # and an em dash). Without this, a C/POSIX locale makes Python
-                # default stdout to ASCII and the run dies with
-                # UnicodeEncodeError. The on-disk files already pin UTF-8.
                 - name: PYTHONIOENCODING
-                  value: "utf-8"
+                  value: "utf-8"     # text report carries µ / em-dash; force UTF-8
                 - name: THANOS_URL
-                  value: ""   # set to your querier, e.g.
-                              # http://thanos-querier.openshift-monitoring:9091
-                              # (OpenShift) — add --insecure in args if a route
+                  value: ""          # e.g. http://thanos-querier.openshift-monitoring:9091
+                                     # (add --insecure to args above if it's a TLS route)
               volumeMounts:
-                - name: script
+                - name: scripts
                   mountPath: /app
-                - name: reports
-                  mountPath: /reports
+                - name: work
+                  mountPath: /work
               resources:
                 requests: { cpu: 50m, memory: 128Mi }
                 limits:   { cpu: 500m, memory: 256Mi }
+
+            # 3) Validate the right-sizing patches against the live cluster
+            #    (server-side dry-run) and write apply-report.txt. NOTHING is
+            #    mutated. `/tools` is prepended to PATH so --oc finds the staged
+            #    binary. Non-fatal (|| true) so a validation failure still lets
+            #    the reports (including the FAILED lines) get pushed.
+            #
+            #    >>> To APPLY FOR REAL, add "--execute" to args. This will roll
+            #    >>> prod workloads unattended every 5 days. Leave it off to keep
+            #    >>> the safe dry-run + report behaviour.
+            - name: apply
+              image: python:3.12-slim
+              command:
+                - sh
+                - -c
+                - 'python3 /app/apply-recommendations.py "$@" || echo "apply step reported issues — see /work/apply-report.txt"'
+                - "_"
+                - "--oc"
+                - "--manifest"
+                - "/work/apply/all.json"
+                - "--report"
+                - "/work/apply-report.txt"
+              env:
+                - name: PATH
+                  value: "/tools:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+                - name: PYTHONIOENCODING
+                  value: "utf-8"
+              volumeMounts:
+                - name: scripts
+                  mountPath: /app
+                - name: work
+                  mountPath: /work
+                - name: tools
+                  mountPath: /tools
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits:   { cpu: 500m, memory: 256Mi }
+
+          # 4) Push everything in /work into <repo>/<REPORT_SUBDIR>/<date>/ over
+          #    HTTPS with the PAT. Runs only after all initContainers succeed.
+          containers:
+            - name: push
+              image: alpine/git:2.45.2
+              env:
+                - name: HOME
+                  value: /gitwork
+                - name: GITLAB_PAT
+                  valueFrom:
+                    secretKeyRef:
+                      name: gitlab-push
+                      key: pat
+                # --- set these to your GitLab target ---
+                - name: GITLAB_HOST
+                  value: "gitlab.example.com"
+                - name: GITLAB_PROJECT_PATH
+                  value: "my-group/cluster-usage-reports"   # without .git
+                - name: GIT_BRANCH
+                  value: "main"
+                - name: GIT_NAME
+                  value: "cluster-usage bot"
+                - name: GIT_EMAIL
+                  value: "cluster-usage@example.com"
+                - name: REPORT_SUBDIR
+                  value: "reports"
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  DATE=$(date +%F); TS=$(date +%H%M%S)
+                  git config --global --add safe.directory '*'
+                  cd /gitwork
+                  # clone the target branch; fall back to the default branch and
+                  # let the push create the branch if it doesn't exist yet.
+                  git clone --depth 1 --branch "$GIT_BRANCH" \
+                    "https://oauth2:${GITLAB_PAT}@${GITLAB_HOST}/${GITLAB_PROJECT_PATH}.git" repo \
+                    || git clone --depth 1 \
+                       "https://oauth2:${GITLAB_PAT}@${GITLAB_HOST}/${GITLAB_PROJECT_PATH}.git" repo
+                  DEST="repo/${REPORT_SUBDIR}/${DATE}"
+                  mkdir -p "$DEST"
+                  cp -R /work/. "$DEST/"
+                  cd repo
+                  git add -A
+                  git -c user.email="$GIT_EMAIL" -c user.name="$GIT_NAME" \
+                    commit -m "cluster-usage reports ${DATE} ${TS}" \
+                    || { echo "nothing to commit"; exit 0; }
+                  git push origin "HEAD:${GIT_BRANCH}"
+                  echo "pushed reports to ${GITLAB_PROJECT_PATH} (${REPORT_SUBDIR}/${DATE})"
+              volumeMounts:
+                - name: work
+                  mountPath: /work
+                  readOnly: true
+                - name: gitwork
+                  mountPath: /gitwork
+              resources:
+                requests: { cpu: 25m, memory: 64Mi }
+                limits:   { cpu: 200m, memory: 128Mi }
+
           volumes:
-            - name: script
+            - name: scripts
               configMap:
-                name: cluster-usage-script
-            - name: reports
-              persistentVolumeClaim:
-                claimName: cluster-usage-reports
----
-# OPTIONAL read-only viewer: browse the reports at http://<svc>/ without copying
-# them off the PVC. Needs a ReadWriteMany PVC (so it can mount while the CronJob
-# writes); with ReadWriteOnce it only works when scheduled on the CronJob's node.
-# Uncomment to use.
-# apiVersion: apps/v1
-# kind: Deployment
-# metadata:
-#   name: cluster-usage-viewer
-#   namespace: forensic-usage
-# spec:
-#   replicas: 1
-#   selector:
-#     matchLabels: { app: cluster-usage-viewer }
-#   template:
-#     metadata:
-#       labels: { app: cluster-usage-viewer }
-#     spec:
-#       containers:
-#         - name: viewer
-#           image: python:3.12-slim
-#           command: ["python3", "-m", "http.server", "8080", "--directory", "/reports"]
-#           ports: [{ containerPort: 8080 }]
-#           volumeMounts:
-#             - name: reports
-#               mountPath: /reports
-#               readOnly: true
-#           resources:
-#             requests: { cpu: 10m, memory: 32Mi }
-#             limits:   { cpu: 100m, memory: 64Mi }
-#       volumes:
-#         - name: reports
-#           persistentVolumeClaim:
-#             claimName: cluster-usage-reports
-# ---
-# apiVersion: v1
-# kind: Service
-# metadata:
-#   name: cluster-usage-viewer
-#   namespace: forensic-usage
-# spec:
-#   selector: { app: cluster-usage-viewer }
-#   ports: [{ port: 80, targetPort: 8080 }]
+                name: cluster-usage-scripts
+            - name: tools
+              emptyDir: {}
+            - name: work
+              emptyDir: {}
+            - name: gitwork
+              emptyDir: {}
