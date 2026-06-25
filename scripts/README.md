@@ -13,7 +13,8 @@ Helper scripts for working with the OOM observability stack from the command lin
 | [`oom-usage.py`](#oom-usagepy) | Recover **memory and CPU usage at OOM time** by querying Prometheus/Thanos for each OOMKilled container's last terminated timestamp. |
 | [`oom-history.py`](#oom-historypy) | Walk each Deployment's **rollout history** (revisions / ReplicaSets) and report OOM status + pre-OOM logs per revision — answers "which version of the deployment started OOMing?". |
 | [`oom-rootcause.py`](#oom-rootcausepy) | **Deep root-cause report per OOMKilled pod** in one shot: workload, node, neighbors, events, PVCs, HPA/VPA, services, NetworkPolicies, LimitRanges, ResourceQuotas, Prometheus memory/CPU/network/storage trends, pre-OOM logs, and a verdict (Pattern A/B/C/D/E) with concrete remediation commands. Use this when you need to answer **why** an OOM happened — leak vs spike vs under-provisioned vs node-pressure vs startup. |
-| [`fetch-cluster-usage.py`](#fetch-cluster-usagepy) | Report configured CPU/memory **limits & requests vs. real Thanos usage** (current + peak over a window) rolled up at **namespace / workload / pod / container**, plus an **OOM-killed** list from live pod state + Thanos history. Runs locally (oc/kubectl) and in-cluster as a CronJob. |
+| [`fetch-cluster-usage.py`](#fetch-cluster-usagepy) | Report configured CPU/memory **limits & requests vs. real Thanos usage** (current + peak over a window) rolled up at **namespace / workload / pod / container**, plus an **OOM-killed** list from live pod state + Thanos history. Also emits **right-sizing recommendations**, a per-namespace **storage-quota** report, and an applyable **patch manifest** of the recommended resources. Runs locally (oc/kubectl) and in-cluster as a CronJob. |
+| [`apply-recommendations.py`](#apply-recommendationspy) | Apply the recommended CPU/memory resources from `fetch-cluster-usage.py` to the cluster. Reads `recommendations-apply.json`, shells out to `kubectl`/`oc patch`. **Server-side dry-run by default**; real changes need `--execute`. Namespaces whose recommendations would exceed their ResourceQuota are skipped with a warning. |
 
 ---
 
@@ -748,43 +749,122 @@ python3 scripts/python/fetch-cluster-usage.py --namespace pid-002-api-test-01-bl
 python3 scripts/python/fetch-cluster-usage.py --level namespace,workload
 ```
 
-### In-cluster (CronJob)
+### In-cluster (CronJob → GitLab)
 
-`manifests/cluster-usage-cronjob.yaml` ships a cluster-wide CronJob (ServiceAccount
-+ ClusterRole/Binding + ConfigMap-delivered script on `python:3.12-slim`).
-Populate the ConfigMap from the real script and set `THANOS_URL`:
+`manifests/cluster-usage-cronjob.yaml` ships a cluster-wide CronJob that **every
+5 days** runs the full pipeline and pushes the reports to a GitLab repo over
+HTTPS with a PAT — no image build and no runtime internet egress (a static `oc`
+binary is copied from a pinned CLI image; the stdlib-only scripts come from a
+ConfigMap). The pipeline (initContainers run in order; all must succeed before
+the push):
+
+| Step | Image | Does |
+|---|---|---|
+| `get-oc` | `quay.io/openshift/origin-cli` | copies a static `oc` into a shared `/tools` emptyDir |
+| `fetch` | `python:3.12-slim` | `fetch-cluster-usage.py --in-cluster` → `/work` (+ logs to stdout/Loki) |
+| `apply` | `python:3.12-slim` | `apply-recommendations.py --oc` **server-side dry-run** → `/work/apply-report.txt` (changes nothing) |
+| `push` | `alpine/git` | `git clone`/`commit`/`push` `/work` → `<repo>/<subdir>/<YYYY-MM-DD>/` |
+
+Setup:
 
 ```bash
-oc create configmap cluster-usage-script \
-  --from-file=fetch-cluster-usage.py=scripts/python/fetch-cluster-usage.py \
-  -n forensic-usage --dry-run=client -o yaml | oc apply -f -
+# 1. namespace + RBAC + CronJob
 oc apply -f manifests/cluster-usage-cronjob.yaml
+
+# 2. ship BOTH scripts via the ConfigMap (re-run after editing either)
+oc create configmap cluster-usage-scripts \
+  --from-file=fetch-cluster-usage.py=scripts/python/fetch-cluster-usage.py \
+  --from-file=apply-recommendations.py=scripts/python/apply-recommendations.py \
+  -n forensic-usage --dry-run=client -o yaml | oc apply -f -
+
+# 3. GitLab PAT (write_repository scope) — never commit the token
+oc create secret generic gitlab-push \
+  --from-literal=pat='glpat-xxxxxxxxxxxxxxxxxxxx' -n forensic-usage
 ```
 
-On OpenShift, uncomment the `cluster-monitoring-view` binding so the SA token is
-accepted by `thanos-querier`. On RKE2/kube-prometheus-stack, Thanos in-cluster
-usually needs no auth.
+Then edit the CronJob env to point at your GitLab target (`GITLAB_HOST`,
+`GITLAB_PROJECT_PATH`, `GIT_BRANCH`, `GIT_NAME`, `GIT_EMAIL`, `REPORT_SUBDIR`)
+and set `THANOS_URL`. On OpenShift, uncomment the `cluster-monitoring-view`
+binding so the SA token is accepted by `thanos-querier`; on RKE2/kube-prometheus-stack
+Thanos in-cluster usually needs no auth.
 
-### Persisting the daily reports
+**The apply step is dry-run by default** — it validates the right-sizing patches
+against the live cluster and records them in `apply-report.txt`, but mutates
+nothing. To actually patch workloads on the timer, add `--execute` to the
+`apply` container's args (this rolls prod workloads unattended every 5 days — read
+the warning above that arg first). Server-side dry-run still needs `patch`/`update`
+RBAC, which the manifest grants on Deployments/StatefulSets.
 
-The CronJob writes the human-readable table to **stdout** (captured by your
-Loki/EFK stack — browse it in Grafana with no extra setup) **and** writes
-machine-readable files into a per-day folder on a PVC. Each day's folder holds a
-combined report plus a `by-stage/<stage>/` sub-report per stage, and a
-`LEGEND.md` describing every column and `level` row:
+> **"Every 5 days" caveat:** the schedule is `0 6 */5 * *`. Cron's `*/5`
+> day-of-month resets each month, so the gap across a month boundary can be 1–4
+> days rather than exactly 5 — the conventional CronJob approximation.
+
+Because the reports now live in GitLab (commit history = the per-run audit
+trail), this revision drops the report PVC and the optional HTTP viewer that the
+earlier daily version used.
+
+### The report files (`--output-dir`)
+
+`--output-dir DIR` writes the full machine-readable bundle (and `--format text`
+still logs the human table to **stdout**, captured by Loki/EFK). The in-cluster
+CronJob points `--output-dir` at an emptyDir and pushes the result to GitLab (see
+[In-cluster](#in-cluster-cronjob--gitlab) above); locally you just point it at a
+folder. The bundle holds a combined report plus a `by-stage/<stage>/` sub-report
+per stage, the gathered `apply/` manifests, and a `LEGEND.md` describing every
+column and `level` row:
 
 ```
-/reports/2026-06-08/
-  resources.csv          # cluster + per-stage rollup rows, then ns/workload/pod/container detail
-  ooms.csv               # one row per OOM-killed container
-  report.json            # nested tree + cluster_totals + stage_summaries
-  LEGEND.md              # Legende (German): was jede Spalte und jede `level`-Zeile bedeutet
+<output-dir>/   (e.g. one commit under reports/2026-06-08/ in GitLab)
+  resources.csv               # cluster + per-stage rollup rows, then ns/workload/pod/container detail
+  resources-human.csv         # same rows, every value with its unit (200m, 6.3Mi, 4.9%)
+  namespaces.csv              # one row per namespace (used vs. limited summary)
+  namespaces-human.csv        # same, unit-formatted
+  recommendations.csv         # per-workload right-sizing (only hot workloads; raw numbers)
+  recommendations-human.csv   # same, unit-formatted
+  recommendations-apply.yaml  # applyable patch manifest (one ResourcePatch per hot workload)
+  recommendations-apply.json  # machine-readable twin, consumed by apply-recommendations.py
+  storage.csv                 # per-namespace storage quota by StorageClass (used/hard bytes)
+  storage-human.csv           # same, unit-formatted
+  ooms.csv                    # one row per OOM-killed container
+  report.json                 # nested tree + cluster_totals + stage_summaries
+  LEGEND.md                   # Legende (German): was jede Spalte und jede `level`-Zeile bedeutet
+  apply/                      # all apply manifests gathered in one place (see below)
+    all.yaml   all.json       # every namespace, combined
+    test.yaml  test.json      # one pair per stage — for a staged rollout
+    prod.yaml  prod.json
+    test/                     # one pair per namespace — for a dedicated apply
+      pid-1-app-test-01.yaml  .json
+      pid-2-api-test-01.yaml  .json
+    prod/
+      pid-3-web-prod-01.yaml  .json
+    ...
   by-stage/
-    ref/   {resources.csv, ooms.csv, report.json, LEGEND.md}   # only ref namespaces
+    ref/   {the same files}   # only ref namespaces
     test/  {...}
     prod/  {...}
     ...
 ```
+
+The **`apply/` folder** gathers only the apply manifests so you never have to
+dig through `by-stage/`, at three granularities:
+
+- `all.json` — the full set across every namespace;
+- `<stage>.json` — one whole stage (`apply/test.json`, `apply/prod.json`);
+- `<stage>/<namespace>.json` — a single namespace, for a **dedicated** apply
+  (`apply/prod/pid-3-web-prod-01.json`). A namespace with nothing to apply (no
+  hot workloads and not quota-skipped) gets no file.
+
+Point the applier straight at whichever scope you want:
+
+```bash
+./apply-recommendations.py --manifest reports/usage/apply/all.json --execute            # everything
+./apply-recommendations.py --manifest reports/usage/apply/prod.json --execute           # one stage
+./apply-recommendations.py --manifest reports/usage/apply/prod/pid-3-web-prod-01.json \
+  --execute                                                                              # one namespace
+```
+
+(The top-level `recommendations-apply.json` is the same as `apply/all.json` — the
+folder just keeps the manifests together and split by stage and namespace.)
 
 `resources.csv` has one row per scope, identified by its `level` column:
 `cluster` (grand total) → `stage` (per stage) → `namespace` → `workload` → `pod`
@@ -798,39 +878,66 @@ counters — i.e. how much the running pods book against the quota. `workload`/
 namespace-scoped, so the `_used` columns are empty there). A namespace without a
 quota falls back to the summed pod specs.
 
-`--date-subdir` gives each run its own dated folder (so a daily run keeps
-history instead of overwriting), and `--retention-days 30` prunes folders older
-than 30 days (only date-named folders are ever removed). The manifest provisions
-a 1Gi `PersistentVolumeClaim` (`cluster-usage-reports`). Prefer
-`ReadWriteMany` if your storage class supports it (OpenShift ODF/NFS,
-Longhorn-RWX); `ReadWriteOnce` works for the single-writer CronJob too.
+#### Right-sizing recommendations
 
-A PVC isn't browsable on its own — to get the files off it:
+`recommendations.csv` (raw) and `recommendations-human.csv` (unit-formatted)
+carry one row per **hot** workload — a workload whose CPU or memory peak over
+`--window` is unbounded or above the target utilisation (`--target-util`, default
+80 %). For each hot dimension: `request = round_up(peak)`,
+`limit = round_up(peak / target_util)` (CPU to the next 10m, memory to the next
+Mi). Quiet workloads are omitted.
+
+#### Storage quota report
+
+`storage.csv` (raw bytes) and `storage-human.csv` (unit-formatted) give one row
+per namespace with two columns per StorageClass — `<class>_used_bytes` and
+`<class>_hard_bytes` — read from the namespace's ResourceQuota
+(`<class>.storageclass.storage.k8s.io/requests.storage`, *Used* vs. *Hard*). A
+fixed set of StorageClasses is always emitted (a class the namespace's quota
+doesn't mention shows `0`, so the matrix is dense); any extra class found in the
+data is appended rather than dropped.
+
+#### Apply manifest
+
+`recommendations-apply.yaml` turns the recommendations into an applyable,
+reviewable patch: one `ResourcePatch` document per hot workload that sets the
+recommended container `requests`/`limits` as a strategic-merge patch — **workload
+resources only, never the ResourceQuota.** A namespace whose summed
+recommendations would exceed its ResourceQuota is **skipped entirely** and named
+in a `SKIPPED` header comment (raise the quota first, then re-export).
+`recommendations-apply.json` is the machine-readable twin that
+[`apply-recommendations.py`](#apply-recommendationspy) consumes (stdlib JSON — no
+YAML dependency). See that section for the dry-run / execute workflow.
+
+Each of these views can also be streamed to stdout without `--output-dir` via
+`--format`, e.g.:
 
 ```bash
-# copy a day's reports to your machine via a throwaway reader pod
-oc run usage-reader --image=busybox --restart=Never -n forensic-usage \
-  --overrides='{"spec":{"containers":[{"name":"r","image":"busybox",
-    "command":["sleep","3600"],"volumeMounts":[{"name":"r","mountPath":"/reports",
-    "readOnly":true}]}],"volumes":[{"name":"r","persistentVolumeClaim":
-    {"claimName":"cluster-usage-reports"}}]}}'
-oc cp forensic-usage/usage-reader:/reports ./usage-reports
-oc delete pod usage-reader -n forensic-usage
+# preview the recommendations table
+python3 scripts/python/fetch-cluster-usage.py --kubectl --format recommendations-human
+
+# the storage-quota matrix, unit-formatted
+python3 scripts/python/fetch-cluster-usage.py --kubectl --format storage-human
+
+# just the apply manifest (pipe straight to a file or kubectl review)
+python3 scripts/python/fetch-cluster-usage.py --kubectl --format recommendations-apply
+
+# only write files, no stdout (pair with --output-dir)
+python3 scripts/python/fetch-cluster-usage.py --kubectl --format none --output-dir ./reports/usage
 ```
 
-Or uncomment the read-only **viewer** `Deployment` + `Service` at the bottom of
-the manifest to browse the folders over HTTP (`python -m http.server`; needs an
-RWX PVC, or a reader on the CronJob's node for RWO).
+`--target-util PCT` (default 80) drives both the recommendation CSVs and the
+apply manifest.
 
-**Writability:** on RKE2 the root container writes the PVC directly. On OpenShift
-the restricted SCC assigns a random UID + fsGroup and chowns the volume, which
-is usually enough; if writes fail with `Permission denied`, set
-`securityContext.fsGroup` in the CronJob to a GID your SCC allows.
+**Run history / retention.** The in-cluster CronJob pushes each run into a dated
+folder in GitLab (`<subdir>/<YYYY-MM-DD>/`), so the repo's commit history *is* the
+retention — no PVC, reader pod, or viewer to manage. Prune old runs with GitLab's
+normal git tooling (or just leave them; the bundles are tiny CSV/JSON/YAML).
 
-**Want object storage instead?** You already run a Thanos object store
-(`manifests/thanos-objstore.md`). For durable, downloadable, lifecycle-expired
-reports, add an `mc`/`rclone` sidecar that syncs `/reports` to a bucket after
-the Python step — ask and we can wire that up.
+For a PVC- or local-disk-based deployment instead of (or in addition to) the
+GitLab push, the script's own flags still apply: `--date-subdir` gives each run
+its own dated folder rather than overwriting, and `--retention-days 30` prunes
+date-named folders older than 30 days (only date-named folders are ever removed).
 
 ### Requirements
 
@@ -843,3 +950,131 @@ the Python step — ask and we can wire that up.
 - In-cluster: the ServiceAccount RBAC from the manifest.
 - A reachable Thanos/Prometheus query API for usage columns (optional; degrades
   to `-` when absent).
+
+---
+
+## `apply-recommendations.py`
+
+Closes the loop on `fetch-cluster-usage.py`: it takes the recommended CPU/memory
+resources and **applies them to the cluster** — safely. It reads the
+`recommendations-apply.json` sidecar (the machine-readable twin of
+`recommendations-apply.yaml`) and, for each workload, shells out to
+`kubectl`/`oc patch --type=strategic` to update the container `requests`/`limits`.
+It **only touches workload resources, never the ResourceQuota.**
+
+Two safety properties are built in:
+
+- **Server-side dry-run by default.** With no flag, every patch runs with
+  `--dry-run=server`: the API server validates it against the live object
+  (schema, admission, quota) and reports the result, but **nothing changes**.
+  Real mutation requires the explicit `--execute` flag.
+- **Quota-exceeding namespaces are skipped at the source.** Any namespace whose
+  summed recommendations would exceed its ResourceQuota was already left out of
+  the manifest by `fetch-cluster-usage.py` (listed in its `SKIPPED` block). The
+  applier re-prints that warning so the caveat is visible at apply time — raise
+  the quota manually, re-run the export, then re-apply.
+
+Stdlib only (`json` + `subprocess`): no PyYAML, no Kubernetes client — it runs in
+any fresh shell with just `kubectl`/`oc` on `PATH`.
+
+### Requirements
+
+- Python 3.6.8+ (standard library only)
+- `kubectl` (default) or `oc` (`--oc`) on `PATH`, with an active session pointed
+  at the cluster you want to change
+- RBAC: `patch` on the target workload kinds (`deployments`, `statefulsets`, …)
+  in the affected namespaces
+- A `recommendations-apply.json` produced by `fetch-cluster-usage.py`
+
+### Usage
+
+```bash
+# 1. generate the reports + apply manifests (part of a normal report run)
+python3 scripts/python/fetch-cluster-usage.py --kubectl --output-dir ./reports/usage
+#    -> manifests gathered under ./reports/usage/apply/  (all.json + one per stage)
+
+# 2. preview — server-side dry-run, validates against the live cluster, changes nothing
+./apply-recommendations.py --manifest ./reports/usage/apply/all.json
+
+# 3. apply for real
+./apply-recommendations.py --manifest ./reports/usage/apply/all.json --execute
+
+# staged rollout: test first, verify, then prod
+./apply-recommendations.py --manifest ./reports/usage/apply/test.json --execute
+./apply-recommendations.py --manifest ./reports/usage/apply/prod.json --execute
+
+# write a text report of what was applied (one line per recommendation)
+./apply-recommendations.py --manifest ./reports/usage/apply/all.json --execute \
+  --report ./reports/usage/apply-report.txt
+
+# OpenShift (oc) + a specific kube context
+./apply-recommendations.py --oc --context prod-cluster \
+  --manifest ./reports/usage/apply/all.json --execute
+```
+
+### Example output (dry-run)
+
+```
+apply-recommendations: DRY-RUN (server, no changes) — 1 workload(s)
+SKIPPED namespaces (raise the ResourceQuota first, then re-export):
+  pid-9-api-prod-01: cpu_limit sum 4000m > quota 1000m; mem_limit sum 10Gi > quota 1Gi
+  pid-3-web-prod-01/Deployment web  web: cpu req 500m→900m, lim 1000m→1130m | mem req 150Mi→200Mi, lim 200Mi→250Mi
+  OK   pid-3-web-prod-01/Deployment web
+done: 1 processed, 0 failed
+```
+
+`--execute` runs the same calls without `--dry-run=server`; each line then shows
+`OK` / `SKIP` / `FAIL` for the real patch.
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `--manifest PATH` | Path to `recommendations-apply.json`. Default: `recommendations-apply.json` in the current directory. |
+| `--execute` | Apply for real. Without it the run is a server-side dry-run that changes nothing. |
+| `--context NAME` | kube context (passed through as `--context`). |
+| `--oc` | Use the `oc` binary instead of `kubectl`. |
+| `--kubectl PATH` | kubectl binary path (default `kubectl`). |
+| `--report PATH` | Also write a text report of the run to `PATH`: one line per **applied** recommendation (`<namespace>/<kind> <name>  <container: old→new>`), with a header (mode, timestamp, counts) and a `#`-comment footer listing anything not applied — failures, not-found workloads, and quota-skipped namespaces. |
+
+### Applied-recommendations report (`--report`)
+
+`--report PATH` records what the run did, with **one line per applied
+recommendation** so it's easy to diff, grep, or paste into a change ticket. It
+works in dry-run too (the header marks the mode), so you can capture the
+intended change set before executing. Example:
+
+```
+# apply-recommendations report — EXECUTE (mutating) — 2026-06-24T19:16:31Z
+# 2 applied, 0 failed, 1 not found, 1 namespace(s) skipped (quota)
+# Applied recommendations (one line each):
+pid-1060-...-417-prodda/Deployment monitoring-console  monitoring-console: cpu req 250m→250m, lim 500m→500m | mem req 238Mi→401Mi, lim 317Mi→501Mi
+pid-1060-...-417-prodda/Deployment web  web: cpu req 500m→900m, lim 1000m→1130m
+#
+# SKIPPED — workload not found on the cluster:
+#   pid-9-gone-prod-01/Deployment ghost
+#
+# SKIPPED namespaces (raise the ResourceQuota first):
+#   pid-1000-...-shared-prodda: cpu_limit sum 163766m > quota 155000m; mem_limit sum 542402Mi > quota 534057Mi
+```
+
+### Behaviour notes
+
+- **Dry-run is the default on purpose.** You have to opt in to mutate the
+  cluster. Run the dry-run first and read the `old→new` lines before `--execute`.
+- **A workload deleted between export and apply is non-fatal.** If `kubectl`
+  reports `NotFound`, that workload is marked `SKIP (not found)` and the run
+  continues to the next one.
+- **Strategic-merge keeps untouched fields.** Only the hot dimensions are in the
+  patch; cold `requests`/`limits` keys and other container fields are merged by
+  key on the live object, so nothing else is disturbed. Multi-container workloads
+  are patched per container name.
+- **Exit code reflects success.** `0` when every patch succeeded (or there was
+  nothing to apply); `1` if any patch failed under `--execute`; `2` if the
+  manifest is missing or unreadable.
+
+### Exit codes
+
+- `0` — completed (all patches OK, or header-only manifest with nothing to apply)
+- `1` — at least one patch failed under `--execute`
+- `2` — manifest not found / unreadable
