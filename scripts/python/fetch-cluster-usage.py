@@ -1773,7 +1773,7 @@ Erzeugt von scripts/python/fetch-cluster-usage.py.
 - `summary.txt`    — menschenlesbare Tabelle (CPU in Cores/Milli, Speicher in Ki/Mi/Gi, % und OOM-Anzahl) — dieselben Zahlen wie die CSVs, nur kompakt formatiert.
 - `report.json`   — dieselben Daten verschachtelt (Namespace → Workload → Pod → Container) plus Aggregationen.
 - `by-stage/<stage>/` — (im obersten Ordner) dieselben Dateien, beschränkt auf eine Stage.
-- `apply/` — (im obersten Ordner) sammelt **nur** die Apply-Manifeste an einem Ort, damit `apply-recommendations.py` nicht jeden `by-stage/`-Ordner durchsuchen muss: `all.yaml`/`all.json` (alle Namespaces zusammen) plus je Stage ein `<stage>.yaml`/`<stage>.json` (für einen gestaffelten Rollout — erst test, dann prod).
+- `apply/` — (im obersten Ordner) sammelt **nur** die Apply-Manifeste an einem Ort, damit `apply-recommendations.py` nicht jeden `by-stage/`-Ordner durchsuchen muss: `all.yaml`/`all.json` (alle Namespaces zusammen), je Stage ein `<stage>.yaml`/`<stage>.json` (für einen gestaffelten Rollout — erst test, dann prod) und je Namespace ein `<stage>/<namespace>.yaml`/`.json` (um einen einzelnen Namespace dediziert anzuwenden). Namespaces ohne Änderung (keine heißen Workloads und nicht Quota-übersprungen) erhalten keine Datei.
 
 ## resources.csv — die Spalte `level` sagt, was jede Zeile aggregiert
 - `cluster`   — Gesamtsumme über alle Namespaces im Bericht.
@@ -1998,15 +1998,28 @@ def write_apply_manifest_pair(trees, path_noext, target_util=80.0):
 
 def write_apply_manifests(trees, apply_dir, target_util=80.0):
     """Collect every recommendations-apply manifest into one folder so
-    apply-recommendations.py never has to hunt through by-stage/. Writes
-    `all.{yaml,json}` (the full set across all namespaces) plus one
-    `<stage>.{yaml,json}` per stage for a staged rollout (apply test first, then
-    prod). Returns apply_dir."""
+    apply-recommendations.py never has to hunt through by-stage/. Writes, under
+    apply_dir:
+      - `all.{yaml,json}`        — the full set across all namespaces;
+      - `<stage>.{yaml,json}`    — one per stage, for a staged rollout;
+      - `<stage>/<namespace>.{yaml,json}` — one per namespace, for applying a
+        single namespace on its own. A namespace with nothing to apply (no hot
+        workloads and not quota-skipped) gets no file.
+    Returns apply_dir."""
     os.makedirs(apply_dir, exist_ok=True)
     write_apply_manifest_pair(trees, os.path.join(apply_dir, "all"), target_util)
     for stage, stage_nodes in sorted(group_by_stage(trees).items()):
         write_apply_manifest_pair(stage_nodes,
                                   os.path.join(apply_dir, stage), target_util)
+        stage_subdir = os.path.join(apply_dir, stage)
+        for node in sorted(stage_nodes, key=lambda n: n["namespace"]):
+            plan = build_apply_plan([node], target_util)
+            if not plan["patches"] and not plan["skipped"]:
+                continue   # nothing to apply for this namespace -> no file
+            os.makedirs(stage_subdir, exist_ok=True)
+            write_apply_manifest_pair(
+                [node], os.path.join(stage_subdir, node["namespace"]),
+                target_util)
     return apply_dir
 
 

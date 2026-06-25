@@ -749,33 +749,72 @@ python3 scripts/python/fetch-cluster-usage.py --namespace pid-002-api-test-01-bl
 python3 scripts/python/fetch-cluster-usage.py --level namespace,workload
 ```
 
-### In-cluster (CronJob)
+### In-cluster (CronJob → GitLab)
 
-`manifests/cluster-usage-cronjob.yaml` ships a cluster-wide CronJob (ServiceAccount
-+ ClusterRole/Binding + ConfigMap-delivered script on `python:3.12-slim`).
-Populate the ConfigMap from the real script and set `THANOS_URL`:
+`manifests/cluster-usage-cronjob.yaml` ships a cluster-wide CronJob that **every
+5 days** runs the full pipeline and pushes the reports to a GitLab repo over
+HTTPS with a PAT — no image build and no runtime internet egress (a static `oc`
+binary is copied from a pinned CLI image; the stdlib-only scripts come from a
+ConfigMap). The pipeline (initContainers run in order; all must succeed before
+the push):
+
+| Step | Image | Does |
+|---|---|---|
+| `get-oc` | `quay.io/openshift/origin-cli` | copies a static `oc` into a shared `/tools` emptyDir |
+| `fetch` | `python:3.12-slim` | `fetch-cluster-usage.py --in-cluster` → `/work` (+ logs to stdout/Loki) |
+| `apply` | `python:3.12-slim` | `apply-recommendations.py --oc` **server-side dry-run** → `/work/apply-report.txt` (changes nothing) |
+| `push` | `alpine/git` | `git clone`/`commit`/`push` `/work` → `<repo>/<subdir>/<YYYY-MM-DD>/` |
+
+Setup:
 
 ```bash
-oc create configmap cluster-usage-script \
-  --from-file=fetch-cluster-usage.py=scripts/python/fetch-cluster-usage.py \
-  -n forensic-usage --dry-run=client -o yaml | oc apply -f -
+# 1. namespace + RBAC + CronJob
 oc apply -f manifests/cluster-usage-cronjob.yaml
+
+# 2. ship BOTH scripts via the ConfigMap (re-run after editing either)
+oc create configmap cluster-usage-scripts \
+  --from-file=fetch-cluster-usage.py=scripts/python/fetch-cluster-usage.py \
+  --from-file=apply-recommendations.py=scripts/python/apply-recommendations.py \
+  -n forensic-usage --dry-run=client -o yaml | oc apply -f -
+
+# 3. GitLab PAT (write_repository scope) — never commit the token
+oc create secret generic gitlab-push \
+  --from-literal=pat='glpat-xxxxxxxxxxxxxxxxxxxx' -n forensic-usage
 ```
 
-On OpenShift, uncomment the `cluster-monitoring-view` binding so the SA token is
-accepted by `thanos-querier`. On RKE2/kube-prometheus-stack, Thanos in-cluster
-usually needs no auth.
+Then edit the CronJob env to point at your GitLab target (`GITLAB_HOST`,
+`GITLAB_PROJECT_PATH`, `GIT_BRANCH`, `GIT_NAME`, `GIT_EMAIL`, `REPORT_SUBDIR`)
+and set `THANOS_URL`. On OpenShift, uncomment the `cluster-monitoring-view`
+binding so the SA token is accepted by `thanos-querier`; on RKE2/kube-prometheus-stack
+Thanos in-cluster usually needs no auth.
 
-### Persisting the daily reports
+**The apply step is dry-run by default** — it validates the right-sizing patches
+against the live cluster and records them in `apply-report.txt`, but mutates
+nothing. To actually patch workloads on the timer, add `--execute` to the
+`apply` container's args (this rolls prod workloads unattended every 5 days — read
+the warning above that arg first). Server-side dry-run still needs `patch`/`update`
+RBAC, which the manifest grants on Deployments/StatefulSets.
 
-The CronJob writes the human-readable table to **stdout** (captured by your
-Loki/EFK stack — browse it in Grafana with no extra setup) **and** writes
-machine-readable files into a per-day folder on a PVC. Each day's folder holds a
-combined report plus a `by-stage/<stage>/` sub-report per stage, and a
-`LEGEND.md` describing every column and `level` row:
+> **"Every 5 days" caveat:** the schedule is `0 6 */5 * *`. Cron's `*/5`
+> day-of-month resets each month, so the gap across a month boundary can be 1–4
+> days rather than exactly 5 — the conventional CronJob approximation.
+
+Because the reports now live in GitLab (commit history = the per-run audit
+trail), this revision drops the report PVC and the optional HTTP viewer that the
+earlier daily version used.
+
+### The report files (`--output-dir`)
+
+`--output-dir DIR` writes the full machine-readable bundle (and `--format text`
+still logs the human table to **stdout**, captured by Loki/EFK). The in-cluster
+CronJob points `--output-dir` at an emptyDir and pushes the result to GitLab (see
+[In-cluster](#in-cluster-cronjob--gitlab) above); locally you just point it at a
+folder. The bundle holds a combined report plus a `by-stage/<stage>/` sub-report
+per stage, the gathered `apply/` manifests, and a `LEGEND.md` describing every
+column and `level` row:
 
 ```
-/reports/2026-06-08/
+<output-dir>/   (e.g. one commit under reports/2026-06-08/ in GitLab)
   resources.csv               # cluster + per-stage rollup rows, then ns/workload/pod/container detail
   resources-human.csv         # same rows, every value with its unit (200m, 6.3Mi, 4.9%)
   namespaces.csv              # one row per namespace (used vs. limited summary)
@@ -793,6 +832,11 @@ combined report plus a `by-stage/<stage>/` sub-report per stage, and a
     all.yaml   all.json       # every namespace, combined
     test.yaml  test.json      # one pair per stage — for a staged rollout
     prod.yaml  prod.json
+    test/                     # one pair per namespace — for a dedicated apply
+      pid-1-app-test-01.yaml  .json
+      pid-2-api-test-01.yaml  .json
+    prod/
+      pid-3-web-prod-01.yaml  .json
     ...
   by-stage/
     ref/   {the same files}   # only ref namespaces
@@ -802,12 +846,25 @@ combined report plus a `by-stage/<stage>/` sub-report per stage, and a
 ```
 
 The **`apply/` folder** gathers only the apply manifests so you never have to
-dig through `by-stage/`: `all.json` is the full set across every namespace, and
-each `<stage>.json` is that stage alone. Point the applier straight at one of
-them — e.g. `--manifest reports/usage/apply/all.json` for everything, or
-`apply/test.json` then `apply/prod.json` to roll out stage by stage. (The
-top-level `recommendations-apply.json` is the same as `apply/all.json` — the
-folder just keeps the manifests together and split by stage.)
+dig through `by-stage/`, at three granularities:
+
+- `all.json` — the full set across every namespace;
+- `<stage>.json` — one whole stage (`apply/test.json`, `apply/prod.json`);
+- `<stage>/<namespace>.json` — a single namespace, for a **dedicated** apply
+  (`apply/prod/pid-3-web-prod-01.json`). A namespace with nothing to apply (no
+  hot workloads and not quota-skipped) gets no file.
+
+Point the applier straight at whichever scope you want:
+
+```bash
+./apply-recommendations.py --manifest reports/usage/apply/all.json --execute            # everything
+./apply-recommendations.py --manifest reports/usage/apply/prod.json --execute           # one stage
+./apply-recommendations.py --manifest reports/usage/apply/prod/pid-3-web-prod-01.json \
+  --execute                                                                              # one namespace
+```
+
+(The top-level `recommendations-apply.json` is the same as `apply/all.json` — the
+folder just keeps the manifests together and split by stage and namespace.)
 
 `resources.csv` has one row per scope, identified by its `level` column:
 `cluster` (grand total) → `stage` (per stage) → `namespace` → `workload` → `pod`
@@ -872,39 +929,15 @@ python3 scripts/python/fetch-cluster-usage.py --kubectl --format none --output-d
 `--target-util PCT` (default 80) drives both the recommendation CSVs and the
 apply manifest.
 
-`--date-subdir` gives each run its own dated folder (so a daily run keeps
-history instead of overwriting), and `--retention-days 30` prunes folders older
-than 30 days (only date-named folders are ever removed). The manifest provisions
-a 1Gi `PersistentVolumeClaim` (`cluster-usage-reports`). Prefer
-`ReadWriteMany` if your storage class supports it (OpenShift ODF/NFS,
-Longhorn-RWX); `ReadWriteOnce` works for the single-writer CronJob too.
+**Run history / retention.** The in-cluster CronJob pushes each run into a dated
+folder in GitLab (`<subdir>/<YYYY-MM-DD>/`), so the repo's commit history *is* the
+retention — no PVC, reader pod, or viewer to manage. Prune old runs with GitLab's
+normal git tooling (or just leave them; the bundles are tiny CSV/JSON/YAML).
 
-A PVC isn't browsable on its own — to get the files off it:
-
-```bash
-# copy a day's reports to your machine via a throwaway reader pod
-oc run usage-reader --image=busybox --restart=Never -n forensic-usage \
-  --overrides='{"spec":{"containers":[{"name":"r","image":"busybox",
-    "command":["sleep","3600"],"volumeMounts":[{"name":"r","mountPath":"/reports",
-    "readOnly":true}]}],"volumes":[{"name":"r","persistentVolumeClaim":
-    {"claimName":"cluster-usage-reports"}}]}}'
-oc cp forensic-usage/usage-reader:/reports ./usage-reports
-oc delete pod usage-reader -n forensic-usage
-```
-
-Or uncomment the read-only **viewer** `Deployment` + `Service` at the bottom of
-the manifest to browse the folders over HTTP (`python -m http.server`; needs an
-RWX PVC, or a reader on the CronJob's node for RWO).
-
-**Writability:** on RKE2 the root container writes the PVC directly. On OpenShift
-the restricted SCC assigns a random UID + fsGroup and chowns the volume, which
-is usually enough; if writes fail with `Permission denied`, set
-`securityContext.fsGroup` in the CronJob to a GID your SCC allows.
-
-**Want object storage instead?** You already run a Thanos object store
-(`manifests/thanos-objstore.md`). For durable, downloadable, lifecycle-expired
-reports, add an `mc`/`rclone` sidecar that syncs `/reports` to a bucket after
-the Python step — ask and we can wire that up.
+For a PVC- or local-disk-based deployment instead of (or in addition to) the
+GitLab push, the script's own flags still apply: `--date-subdir` gives each run
+its own dated folder rather than overwriting, and `--retention-days 30` prunes
+date-named folders older than 30 days (only date-named folders are ever removed).
 
 ### Requirements
 
