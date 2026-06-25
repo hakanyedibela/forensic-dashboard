@@ -472,6 +472,37 @@ def parse_storage_quota(items):
     return out
 
 
+def storage_totals(storage):
+    """Sum a namespace's per-storageclass quota into (used, hard) bytes across
+    all classes. Each side is None when no class tracks it. Feeds the
+    storage_used / storage_hard / storage_used_pct namespace columns."""
+    used = [v.get("used") for v in (storage or {}).values() if v.get("used") is not None]
+    hard = [v.get("hard") for v in (storage or {}).values() if v.get("hard") is not None]
+    return (sum(used) if used else None, sum(hard) if hard else None)
+
+
+def pvc_records(items):
+    """PersistentVolumeClaim list -> [{name, storageclass, capacity}] sorted by
+    name. Capacity is the provisioned status.capacity.storage (Bound PVCs) or,
+    failing that, the requested spec.resources.requests.storage, parsed to bytes.
+    storageClassName missing -> '-'."""
+    out = []
+    for it in items or []:
+        meta = it.get("metadata", {}) or {}
+        spec = it.get("spec", {}) or {}
+        status = it.get("status", {}) or {}
+        cap = (status.get("capacity", {}) or {}).get("storage")
+        if cap is None:
+            cap = ((spec.get("resources", {}) or {}).get("requests", {})
+                   or {}).get("storage")
+        out.append({
+            "name": meta.get("name", ""),
+            "storageclass": spec.get("storageClassName") or "-",
+            "capacity": parse_mem(cap),
+        })
+    return sorted(out, key=lambda p: p["name"])
+
+
 # ------------------------------------------------------- pod -> leaf records
 
 def pods_to_leaves(pods, rs_index):
@@ -569,6 +600,7 @@ def build_namespace_tree(namespace, leaves, ooms):
         "workloads": workloads,
         "ooms": ooms,
         "storage": {},
+        "pvcs": [],
     }
 
 
@@ -706,6 +738,7 @@ def attach_oom_counts(leaves, merged_ooms):
 _RESOURCES = {
     "pods":         ("pods",         "/api/v1",        True),
     "resourcequotas": ("resourcequotas", "/api/v1",    True),
+    "persistentvolumeclaims": ("persistentvolumeclaims", "/api/v1", True),
     "replicasets":  ("replicasets",  "/apis/apps/v1",  True),
     "deployments":  ("deployments",  "/apis/apps/v1",  True),
     "statefulsets": ("statefulsets", "/apis/apps/v1",  True),
@@ -762,6 +795,9 @@ class CliK8sClient:
     def list_resourcequotas(self, namespace=None):
         return self._list("resourcequotas", namespace)
 
+    def list_persistentvolumeclaims(self, namespace=None):
+        return self._list("persistentvolumeclaims", namespace)
+
     def list_replicasets(self, namespace=None):
         return self._list("replicasets", namespace)
 
@@ -815,6 +851,9 @@ class RestK8sClient:
 
     def list_resourcequotas(self, namespace=None):
         return self._list("resourcequotas", namespace)
+
+    def list_persistentvolumeclaims(self, namespace=None):
+        return self._list("persistentvolumeclaims", namespace)
 
     def list_replicasets(self, namespace=None):
         return self._list("replicasets", namespace)
@@ -1098,9 +1137,16 @@ def collect_namespace(fcu_k8s, namespace, thanos, window, step,
     quotas = lister(namespace) if lister else []
     if quotas:
         apply_quota_to_totals(node["totals"], parse_quota(quotas))
-    # Per-storageclass requests.storage Hard/Used (for storage.csv); {} when the
-    # namespace has no storage quota.
+    # Per-storageclass requests.storage Hard/Used from the ResourceQuota, plus
+    # the summed totals on the namespace rollup (-> namespaces.csv storage cols).
     node["storage"] = parse_storage_quota(quotas)
+    s_used, s_hard = storage_totals(node["storage"])
+    node["totals"]["storage_used"] = s_used
+    node["totals"]["storage_hard"] = s_hard
+    node["totals"]["storage_used_pct"] = util_pct(s_used, s_hard)
+    # PersistentVolumeClaims in the namespace (-> resources.csv pvc rows).
+    pvc_lister = getattr(fcu_k8s, "list_persistentvolumeclaims", None)
+    node["pvcs"] = pvc_records(pvc_lister(namespace)) if pvc_lister else []
 
     if include_idle:
         present = {(w["kind"], w["name"]) for w in node["workloads"]}
@@ -1120,7 +1166,7 @@ def collect_namespace(fcu_k8s, namespace, thanos, window, step,
 CSV_FIELDS = [
     ("level", "level"), ("stage", "stage"), ("namespace", "namespace"),
     ("workload_kind", "workload_kind"), ("workload", "workload"),
-    ("pod", "pod"), ("container", "container"),
+    ("pod", "pod"), ("container", "container"), ("pvc", "pvc"),
     ("cpu_request_cores", "cpu_request"), ("cpu_limit_cores", "cpu_limit"),
     ("cpu_now_cores", "cpu_now"),
     ("cpu_request_used_cores", "cpu_request_used"),
@@ -1133,6 +1179,13 @@ CSV_FIELDS = [
     ("mem_limit_used_bytes", "mem_limit_used"),
     ("mem_peak_bytes", "mem_peak"),
     ("mem_peak_util_pct", "mem_peak_util_pct"),
+    # Storage: namespace-level ResourceQuota requests.storage Used/Hard (+%),
+    # summed at stage/cluster; storageclass + capacity carry the per-PVC rows.
+    ("storage_used_bytes", "storage_used"),
+    ("storage_hard_bytes", "storage_hard"),
+    ("storage_used_pct", "storage_used_pct"),
+    ("storageclass", "storageclass"),
+    ("storage_capacity_bytes", "storage_capacity"),
     ("oom_count", "oom_count"), ("pod_count", "pod_count"),
     ("container_count", "container_count"),
 ]
@@ -1155,10 +1208,21 @@ def _row_from_totals(level, stage, namespace, totals, **ids):
 
 # Metric (non-identity) columns, reused for the concise per-namespace summary.
 _IDENTITY_KEYS = {"level", "stage", "namespace", "workload_kind", "workload",
-                  "pod", "container"}
-METRIC_FIELDS = [(h, k) for h, k in CSV_FIELDS if k not in _IDENTITY_KEYS]
+                  "pod", "container", "pvc", "storageclass"}
+# PVC-only metric columns: meaningful on level=pvc rows in resources.csv but not
+# at the namespace level, so they're excluded from the namespaces.csv summary.
+_PVC_ONLY_KEYS = {"storage_capacity"}
+METRIC_FIELDS = [(h, k) for h, k in CSV_FIELDS
+                 if k not in _IDENTITY_KEYS and k not in _PVC_ONLY_KEYS]
 NS_CSV_FIELDS = [("stage", "stage"), ("namespace", "namespace")] + METRIC_FIELDS
-NS_CSV_COLUMNS = [h for h, _ in NS_CSV_FIELDS]
+# Per-storageclass quota columns appended only to namespaces.csv (the totals
+# storage_used/hard/used_pct already come in via METRIC_FIELDS). Dense over the
+# canonical class set so every namespace has the same columns.
+NS_STORAGE_COLUMNS = []
+for _cls in STORAGE_CLASSES:
+    NS_STORAGE_COLUMNS += [f"{_cls}_used_bytes", f"{_cls}_hard_bytes",
+                           f"{_cls}_used_pct"]
+NS_CSV_COLUMNS = [h for h, _ in NS_CSV_FIELDS] + NS_STORAGE_COLUMNS
 
 # Human-readable twin of resources.csv: same rows/columns, but each metric is
 # rendered with its unit inline (200m, 6.3Mi, 4.9%) instead of a raw float. The
@@ -1168,7 +1232,8 @@ _CPU_METRIC_KEYS = {"cpu_request", "cpu_limit", "cpu_now", "cpu_peak", "cpu_avg"
                     "cpu_request_used", "cpu_limit_used"}
 _MEM_METRIC_KEYS = {"mem_request", "mem_limit", "mem_now", "mem_peak",
                     "mem_request_used", "mem_limit_used"}
-_PCT_METRIC_KEYS = {"cpu_peak_util_pct", "mem_peak_util_pct"}
+_STORAGE_BYTES_KEYS = {"storage_used", "storage_hard", "storage_capacity"}
+_PCT_METRIC_KEYS = {"cpu_peak_util_pct", "mem_peak_util_pct", "storage_used_pct"}
 _HEADER_TO_KEY = dict(CSV_FIELDS)
 
 
@@ -1181,7 +1246,31 @@ def _human_header(header):
 
 
 HUMAN_CSV_COLUMNS = [_human_header(h) for h, _ in CSV_FIELDS]
-NS_HUMAN_CSV_COLUMNS = [_human_header(h) for h, _ in NS_CSV_FIELDS]
+NS_HUMAN_STORAGE_COLUMNS = [_human_header(c) for c in NS_STORAGE_COLUMNS]
+NS_HUMAN_CSV_COLUMNS = ([_human_header(h) for h, _ in NS_CSV_FIELDS]
+                        + NS_HUMAN_STORAGE_COLUMNS)
+
+
+def _ns_storage_cells(node, human):
+    """Per-storageclass quota cells for namespaces.csv. A class absent from the
+    namespace's quota shows 0 (dense matrix, matching the cpu/mem 'used'
+    columns); %-used is Used/Hard (blank / '-' where Hard is 0)."""
+    store = node.get("storage") or {}
+    cells = {}
+    for cls in STORAGE_CLASSES:
+        entry = store.get(cls) or {}
+        used = entry.get("used") or 0
+        hard = entry.get("hard") or 0
+        pct = util_pct(used, hard)
+        if human:
+            cells[f"{cls}_used"] = fmt_bytes(used)
+            cells[f"{cls}_hard"] = fmt_bytes(hard)
+            cells[f"{cls}_used_pct"] = fmt_pct(pct)
+        else:
+            cells[f"{cls}_used_bytes"] = used
+            cells[f"{cls}_hard_bytes"] = hard
+            cells[f"{cls}_used_pct"] = "" if pct is None else pct
+    return cells
 
 
 def _human_metric(key, value):
@@ -1189,7 +1278,7 @@ def _human_metric(key, value):
     v = None if value == "" else value
     if key in _CPU_METRIC_KEYS:
         return fmt_cores(v)
-    if key in _MEM_METRIC_KEYS:
+    if key in _MEM_METRIC_KEYS or key in _STORAGE_BYTES_KEYS:
         return fmt_bytes(v)
     if key in _PCT_METRIC_KEYS:
         return fmt_pct(v)
@@ -1211,6 +1300,10 @@ def aggregate_totals(totals_list):
         agg[f] = sum_usage([t.get(f) for t in totals_list])
     agg["cpu_peak_util_pct"] = util_pct(agg["cpu_peak"], agg["cpu_limit"])
     agg["mem_peak_util_pct"] = util_pct(agg["mem_peak"], agg["mem_limit"])
+    # Storage quota Used/Hard sum across namespaces; %-used recomputed.
+    agg["storage_used"] = sum_usage([t.get("storage_used") for t in totals_list])
+    agg["storage_hard"] = sum_usage([t.get("storage_hard") for t in totals_list])
+    agg["storage_used_pct"] = util_pct(agg["storage_used"], agg["storage_hard"])
     for f in ("oom_count", "pod_count", "container_count"):
         agg[f] = sum(t.get(f, 0) for t in totals_list)
     return agg
@@ -1267,6 +1360,12 @@ def flatten_rows(trees):
                         "container", stage, ns, c,
                         workload_kind=wl["kind"], workload=wl["name"],
                         pod=pod["name"], container=c["container"]))
+        # PVCs are namespace-scoped (parallel to workloads): one row each, with
+        # capacity + storageclass and the cpu/mem columns left blank.
+        for pvc in node.get("pvcs", []):
+            rows.append(_row_from_totals(
+                "pvc", stage, ns, {"storage_capacity": pvc["capacity"]},
+                pvc=pvc["name"], storageclass=pvc["storageclass"]))
     return rows
 
 
@@ -1302,6 +1401,7 @@ def render_namespaces_csv(trees, stream):
         for header, key in METRIC_FIELDS:
             v = node["totals"].get(key)
             row[header] = "" if v is None else v
+        row.update(_ns_storage_cells(node, human=False))
         writer.writerow(row)
 
 
@@ -1315,6 +1415,7 @@ def render_namespaces_human_csv(trees, stream):
         row = {"stage": node["stage"], "namespace": node["namespace"]}
         for header, key in METRIC_FIELDS:
             row[_human_header(header)] = _human_metric(key, node["totals"].get(key))
+        row.update(_ns_storage_cells(node, human=True))
         writer.writerow(row)
 
 
@@ -1622,71 +1723,6 @@ def render_recommendations_apply_json(trees, stream, target_util=80.0):
     stream.write("\n")
 
 
-# ------------------------------------------ per-storageclass storage CSV (wide)
-
-def storage_classes_in(trees):
-    """Column order for the storage CSV: the canonical STORAGE_CLASSES first
-    (stable, fixed layout), then any extra storageclass found in the data but
-    not listed (sorted) so a renamed/unexpected class is surfaced, not dropped."""
-    extra = sorted({cls for node in trees
-                    for cls in (node.get("storage") or {})
-                    if cls not in STORAGE_CLASSES})
-    return list(STORAGE_CLASSES) + extra
-
-
-def storage_rows(trees, classes=None):
-    """One dict per namespace (sorted by stage, then namespace) with keys
-    `stage`, `namespace`, and `<class>_used` / `<class>_hard` (bytes) for every
-    class. A class absent from a namespace's quota is 0 (not None), so the matrix
-    is dense — every class shown for every namespace, including zeros."""
-    if classes is None:
-        classes = storage_classes_in(trees)
-    rows = []
-    for node in sorted(trees, key=lambda n: (n["stage"], n["namespace"])):
-        store = node.get("storage") or {}
-        row = {"stage": node["stage"], "namespace": node["namespace"]}
-        for cls in classes:
-            entry = store.get(cls) or {}
-            row[f"{cls}_used"] = entry.get("used") or 0
-            row[f"{cls}_hard"] = entry.get("hard") or 0
-        rows.append(row)
-    return rows
-
-
-def render_storage_csv(trees, stream):
-    """Per-namespace storage quota CSV (wide): two raw-byte columns
-    (`<class>_used_bytes`, `<class>_hard_bytes`) per storageclass."""
-    classes = storage_classes_in(trees)
-    cols = ["stage", "namespace"]
-    for cls in classes:
-        cols += [f"{cls}_used_bytes", f"{cls}_hard_bytes"]
-    writer = csv.DictWriter(stream, fieldnames=cols, extrasaction="ignore")
-    writer.writeheader()
-    for row in storage_rows(trees, classes):
-        out = {"stage": row["stage"], "namespace": row["namespace"]}
-        for cls in classes:
-            out[f"{cls}_used_bytes"] = row[f"{cls}_used"]
-            out[f"{cls}_hard_bytes"] = row[f"{cls}_hard"]
-        writer.writerow(out)
-
-
-def render_storage_human_csv(trees, stream):
-    """Human-readable twin: same rows, each byte value formatted with its unit
-    (`10.0Gi`, `0.0B`); the `_bytes` header suffix is dropped."""
-    classes = storage_classes_in(trees)
-    cols = ["stage", "namespace"]
-    for cls in classes:
-        cols += [f"{cls}_used", f"{cls}_hard"]
-    writer = csv.DictWriter(stream, fieldnames=cols, extrasaction="ignore")
-    writer.writeheader()
-    for row in storage_rows(trees, classes):
-        out = {"stage": row["stage"], "namespace": row["namespace"]}
-        for cls in classes:
-            out[f"{cls}_used"] = fmt_bytes(row[f"{cls}_used"])
-            out[f"{cls}_hard"] = fmt_bytes(row[f"{cls}_hard"])
-        writer.writerow(out)
-
-
 def render_ooms_csv(trees, stream):
     cols = ["stage", "namespace", "pod", "container", "source", "oom_events",
             "restart_count", "exit_code", "finished_at"]
@@ -1734,10 +1770,6 @@ def render_stdout_formats(trees, formats, stream, window, cluster, levels,
         render_recommendations_csv(trees, stream, target_util=target_util)
     if "recommendations-human" in formats:
         render_recommendations_human_csv(trees, stream, target_util=target_util)
-    if "storage" in formats:
-        render_storage_csv(trees, stream)
-    if "storage-human" in formats:
-        render_storage_human_csv(trees, stream)
     if "recommendations-apply" in formats:
         render_recommendations_apply_yaml(trees, stream, target_util=target_util)
 
@@ -1767,8 +1799,6 @@ Erzeugt von scripts/python/fetch-cluster-usage.py.
 - `recommendations-human.csv` — dieselben Zeilen wie `recommendations.csv`, aber jeder Wert mit Einheit (z. B. `200m`, `1.13c`, `6.3Mi`) statt Rohzahl.
 - `recommendations-apply.yaml` — anwendbares Patch-Manifest: ein `ResourcePatch`-Dokument pro **heißem** Workload, das die empfohlenen `requests`/`limits` pro Container als Strategic-Merge-Patch setzt. Namespaces, deren Summe das ResourceQuota überschreiten würde (`quota_action=INCREASE_QUOTA`), werden **übersprungen** und im `SKIPPED`-Kopfblock genannt (Quota zuerst manuell erhöhen). Zum menschlichen Review gedacht.
 - `recommendations-apply.json` — maschinenlesbares Pendant zu `recommendations-apply.yaml` (dieselben Patches), das `apply-recommendations.py` mit der Python-Standardbibliothek liest (kein YAML-Paket nötig).
-- `storage.csv`    — Speicher-Kontingent pro Namespace und StorageClass: genau eine Zeile pro Namespace, je StorageClass eine `*_used_bytes`- und eine `*_hard_bytes`-Spalte (gebucht vs. Hard-Kontingent, in Bytes). Fehlt eine StorageClass im Kontingent des Namespace, steht `0`.
-- `storage-human.csv` — dieselben Zeilen wie `storage.csv`, aber jeder Wert mit Einheit (z. B. `10.0Gi`, `0.0B`) statt Rohzahl; der `_bytes`-Suffix entfällt im Spaltennamen.
 - `ooms.csv`       — eine Zeile pro OOM-getötetem Container.
 - `summary.txt`    — menschenlesbare Tabelle (CPU in Cores/Milli, Speicher in Ki/Mi/Gi, % und OOM-Anzahl) — dieselben Zahlen wie die CSVs, nur kompakt formatiert.
 - `report.json`   — dieselben Daten verschachtelt (Namespace → Workload → Pod → Container) plus Aggregationen.
@@ -1905,20 +1935,31 @@ Eigenständiges Skript, das `recommendations-apply.json` einliest und je Patch
 - Ein zwischenzeitlich gelöschter Workload (`NotFound`) wird übersprungen, nicht
   als Fehler gewertet. Der `SKIPPED`-Block wird beim Anwenden erneut ausgegeben.
 
-## storage.csv Spalten
-Speicher-Kontingent (`requests.storage`) pro Namespace, aufgeschlüsselt nach
-**StorageClass**. Quelle ist die **ResourceQuota** des Namespace (Schlüssel
-`<class>.storageclass.storage.k8s.io/requests.storage`). Breites Format: eine
-Zeile pro Namespace, je StorageClass zwei Spalten.
-- `stage`, `namespace` — Identität der Zeile.
-- `<class>_used_bytes` — gebuchter Speicher dieser StorageClass (Quota *Used*), in Bytes.
-- `<class>_hard_bytes` — Hard-Kontingent dieser StorageClass (Quota *Hard*), in Bytes.
-Die StorageClasses stehen in fester Reihenfolge; eine im Quota des Namespace
-**nicht** vorhandene Klasse erscheint als `0` (nicht leer), damit die Matrix
-dicht ist — jede Klasse für jeden Namespace, auch Nullwerte. Eine im Cluster
-gefundene, aber nicht gelistete Klasse wird hinten angehängt (nie verworfen).
-In `storage-human.csv` tragen die Werte ihre Einheit (`Ki`/`Mi`/`Gi`/`Ti`,
-`0.0B` für Null), und der `_bytes`-Suffix entfällt im Spaltennamen.
+## Speicher (Storage) — in resources.csv und namespaces.csv
+Das Speicher-Kontingent (`requests.storage`) steckt direkt in den Haupt-CSVs
+(`resources.csv` und `namespaces.csv`), nicht in einer eigenen Datei.
+
+**Quota-Summen (in beiden CSVs, auf Namespace-Ebene aus der ResourceQuota; in
+`stage`/`cluster` summiert):**
+- `storage_used_bytes` — gebuchter Speicher über alle StorageClasses (Quota *Used*).
+- `storage_hard_bytes` — Hard-Kontingent über alle StorageClasses (Quota *Hard*).
+- `storage_used_pct` — `storage_used / storage_hard` in Prozent (leer, wenn kein Hard-Kontingent).
+
+**Pro StorageClass (nur in `namespaces.csv`):** je Klasse drei Spalten
+`<class>_used_bytes`, `<class>_hard_bytes`, `<class>_used_pct` (Used, Hard und
+Used/Hard %). Die Klassen stehen in fester Reihenfolge; eine im Quota nicht
+vorhandene Klasse erscheint als `0` (dichte Matrix).
+
+**PVCs (nur in `resources.csv`):** je PersistentVolumeClaim eine Zeile mit
+`level=pvc`. Quelle ist `oc get pvc`.
+- `pvc` — Name des PVC (in der Spalte `pvc`).
+- `storageclass` — StorageClass des PVC (`spec.storageClassName`).
+- `storage_capacity_bytes` — bereitgestellte Kapazität (`status.capacity.storage`,
+  sonst `spec.resources.requests.storage`).
+Die CPU-/Speicher-Spalten sind in `pvc`-Zeilen leer; umgekehrt sind
+`pvc`/`storageclass`/`storage_capacity_bytes` in den übrigen Zeilen leer.
+In den `*-human.csv` tragen die Byte-Werte ihre Einheit (`Ki`/`Mi`/`Gi`/`Ti`)
+und `*_pct` das `%`-Zeichen; der `_bytes`-Suffix entfällt im Spaltennamen.
 
 ## ooms.csv Spalten
 - `stage`, `namespace`, `pod`, `container` — welcher Container OOM erlitten hat.
@@ -1970,11 +2011,6 @@ def write_report_files(trees, out_dir, window, cluster,
     with open(os.path.join(out_dir, "recommendations-apply.json"), "w",
               encoding="utf-8") as f:
         render_recommendations_apply_json(trees, f, target_util=target_util)
-    with open(os.path.join(out_dir, "storage.csv"), "w", encoding="utf-8") as f:
-        render_storage_csv(trees, f)
-    with open(os.path.join(out_dir, "storage-human.csv"), "w",
-              encoding="utf-8") as f:
-        render_storage_human_csv(trees, f)
     with open(os.path.join(out_dir, "ooms.csv"), "w", encoding="utf-8") as f:
         render_ooms_csv(trees, f)
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
@@ -2222,7 +2258,7 @@ def build_parser():
                      choices=["text", "json", "csv", "resources-human",
                               "namespaces-human", "recommendations",
                               "recommendations-human", "recommendations-apply",
-                              "storage", "storage-human", "none"],
+                              "none"],
                      help="stdout format(s), repeatable (default: text). "
                           "'csv' = raw resources.csv; 'resources-human' / "
                           "'namespaces-human' = the unit-formatted CSVs; "
@@ -2230,8 +2266,6 @@ def build_parser():
                           "per-workload right-sizing CSV (raw / unit-formatted); "
                           "'recommendations-apply' = the per-workload patch YAML "
                           "manifest (for apply-recommendations.py); "
-                          "'storage' / 'storage-human' = per-namespace "
-                          "per-storageclass storage quota (raw / unit-formatted); "
                           "'none' = no stdout (pair with --output-dir to only "
                           "write files).")
     out.add_argument("--target-util", type=float, default=80.0,
