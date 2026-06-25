@@ -947,7 +947,8 @@ Storage lives in the main CSVs — there is no separate `storage.csv`.
   class set (a class the quota doesn't mention shows `0`, so the matrix is dense).
 - **`resources.csv`** gains the storage totals on the `namespace`/`stage`/`cluster`
   rows, and one **`level=pvc`** row per PersistentVolumeClaim carrying `pvc`
-  (name), `storageclass`, and `storage_capacity_bytes` (provisioned capacity).
+  (name), `storageclass`, `storageclass_description` (from the StorageClass's
+  `description` annotation), and `storage_capacity_bytes` (provisioned capacity).
   The cpu/mem columns are blank on `pvc` rows and vice-versa.
 
 The used % is the storageclass quota (Used÷Hard); per-PVC disk fill is not
@@ -1001,7 +1002,7 @@ date-named folders older than 30 days (only date-named folders are ever removed)
   as well as the `python:3.12-slim` CronJob image.
 - Local: `oc` or `kubectl` (`--kubectl`) with an active session; RBAC `get`/`list`
   on pods, replicasets, deployments, statefulsets, daemonsets, resourcequotas,
-  persistentvolumeclaims, and namespaces.
+  persistentvolumeclaims, storageclasses, and namespaces.
   (With `oc` it discovers namespaces via `oc get projects` — the projects you can
   see — matching `fetch-cluster-state-loop.sh`; `kubectl` lists `namespaces`.)
 - In-cluster: the ServiceAccount RBAC from the manifest.

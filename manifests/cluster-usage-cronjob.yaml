@@ -55,6 +55,9 @@ rules:
   - apiGroups: ["apps"]
     resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]
     verbs: ["get", "list"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list"]
   # The apply step does a server-side dry-run (oc patch --dry-run=server). The API
   # server still runs an authorization check for it, so the SA needs patch/update
   # on the workload kinds even though nothing is mutated. Removing "--execute"

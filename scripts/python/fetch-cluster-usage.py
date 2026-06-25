@@ -503,6 +503,33 @@ def pvc_records(items):
     return sorted(out, key=lambda p: p["name"])
 
 
+def _storageclass_description(sc):
+    """Pull the human description from a StorageClass's annotations: the exact
+    `description` key, else the first annotation ending in `/description`
+    (e.g. `kubernetes.io/description`). '' when none is set."""
+    ann = (sc.get("metadata", {}) or {}).get("annotations", {}) or {}
+    if ann.get("description"):
+        return ann["description"]
+    for key, val in ann.items():
+        if key.endswith("/description") and val:
+            return val
+    return ""
+
+
+def storageclass_descriptions(items):
+    """{storageclass name: description} from a list of StorageClass objects.
+    Classes without a description annotation are omitted. Empty/None -> {}."""
+    out = {}
+    for sc in items or []:
+        name = (sc.get("metadata", {}) or {}).get("name")
+        if not name:
+            continue
+        desc = _storageclass_description(sc)
+        if desc:
+            out[name] = desc
+    return out
+
+
 # ------------------------------------------------------- pod -> leaf records
 
 def pods_to_leaves(pods, rs_index):
@@ -743,6 +770,7 @@ _RESOURCES = {
     "deployments":  ("deployments",  "/apis/apps/v1",  True),
     "statefulsets": ("statefulsets", "/apis/apps/v1",  True),
     "daemonsets":   ("daemonsets",   "/apis/apps/v1",  True),
+    "storageclasses": ("storageclasses", "/apis/storage.k8s.io/v1", False),
     "namespaces":   ("namespaces",   "/api/v1",        False),
     # OpenShift: listing projects returns what the caller can see and doesn't
     # need cluster-wide namespace list permission (matches
@@ -797,6 +825,9 @@ class CliK8sClient:
 
     def list_persistentvolumeclaims(self, namespace=None):
         return self._list("persistentvolumeclaims", namespace)
+
+    def list_storageclasses(self):
+        return self._list("storageclasses", None)
 
     def list_replicasets(self, namespace=None):
         return self._list("replicasets", namespace)
@@ -854,6 +885,9 @@ class RestK8sClient:
 
     def list_persistentvolumeclaims(self, namespace=None):
         return self._list("persistentvolumeclaims", namespace)
+
+    def list_storageclasses(self):
+        return self._list("storageclasses", None)
 
     def list_replicasets(self, namespace=None):
         return self._list("replicasets", namespace)
@@ -1104,7 +1138,7 @@ def _declared_workloads(fcu_k8s, namespace):
 
 
 def collect_namespace(fcu_k8s, namespace, thanos, window, step,
-                      include_idle=True):
+                      include_idle=True, sc_desc=None):
     """Full per-namespace pipeline -> nested namespace tree dict.
 
     When include_idle is set, declared Deployments/StatefulSets/DaemonSets with
@@ -1144,9 +1178,14 @@ def collect_namespace(fcu_k8s, namespace, thanos, window, step,
     node["totals"]["storage_used"] = s_used
     node["totals"]["storage_hard"] = s_hard
     node["totals"]["storage_used_pct"] = util_pct(s_used, s_hard)
-    # PersistentVolumeClaims in the namespace (-> resources.csv pvc rows).
+    # PersistentVolumeClaims in the namespace (-> resources.csv pvc rows), each
+    # tagged with its StorageClass's description annotation (cluster-scoped map
+    # fetched once, passed in as sc_desc).
     pvc_lister = getattr(fcu_k8s, "list_persistentvolumeclaims", None)
     node["pvcs"] = pvc_records(pvc_lister(namespace)) if pvc_lister else []
+    sc_desc = sc_desc or {}
+    for p in node["pvcs"]:
+        p["description"] = sc_desc.get(p["storageclass"], "")
 
     if include_idle:
         present = {(w["kind"], w["name"]) for w in node["workloads"]}
@@ -1185,6 +1224,7 @@ CSV_FIELDS = [
     ("storage_hard_bytes", "storage_hard"),
     ("storage_used_pct", "storage_used_pct"),
     ("storageclass", "storageclass"),
+    ("storageclass_description", "storageclass_description"),
     ("storage_capacity_bytes", "storage_capacity"),
     ("oom_count", "oom_count"), ("pod_count", "pod_count"),
     ("container_count", "container_count"),
@@ -1208,7 +1248,8 @@ def _row_from_totals(level, stage, namespace, totals, **ids):
 
 # Metric (non-identity) columns, reused for the concise per-namespace summary.
 _IDENTITY_KEYS = {"level", "stage", "namespace", "workload_kind", "workload",
-                  "pod", "container", "pvc", "storageclass"}
+                  "pod", "container", "pvc", "storageclass",
+                  "storageclass_description"}
 # PVC-only metric columns: meaningful on level=pvc rows in resources.csv but not
 # at the namespace level, so they're excluded from the namespaces.csv summary.
 _PVC_ONLY_KEYS = {"storage_capacity"}
@@ -1365,7 +1406,8 @@ def flatten_rows(trees):
         for pvc in node.get("pvcs", []):
             rows.append(_row_from_totals(
                 "pvc", stage, ns, {"storage_capacity": pvc["capacity"]},
-                pvc=pvc["name"], storageclass=pvc["storageclass"]))
+                pvc=pvc["name"], storageclass=pvc["storageclass"],
+                storageclass_description=pvc.get("description", "")))
     return rows
 
 
@@ -1954,6 +1996,8 @@ vorhandene Klasse erscheint als `0` (dichte Matrix).
 `level=pvc`. Quelle ist `oc get pvc`.
 - `pvc` — Name des PVC (in der Spalte `pvc`).
 - `storageclass` — StorageClass des PVC (`spec.storageClassName`).
+- `storageclass_description` — Beschreibung der StorageClass aus deren Annotation
+  `description` (bzw. `…/description`); leer, wenn nicht gesetzt.
 - `storage_capacity_bytes` — bereitgestellte Kapazität (`status.capacity.storage`,
   sonst `spec.resources.requests.storage`).
 Die CPU-/Speicher-Spalten sind in `pvc`-Zeilen leer; umgekehrt sind
@@ -2362,8 +2406,16 @@ def main(argv=None):
         sys.stderr.write("no matching namespaces.\n")
         return 0
 
+    # StorageClass descriptions are cluster-scoped — fetch once and share.
+    sc_lister = getattr(k8s, "list_storageclasses", None)
+    try:
+        sc_desc = storageclass_descriptions(sc_lister()) if sc_lister else {}
+    except Exception:                       # missing RBAC / API -> skip the column
+        sc_desc = {}
+
     trees = [collect_namespace(k8s, ns, thanos, args.window, args.step,
-                               include_idle=not args.no_idle_workloads)
+                               include_idle=not args.no_idle_workloads,
+                               sc_desc=sc_desc)
              for ns in namespaces]
 
     formats = args.format or ["text"]
