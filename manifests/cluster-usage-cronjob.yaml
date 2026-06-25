@@ -50,7 +50,7 @@ metadata:
   name: cluster-usage-read
 rules:
   - apiGroups: [""]
-    resources: ["namespaces", "pods", "resourcequotas"]
+    resources: ["namespaces", "pods", "resourcequotas", "persistentvolumeclaims"]
     verbs: ["get", "list"]
   - apiGroups: ["apps"]
     resources: ["replicasets", "deployments", "statefulsets", "daemonsets"]

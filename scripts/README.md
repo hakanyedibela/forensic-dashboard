@@ -866,16 +866,14 @@ column and `level` row:
 
 ```
 <output-dir>/   (e.g. one commit under reports/2026-06-08/ in GitLab)
-  resources.csv               # cluster + per-stage rollup rows, then ns/workload/pod/container detail
+  resources.csv               # cluster/stage/namespace/workload/pod/container + per-PVC (level=pvc) rows
   resources-human.csv         # same rows, every value with its unit (200m, 6.3Mi, 4.9%)
-  namespaces.csv              # one row per namespace (used vs. limited summary)
+  namespaces.csv              # one row per namespace (cpu/mem + storage quota: totals & per-storageclass)
   namespaces-human.csv        # same, unit-formatted
   recommendations.csv         # per-workload right-sizing (only hot workloads; raw numbers)
   recommendations-human.csv   # same, unit-formatted
   recommendations-apply.yaml  # applyable patch manifest (one ResourcePatch per hot workload)
   recommendations-apply.json  # machine-readable twin, consumed by apply-recommendations.py
-  storage.csv                 # per-namespace storage quota by StorageClass (used/hard bytes)
-  storage-human.csv           # same, unit-formatted
   ooms.csv                    # one row per OOM-killed container
   report.json                 # nested tree + cluster_totals + stage_summaries
   LEGEND.md                   # Legende (German): was jede Spalte und jede `level`-Zeile bedeutet
@@ -938,15 +936,22 @@ carry one row per **hot** workload — a workload whose CPU or memory peak over
 `limit = round_up(peak / target_util)` (CPU to the next 10m, memory to the next
 Mi). Quiet workloads are omitted.
 
-#### Storage quota report
+#### Storage (in namespaces.csv and resources.csv)
 
-`storage.csv` (raw bytes) and `storage-human.csv` (unit-formatted) give one row
-per namespace with two columns per StorageClass — `<class>_used_bytes` and
-`<class>_hard_bytes` — read from the namespace's ResourceQuota
-(`<class>.storageclass.storage.k8s.io/requests.storage`, *Used* vs. *Hard*). A
-fixed set of StorageClasses is always emitted (a class the namespace's quota
-doesn't mention shows `0`, so the matrix is dense); any extra class found in the
-data is appended rather than dropped.
+Storage lives in the main CSVs — there is no separate `storage.csv`.
+
+- **`namespaces.csv`** gains the per-namespace `requests.storage` quota from the
+  ResourceQuota: totals `storage_used_bytes` / `storage_hard_bytes` /
+  `storage_used_pct` (Used, Hard, Used÷Hard), plus a per-StorageClass triple
+  `<class>_used_bytes` / `<class>_hard_bytes` / `<class>_used_pct` over a fixed
+  class set (a class the quota doesn't mention shows `0`, so the matrix is dense).
+- **`resources.csv`** gains the storage totals on the `namespace`/`stage`/`cluster`
+  rows, and one **`level=pvc`** row per PersistentVolumeClaim carrying `pvc`
+  (name), `storageclass`, and `storage_capacity_bytes` (provisioned capacity).
+  The cpu/mem columns are blank on `pvc` rows and vice-versa.
+
+The used % is the storageclass quota (Used÷Hard); per-PVC disk fill is not
+queried (capacity only).
 
 #### Apply manifest
 
@@ -967,8 +972,8 @@ Each of these views can also be streamed to stdout without `--output-dir` via
 # preview the recommendations table
 python3 scripts/python/fetch-cluster-usage.py --kubectl --format recommendations-human
 
-# the storage-quota matrix, unit-formatted
-python3 scripts/python/fetch-cluster-usage.py --kubectl --format storage-human
+# the per-namespace summary incl. storage quota, unit-formatted
+python3 scripts/python/fetch-cluster-usage.py --kubectl --format namespaces-human
 
 # just the apply manifest (pipe straight to a file or kubectl review)
 python3 scripts/python/fetch-cluster-usage.py --kubectl --format recommendations-apply
@@ -995,7 +1000,8 @@ date-named folders older than 30 days (only date-named folders are ever removed)
 - Python 3.6.8+ (stdlib only) — runs on the RHEL 8 / OpenShift system `python3`
   as well as the `python:3.12-slim` CronJob image.
 - Local: `oc` or `kubectl` (`--kubectl`) with an active session; RBAC `get`/`list`
-  on pods, replicasets, deployments, statefulsets, daemonsets, resourcequotas, and namespaces.
+  on pods, replicasets, deployments, statefulsets, daemonsets, resourcequotas,
+  persistentvolumeclaims, and namespaces.
   (With `oc` it discovers namespaces via `oc get projects` — the projects you can
   see — matching `fetch-cluster-state-loop.sh`; `kubectl` lists `namespaces`.)
 - In-cluster: the ServiceAccount RBAC from the manifest.
