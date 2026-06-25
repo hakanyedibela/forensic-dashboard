@@ -43,7 +43,11 @@ those recommendations into something that actually changes the cluster:
 
 ### 1. Manifest renderer (in `fetch-cluster-usage.py`)
 
-New renderer following the existing `render_*` convention:
+`fetch-cluster-usage.py` is **stdlib-only** by design (it runs in-cluster as a
+CronJob), so the renderer hand-emits the YAML — it does **not** import PyYAML.
+The output is a controlled structure (k8s names, quantity strings) emitted with
+explicit double-quoting of string scalars so it round-trips through any YAML
+parser. New renderer following the existing `render_*` convention:
 
 ```python
 def render_recommendations_apply_yaml(trees, stream, target_util=80.0):
@@ -58,14 +62,17 @@ main dir and each `by-stage/<stage>/` folder, the manifest appears in all of
 them automatically. Output filename: `recommendations-apply.yaml`.
 
 The renderer reuses the existing pure layer:
-- `compute_recommendation(wl["totals"], target_util)` for the per-workload
+- `compute_recommendation(container_totals, target_util)` run **per container
+  name** (via a new `workload_container_recommendations` helper) for the
   recommended values.
 - `namespace_recommendation_summary(ns_node, target_util)` for the
   `quota_action` used by the skip-flagged guard.
 
-It does **not** introduce a new value formula. Recommended numbers are
-formatted with the existing `fmt_cores` / `fmt_bytes` helpers (Kubernetes
-quantity strings, e.g. `320m`, `256Mi`) so they round-trip through kubectl.
+It does **not** introduce a new value formula. Numbers are formatted as valid
+Kubernetes quantity strings by **new** dedicated helpers `cpu_quantity` /
+`mem_quantity` (e.g. `320m`, `256Mi`). The existing `fmt_cores` / `fmt_bytes`
+are **not** reused here: `fmt_cores` appends a `c` (cores) / `µ` suffix that is
+not a valid Kubernetes quantity, so it would not round-trip through kubectl.
 
 #### Manifest document shape
 
@@ -112,10 +119,13 @@ Notes:
 - The patch `containers` list is keyed by container `name` (strategic-merge
   patchMergeKey), so multi-container workloads get one list entry per container
   that has a recommendation.
-- Within a container's `resources`, only the qualifying dimensions are changed;
-  the paired non-hot value is emitted at its current value so the merge does
-  not leave an unpaired request/limit. A dimension with no current value and no
-  recommendation is omitted.
+- Within a container's `resources`, only the qualifying dimensions are
+  emitted, and for each the patch sets **both** `requests` and `limits`
+  (`compute_recommendation` always produces the pair together for a hot
+  resource). Cold dimensions are left out entirely — a strategic-merge patch
+  merges the `requests`/`limits` maps by key, so untouched keys (e.g. a cold
+  `memory` limit) are preserved on the live object. This keeps each document
+  minimal.
 
 #### Quota guard (skip + warn)
 
@@ -126,11 +136,15 @@ dimensions exceed (`*_status == "EXCEEDS"`) with their sum vs quota.
 
 ### 2. Applier — `scripts/python/apply-recommendations.py`
 
-Standalone script. Parses the multi-doc YAML, iterates the `ResourcePatch`
-documents, shells out to `kubectl` (or `oc`).
+Standalone script. Reads the machine-readable **JSON sidecar**
+(`recommendations-apply.json`) with the stdlib `json` module — **no PyYAML
+dependency** — iterates the `ResourcePatch` entries, and shells out to `kubectl`
+(or `oc`). The `recommendations-apply.yaml` stays the human-reviewable artifact;
+the renderer emits both from one `build_apply_plan` model so they never drift.
 
 CLI:
-- `--manifest PATH` (required) — path to `recommendations-apply.yaml`.
+- `--manifest PATH` — path to `recommendations-apply.json` (default:
+  `recommendations-apply.json` in the working directory).
 - `--execute` — perform real changes. Absent ⇒ dry-run only.
 - `--context NAME` — kube context (passed as `--context`).
 - `--oc` — use the `oc` binary instead of `kubectl`.
@@ -161,14 +175,21 @@ Per document, build argv:
   block so the quota caveat is visible at apply time, not just at generation
   time.
 
-The applier shells out (subprocess) rather than using a Kubernetes client
-library, matching the repo's existing kubectl/oc-driven scripts and avoiding a
-new dependency.
+The applier shells out (subprocess) to kubectl/oc rather than using a
+Kubernetes client library, matching the repo's existing kubectl/oc-driven
+scripts. It is **stdlib-only** like the rest of the pipeline: it reads the JSON
+sidecar with `json.load` (no PyYAML), so it runs in any fresh shell without a
+`pip install`. The patch body is serialized to JSON (stdlib `json`) for the
+`--patch` argument (JSON is valid input to `kubectl patch` and avoids
+shell-quoting pitfalls).
 
 ## Output files
 
-- `recommendations-apply.yaml` — added to the output dir and every
-  `by-stage/<stage>/` folder, alongside the existing recommendation files.
+- `recommendations-apply.yaml` — human-reviewable patch manifest, added to the
+  output dir and every `by-stage/<stage>/` folder, alongside the existing
+  recommendation files.
+- `recommendations-apply.json` — machine-readable sidecar (same patches),
+  consumed by `apply-recommendations.py`. Written next to the YAML.
 
 ## Edge cases
 
@@ -177,6 +198,12 @@ new dependency.
 - **All in-scope namespaces flagged INCREASE_QUOTA:** all documents skipped;
   manifest is header-only with a populated SKIPPED block; applier prints the
   warning and exits 0 (nothing to do).
+- **Per-container recommendations:** `compute_recommendation` runs per
+  container *name* (peak taken as the max across the workload's replicas, limit
+  from the template), since a strategic-merge patch addresses containers by
+  name. The CSV's workload-aggregate recommendation is not reused for the
+  manifest. Idle workloads (no running pods → no per-container peak) never
+  qualify and produce no document.
 - **Multi-container workload, only one container hot:** one list entry for the
   hot container; cold containers are not listed (untouched).
 - **Workload deleted between export and apply:** kubectl NotFound ⇒ skipped,
@@ -195,8 +222,12 @@ Renderer (in `scripts/python/tests/`):
 - Paired non-hot dimension carried at its current value (merge safety).
 - Multi-container: only hot containers listed, keyed by name.
 - Empty / no-hot input ⇒ header only, zero documents.
-- Emitted quantity strings parse as valid Kubernetes quantities
-  (`fmt_cores` / `fmt_bytes` output).
+- Emitted quantity strings are valid Kubernetes quantities
+  (`cpu_quantity` / `mem_quantity` output) and round-trip via `parse_cpu` /
+  `parse_mem`.
+- The emitted manifest round-trips through `yaml.safe_load_all` (well-formed
+  multi-doc YAML), asserted in the renderer test using PyYAML as a test-only
+  dependency.
 
 Applier:
 - Correct kubectl argv for dry-run (includes `--dry-run=server`) vs execute
