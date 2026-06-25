@@ -945,6 +945,10 @@ Storage lives in the main CSVs — there is no separate `storage.csv`.
   `storage_used_pct` (Used, Hard, Used÷Hard), plus a per-StorageClass triple
   `<class>_used_bytes` / `<class>_hard_bytes` / `<class>_used_pct` over a fixed
   class set (a class the quota doesn't mention shows `0`, so the matrix is dense).
+  It also gets the **actual PVC usage per StorageClass**: `<class>_pvc_bytes` (sum
+  of that class's PVC capacities in the namespace) and `<class>_pvc_pct` (that
+  class's share of the namespace's total PVC storage) — e.g. see that file-silver
+  is 62.5 % of a namespace's storage, independent of any quota.
 - **`resources.csv`** gains the storage totals on the `namespace`/`stage`/`cluster`
   rows, and one **`level=pvc`** row per PersistentVolumeClaim carrying `pvc`
   (name), `storageclass`, `storageclass_description` (from the StorageClass's

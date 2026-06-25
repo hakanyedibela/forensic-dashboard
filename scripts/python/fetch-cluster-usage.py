@@ -1263,7 +1263,14 @@ NS_STORAGE_COLUMNS = []
 for _cls in STORAGE_CLASSES:
     NS_STORAGE_COLUMNS += [f"{_cls}_used_bytes", f"{_cls}_hard_bytes",
                            f"{_cls}_used_pct"]
-NS_CSV_COLUMNS = [h for h, _ in NS_CSV_FIELDS] + NS_STORAGE_COLUMNS
+# Per-storageclass PVC usage in the namespace (aggregated from the PVCs, not the
+# quota): <class>_pvc_bytes = sum of that class's PVC capacities, <class>_pvc_pct
+# = that class's share of the namespace's total PVC capacity.
+NS_PVC_COLUMNS = []
+for _cls in STORAGE_CLASSES:
+    NS_PVC_COLUMNS += [f"{_cls}_pvc_bytes", f"{_cls}_pvc_pct"]
+NS_CSV_COLUMNS = ([h for h, _ in NS_CSV_FIELDS]
+                  + NS_STORAGE_COLUMNS + NS_PVC_COLUMNS)
 
 # Human-readable twin of resources.csv: same rows/columns, but each metric is
 # rendered with its unit inline (200m, 6.3Mi, 4.9%) instead of a raw float. The
@@ -1288,8 +1295,36 @@ def _human_header(header):
 
 HUMAN_CSV_COLUMNS = [_human_header(h) for h, _ in CSV_FIELDS]
 NS_HUMAN_STORAGE_COLUMNS = [_human_header(c) for c in NS_STORAGE_COLUMNS]
+NS_HUMAN_PVC_COLUMNS = [_human_header(c) for c in NS_PVC_COLUMNS]
 NS_HUMAN_CSV_COLUMNS = ([_human_header(h) for h, _ in NS_CSV_FIELDS]
-                        + NS_HUMAN_STORAGE_COLUMNS)
+                        + NS_HUMAN_STORAGE_COLUMNS + NS_HUMAN_PVC_COLUMNS)
+
+
+def _ns_pvc_cells(node, human):
+    """Per-storageclass PVC usage for namespaces.csv: <class>_pvc_bytes (sum of
+    the namespace's PVC capacities of that class) and <class>_pvc_pct (that
+    class's share of the namespace's total PVC capacity). Dense over the
+    canonical class set; share is blank when the namespace has no PVCs."""
+    by_class = {}
+    total = 0
+    for p in node.get("pvcs", []):
+        cap = p.get("capacity")
+        if cap is None:
+            continue
+        cls = p.get("storageclass")
+        by_class[cls] = by_class.get(cls, 0) + cap
+        total += cap
+    cells = {}
+    for cls in STORAGE_CLASSES:
+        b = by_class.get(cls, 0)
+        pct = util_pct(b, total) if total else None
+        if human:
+            cells[f"{cls}_pvc"] = fmt_bytes(b)
+            cells[f"{cls}_pvc_pct"] = fmt_pct(pct)
+        else:
+            cells[f"{cls}_pvc_bytes"] = b
+            cells[f"{cls}_pvc_pct"] = "" if pct is None else pct
+    return cells
 
 
 def _ns_storage_cells(node, human):
@@ -1444,6 +1479,7 @@ def render_namespaces_csv(trees, stream):
             v = node["totals"].get(key)
             row[header] = "" if v is None else v
         row.update(_ns_storage_cells(node, human=False))
+        row.update(_ns_pvc_cells(node, human=False))
         writer.writerow(row)
 
 
@@ -1458,6 +1494,7 @@ def render_namespaces_human_csv(trees, stream):
         for header, key in METRIC_FIELDS:
             row[_human_header(header)] = _human_metric(key, node["totals"].get(key))
         row.update(_ns_storage_cells(node, human=True))
+        row.update(_ns_pvc_cells(node, human=True))
         writer.writerow(row)
 
 
@@ -1987,10 +2024,17 @@ Das Speicher-Kontingent (`requests.storage`) steckt direkt in den Haupt-CSVs
 - `storage_hard_bytes` — Hard-Kontingent über alle StorageClasses (Quota *Hard*).
 - `storage_used_pct` — `storage_used / storage_hard` in Prozent (leer, wenn kein Hard-Kontingent).
 
-**Pro StorageClass (nur in `namespaces.csv`):** je Klasse drei Spalten
+**Pro StorageClass — Quota (nur in `namespaces.csv`):** je Klasse drei Spalten
 `<class>_used_bytes`, `<class>_hard_bytes`, `<class>_used_pct` (Used, Hard und
 Used/Hard %). Die Klassen stehen in fester Reihenfolge; eine im Quota nicht
 vorhandene Klasse erscheint als `0` (dichte Matrix).
+
+**Pro StorageClass — tatsächliche PVC-Nutzung (nur in `namespaces.csv`):** je
+Klasse zwei Spalten `<class>_pvc_bytes` (Summe der PVC-Kapazitäten dieser Klasse
+im Namespace) und `<class>_pvc_pct` (Anteil dieser Klasse an der gesamten
+PVC-Kapazität des Namespace). So sieht man z. B., wie viel Speicher `file-silver`
+im Namespace belegt und welchen Anteil das ausmacht — unabhängig von der Quota.
+Leer im `*_pct`, wenn der Namespace keine PVCs hat.
 
 **PVCs (nur in `resources.csv`):** je PersistentVolumeClaim eine Zeile mit
 `level=pvc`. Quelle ist `oc get pvc`.
