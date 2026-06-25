@@ -1732,6 +1732,48 @@ def test_pvc_records_missing_class_dash(fcu):
     assert recs[0]["capacity"] is None
 
 
+def _sc(name, annotations):
+    return {"metadata": {"name": name, "annotations": annotations}}
+
+
+def test_storageclass_description_exact_key(fcu):
+    sc = _sc("file-silver", {"description": "RWO and RWX filesystem volumes",
+                             "other": "x"})
+    assert fcu._storageclass_description(sc) == "RWO and RWX filesystem volumes"
+
+
+def test_storageclass_description_slash_suffix_fallback(fcu):
+    sc = _sc("file-gold", {"kubernetes.io/description": "gold tier"})
+    assert fcu._storageclass_description(sc) == "gold tier"
+
+
+def test_storageclass_description_none(fcu):
+    assert fcu._storageclass_description(_sc("x", {})) == ""
+    assert fcu._storageclass_description({"metadata": {}}) == ""
+
+
+def test_storageclass_descriptions_map_skips_blank(fcu):
+    items = [_sc("file-silver", {"description": "silver"}),
+             _sc("file-gold", {}),                       # no description -> omitted
+             {"metadata": {}}]                            # no name -> skipped
+    assert fcu.storageclass_descriptions(items) == {"file-silver": "silver"}
+
+
+def test_collect_namespace_tags_pvc_with_sc_description(fcu):
+    pods = [{"metadata": {"name": "w-1", "namespace": "ns1", "labels": {}},
+             "spec": {"nodeName": "n1", "containers": [{"name": "c",
+                                                        "resources": {}}]},
+             "status": {"containerStatuses": []}}]
+    pvcs = [{"metadata": {"name": "data-0"},
+             "spec": {"storageClassName": "file-silver",
+                      "resources": {"requests": {"storage": "8Gi"}}},
+             "status": {"capacity": {"storage": "8Gi"}}}]
+    node = fcu.collect_namespace(
+        StorageFakeK8s(pods=pods, pvcs=pvcs), "ns1", thanos=None,
+        window="24h", step="5m", sc_desc={"file-silver": "RWX filesystem"})
+    assert node["pvcs"][0]["description"] == "RWX filesystem"
+
+
 class StorageFakeK8s(QuotaFakeK8s):
     def __init__(self, pods=None, quotas=None, pvcs=None):
         super().__init__(pods=pods, quotas=quotas)
@@ -1805,7 +1847,7 @@ def test_resources_csv_emits_pvc_rows(fcu):
     node = _sto_node(fcu, "ns1", "test",
                     {"file-gold": {"used": 3 * GI, "hard": 10 * GI}})
     node["pvcs"] = [{"name": "data-0", "storageclass": "file-silver",
-                     "capacity": 8 * GI}]
+                     "capacity": 8 * GI, "description": "RWX filesystem volumes"}]
     buf = io.StringIO()
     fcu.render_resources_csv([node], buf, summary_kinds=())
     rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
@@ -1814,6 +1856,7 @@ def test_resources_csv_emits_pvc_rows(fcu):
     r = pvc_rows[0]
     assert r["pvc"] == "data-0"
     assert r["storageclass"] == "file-silver"
+    assert r["storageclass_description"] == "RWX filesystem volumes"
     assert r["storage_capacity_bytes"] == str(8 * GI)
     assert r["cpu_request_cores"] == ""          # cpu/mem blank on pvc rows
     # the namespace row carries the storage quota totals
