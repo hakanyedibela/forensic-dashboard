@@ -1843,6 +1843,45 @@ def test_namespaces_human_storage_units(fcu):
     assert row["file-gold_hard"] == "10.0Gi"
 
 
+def test_namespaces_csv_pvc_per_class_share(fcu):
+    node = _sto_node(fcu, "ns1", "test", {})          # no quota needed
+    node["pvcs"] = [
+        {"name": "a", "storageclass": "file-silver", "capacity": 50 * GI},
+        {"name": "c", "storageclass": "file-gold", "capacity": 20 * GI},
+        {"name": "d", "storageclass": "file-network", "capacity": 10 * GI},
+    ]  # total 80Gi -> 62.5% / 25% / 12.5%
+    buf = io.StringIO()
+    fcu.render_namespaces_csv([node], buf)
+    row = list(_csv.DictReader(io.StringIO(buf.getvalue())))[0]
+    assert row["file-silver_pvc_bytes"] == str(50 * GI)
+    assert float(row["file-silver_pvc_pct"]) == pytest.approx(62.5)
+    assert float(row["file-gold_pvc_pct"]) == pytest.approx(25.0)
+    assert float(row["file-network_pvc_pct"]) == pytest.approx(12.5)
+    # a class with no PVC is 0 bytes / 0% (dense, since the ns has PVCs)
+    assert row["block-silver_pvc_bytes"] == "0"
+    assert float(row["block-silver_pvc_pct"]) == pytest.approx(0.0)
+
+
+def test_namespaces_human_pvc_share(fcu):
+    node = _sto_node(fcu, "ns1", "test", {})
+    node["pvcs"] = [{"name": "a", "storageclass": "file-silver", "capacity": 50 * GI},
+                    {"name": "c", "storageclass": "file-gold", "capacity": 30 * GI}]
+    buf = io.StringIO()
+    fcu.render_namespaces_human_csv([node], buf)
+    row = list(_csv.DictReader(io.StringIO(buf.getvalue())))[0]
+    assert row["file-silver_pvc"] == "50.0Gi"
+    assert row["file-silver_pvc_pct"] == "62.5%"
+
+
+def test_namespaces_pvc_share_blank_without_pvcs(fcu):
+    node = _sto_node(fcu, "ns1", "test", {})          # pvcs == []
+    buf = io.StringIO()
+    fcu.render_namespaces_csv([node], buf)
+    row = list(_csv.DictReader(io.StringIO(buf.getvalue())))[0]
+    assert row["file-silver_pvc_bytes"] == "0"
+    assert row["file-silver_pvc_pct"] == ""           # no PVCs -> blank share
+
+
 def test_resources_csv_emits_pvc_rows(fcu):
     node = _sto_node(fcu, "ns1", "test",
                     {"file-gold": {"used": 3 * GI, "hard": 10 * GI}})
