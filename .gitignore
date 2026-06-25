@@ -10,3 +10,6 @@ oom-loop-*/
 __pycache__/
 *.pyc
 /reports-usage/
+
+# debug logs
+*.log
