@@ -1882,6 +1882,30 @@ def test_namespaces_pvc_share_blank_without_pvcs(fcu):
     assert row["file-silver_pvc_pct"] == ""           # no PVCs -> blank share
 
 
+def test_summary_text_includes_storage(fcu):
+    node = _sto_node(fcu, "ns1", "test",
+                     {"file-silver": {"used": 6 * GI, "hard": 10 * GI}})
+    node["pvcs"] = [{"name": "app-0", "storageclass": "file-silver",
+                     "capacity": 50 * GI, "description": "RWX volumes"}]
+    buf = io.StringIO()
+    fcu.render_text([node], buf, levels=("namespace",))
+    out = buf.getvalue()
+    assert "BY NAMESPACE — storage quota" in out
+    assert "STORAGE" in out and "STORAGECLASS" in out and "PVC share" in out
+    assert "file-silver" in out
+    assert "60.0%" in out                              # quota Used/Hard
+    assert "app-0" in out and "RWX volumes" in out     # PVC list + description
+
+
+def test_summary_text_omits_storage_when_absent(fcu):
+    node = _sto_node(fcu, "ns1", "test", {})           # no quota, no pvcs
+    buf = io.StringIO()
+    fcu.render_text([node], buf, levels=("namespace",))
+    out = buf.getvalue()
+    assert "STORAGECLASS" not in out
+    assert "BY NAMESPACE — storage" not in out
+
+
 def test_resources_csv_emits_pvc_rows(fcu):
     node = _sto_node(fcu, "ns1", "test",
                     {"file-gold": {"used": 3 * GI, "hard": 10 * GI}})

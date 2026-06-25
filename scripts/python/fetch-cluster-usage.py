@@ -1879,7 +1879,7 @@ Erzeugt von scripts/python/fetch-cluster-usage.py.
 - `recommendations-apply.yaml` — anwendbares Patch-Manifest: ein `ResourcePatch`-Dokument pro **heißem** Workload, das die empfohlenen `requests`/`limits` pro Container als Strategic-Merge-Patch setzt. Namespaces, deren Summe das ResourceQuota überschreiten würde (`quota_action=INCREASE_QUOTA`), werden **übersprungen** und im `SKIPPED`-Kopfblock genannt (Quota zuerst manuell erhöhen). Zum menschlichen Review gedacht.
 - `recommendations-apply.json` — maschinenlesbares Pendant zu `recommendations-apply.yaml` (dieselben Patches), das `apply-recommendations.py` mit der Python-Standardbibliothek liest (kein YAML-Paket nötig).
 - `ooms.csv`       — eine Zeile pro OOM-getötetem Container.
-- `summary.txt`    — menschenlesbare Tabelle (CPU in Cores/Milli, Speicher in Ki/Mi/Gi, % und OOM-Anzahl) — dieselben Zahlen wie die CSVs, nur kompakt formatiert.
+- `summary.txt`    — menschenlesbare Tabelle (CPU in Cores/Milli, Speicher in Ki/Mi/Gi, % und OOM-Anzahl) — dieselben Zahlen wie die CSVs, nur kompakt formatiert. Enthält je Namespace zusätzlich einen **STORAGE**-Block (Quota used/hard/%, je StorageClass Quota- und PVC-Nutzung samt Anteil, sowie eine PVC-Liste mit Beschreibung) und oben eine Übersicht „BY NAMESPACE — storage quota".
 - `report.json`   — dieselben Daten verschachtelt (Namespace → Workload → Pod → Container) plus Aggregationen.
 - `by-stage/<stage>/` — (im obersten Ordner) dieselben Dateien, beschränkt auf eine Stage.
 - `apply/` — (im obersten Ordner) sammelt **nur** die Apply-Manifeste an einem Ort, damit `apply-recommendations.py` nicht jeden `by-stage/`-Ordner durchsuchen muss: `all.yaml`/`all.json` (alle Namespaces zusammen), je Stage ein `<stage>.yaml`/`<stage>.json` (für einen gestaffelten Rollout — erst test, dann prod) und je Namespace ein `<stage>/<namespace>.yaml`/`.json` (um einen einzelnen Namespace dediziert anzuwenden). Namespaces ohne Änderung (keine heißen Workloads und nicht Quota-übersprungen) erhalten keine Datei.
@@ -2229,6 +2229,39 @@ _USAGE_HEADERS = ["CPU req", "CPU lim", "CPU now",
                   "MEM req-used", "MEM lim-used", "MEM peak", "MEM %", "OOM"]
 
 
+def _ns_pvc_by_class(node):
+    """(by_class capacity dict, total capacity) from a namespace's PVCs."""
+    by_class, total = {}, 0
+    for p in node.get("pvcs", []):
+        cap = p.get("capacity")
+        if cap is None:
+            continue
+        by_class[p.get("storageclass")] = by_class.get(p.get("storageclass"), 0) + cap
+        total += cap
+    return by_class, total
+
+
+def _storage_class_rows(node):
+    """Per-storageclass text rows: quota Used/Hard/% and PVC capacity/share, for
+    every class that has either quota or PVC data in the namespace."""
+    store = node.get("storage") or {}
+    by_class, total = _ns_pvc_by_class(node)
+    rows = []
+    for cls in sorted(set(store) | set(by_class)):
+        q = store.get(cls) or {}
+        pvc_b = by_class.get(cls, 0)
+        rows.append([cls,
+                     fmt_bytes(q.get("used")), fmt_bytes(q.get("hard")),
+                     fmt_pct(util_pct(q.get("used"), q.get("hard"))),
+                     fmt_bytes(pvc_b),
+                     fmt_pct(util_pct(pvc_b, total) if total else None)])
+    return rows
+
+
+def _has_storage(node):
+    return bool(node.get("storage")) or bool(node.get("pvcs"))
+
+
 def render_text(trees, stream, levels=("namespace", "workload", "pod",
                                        "container"), summary=True):
     if summary and trees:
@@ -2241,10 +2274,21 @@ def render_text(trees, stream, levels=("namespace", "workload", "pod",
         _print_table(["SCOPE", *_USAGE_HEADERS], rows, stream)
 
         stream.write("\nBY NAMESPACE — total used vs. limited per namespace\n")
+        sorted_ns = sorted(trees, key=lambda n: (n["stage"], n["namespace"]))
         ns_rows = [[f"{n['stage']}/{n['namespace']}", *_usage_cells(n["totals"])]
-                   for n in sorted(trees, key=lambda n: (n["stage"],
-                                                         n["namespace"]))]
+                   for n in sorted_ns]
         _print_table(["NAMESPACE", *_USAGE_HEADERS], ns_rows, stream)
+
+        # Storage quota per namespace (only when some namespace tracks storage).
+        if any(_has_storage(n) for n in trees):
+            stream.write("\nBY NAMESPACE — storage quota (used vs. hard)\n")
+            sto_rows = [[f"{n['stage']}/{n['namespace']}",
+                         fmt_bytes(n["totals"].get("storage_used")),
+                         fmt_bytes(n["totals"].get("storage_hard")),
+                         fmt_pct(n["totals"].get("storage_used_pct"))]
+                        for n in sorted_ns]
+            _print_table(["NAMESPACE", "STO used", "STO hard", "STO %"],
+                         sto_rows, stream)
 
     for node in trees:
         stream.write("\n" + "=" * 100 + "\n")
@@ -2283,6 +2327,26 @@ def render_text(trees, stream, levels=("namespace", "workload", "pod",
                         rows.append([f"{pod['name']}/{c['container']}",
                                      *_usage_cells(c)])
             _print_table(["POD/CONTAINER", *_USAGE_HEADERS], rows, stream)
+
+        if _has_storage(node):
+            t = node["totals"]
+            stream.write("\nSTORAGE\n")
+            stream.write(
+                f"  quota: used {fmt_bytes(t.get('storage_used'))}"
+                f" / hard {fmt_bytes(t.get('storage_hard'))}"
+                f" ({fmt_pct(t.get('storage_used_pct'))})\n")
+            cls_rows = _storage_class_rows(node)
+            if cls_rows:
+                _print_table(["STORAGECLASS", "Q used", "Q hard", "Q %",
+                              "PVC used", "PVC share"], cls_rows, stream)
+            if node.get("pvcs"):
+                stream.write("\n  PVCs\n")
+                pvc_rows = [[p["name"], p["storageclass"],
+                             fmt_bytes(p.get("capacity")),
+                             p.get("description", "")]
+                            for p in node["pvcs"]]
+                _print_table(["PVC", "STORAGECLASS", "CAPACITY", "DESCRIPTION"],
+                             pvc_rows, stream)
 
         if node["ooms"]:
             stream.write("\nOOM-KILLED\n")
