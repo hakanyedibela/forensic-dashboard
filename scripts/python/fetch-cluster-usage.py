@@ -412,6 +412,66 @@ def apply_quota_to_totals(totals, quota):
     return totals
 
 
+# --------------------------------------------- namespace per-storageclass quota
+
+# A namespace's per-storageclass storage quota is a ResourceQuota key of the form
+# `<class>.storageclass.storage.k8s.io/requests.storage`. parse_storage_quota
+# strips this suffix to recover the class name; values use the same Ki/Mi/Gi
+# units as memory, so parse_mem parses them to bytes.
+STORAGE_QUOTA_SUFFIX = ".storageclass.storage.k8s.io/requests.storage"
+
+# Storage classes we always emit a column for (even where a namespace has no
+# quota entry — those cells become 0), in the report's fixed left-to-right order.
+# Any class found in the data but missing here is appended (storage_classes_in)
+# so a renamed/unexpected class is surfaced, never silently dropped.
+STORAGE_CLASSES = [
+    "block-silver",
+    "file-bronce",
+    "file-gold",
+    "file-intern-logging",
+    "file-intern-monitoring-alertmgr",
+    "file-intern-monitoring-prometheus",
+    "file-intern-monitoring-user-prometheus",
+    "file-intern-registry",
+    "file-network",
+    "file-silver",
+    "object-silver",
+    "ocs-storagecluster-ceph-rbd",
+    "ocs-storagecluster-ceph-rgw",
+    "ocs-storagecluster-cephfs",
+    "openshift-storage.noobaa.io",
+]
+
+
+def parse_storage_quota(items):
+    """From a namespace's ResourceQuota objects, pull every per-storageclass
+    `requests.storage` entry into {storageclass: {"used": bytes, "hard": bytes}}.
+
+    The class name is the quota key with STORAGE_QUOTA_SUFFIX stripped; values
+    parse via parse_mem (Ki/Mi/Gi -> bytes). Across multiple quotas the binding
+    Hard is the smallest cap and Used the largest booked value (matching
+    parse_quota). Non-storage keys are ignored. Empty/None input -> {}."""
+    out = {}
+    for item in items or []:
+        status = item.get("status", {}) or {}
+        for field in ("hard", "used"):
+            for key, raw in (status.get(field, {}) or {}).items():
+                if not key.endswith(STORAGE_QUOTA_SUFFIX):
+                    continue
+                cls = key[: -len(STORAGE_QUOTA_SUFFIX)]
+                v = parse_mem(raw)
+                if v is None:
+                    continue
+                entry = out.setdefault(cls, {"used": None, "hard": None})
+                if field == "hard":
+                    entry["hard"] = v if entry["hard"] is None \
+                        else min(entry["hard"], v)
+                else:
+                    entry["used"] = v if entry["used"] is None \
+                        else max(entry["used"], v)
+    return out
+
+
 # ------------------------------------------------------- pod -> leaf records
 
 def pods_to_leaves(pods, rs_index):
@@ -508,6 +568,7 @@ def build_namespace_tree(namespace, leaves, ooms):
         "totals": rollup(leaves),
         "workloads": workloads,
         "ooms": ooms,
+        "storage": {},
     }
 
 
@@ -1037,6 +1098,9 @@ def collect_namespace(fcu_k8s, namespace, thanos, window, step,
     quotas = lister(namespace) if lister else []
     if quotas:
         apply_quota_to_totals(node["totals"], parse_quota(quotas))
+    # Per-storageclass requests.storage Hard/Used (for storage.csv); {} when the
+    # namespace has no storage quota.
+    node["storage"] = parse_storage_quota(quotas)
 
     if include_idle:
         present = {(w["kind"], w["name"]) for w in node["workloads"]}
@@ -1335,6 +1399,294 @@ def render_recommendations_human_csv(trees, stream, target_util=80.0):
                          for h, k in REC_FIELDS})
 
 
+# ----------------------------------- apply manifest (per-workload patch YAML)
+
+def cpu_quantity(cores):
+    """Cores -> a valid Kubernetes CPU quantity string in millicores ('320m').
+    Unlike fmt_cores there is no 'c'/'µ' suffix, so it round-trips via parse_cpu
+    and is accepted verbatim by kubectl. None -> None."""
+    if cores is None:
+        return None
+    return f"{int(round(cores * 1000))}m"
+
+
+def mem_quantity(nbytes):
+    """Bytes -> a valid Kubernetes memory quantity string. Exact Gi multiples
+    render as 'Gi', otherwise Mi (recommendations are rounded up to whole Mi, so
+    Mi is always exact). Round-trips via parse_mem. None -> None."""
+    if nbytes is None:
+        return None
+    gi, mi = 1024 ** 3, 1024 ** 2
+    if nbytes % gi == 0:
+        return f"{nbytes // gi}Gi"
+    return f"{nbytes // mi}Mi"
+
+
+def _opt_max(vals):
+    xs = [v for v in vals if v is not None]
+    return max(xs) if xs else None
+
+
+def _opt_first(vals):
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
+def workload_container_recommendations(wl, target_util=80.0):
+    """Per-container recommendations for one workload node, keyed by container
+    *name* (the strategic-merge patchMergeKey). For each container name the peak
+    is the max across the workload's replicas and the limit/request the
+    configured template value; compute_recommendation is then run on that
+    synthetic per-container totals. Returns one dict per container with its
+    current (`*_cur`) values and the compute_recommendation `*_rec` keys (None
+    where that resource is not hot). Containers with no running pods produce no
+    entry (idle workloads never qualify)."""
+    by_name = {}
+    for pod in wl.get("pods", []) or []:
+        for c in pod.get("containers", []) or []:
+            by_name.setdefault(c["container"], []).append(c)
+    out = []
+    for name in sorted(by_name):
+        leaves = by_name[name]
+        totals = {
+            "cpu_peak": _opt_max(l.get("cpu_peak") for l in leaves),
+            "mem_peak": _opt_max(l.get("mem_peak") for l in leaves),
+            "cpu_limit": _opt_first(l.get("cpu_limit") for l in leaves),
+            "mem_limit": _opt_first(l.get("mem_limit") for l in leaves),
+        }
+        rec = compute_recommendation(totals, target_util)
+        out.append({
+            "container": name,
+            "cpu_request_cur": _opt_first(l.get("cpu_request") for l in leaves),
+            "cpu_limit_cur": totals["cpu_limit"],
+            "mem_request_cur": _opt_first(l.get("mem_request") for l in leaves),
+            "mem_limit_cur": totals["mem_limit"],
+            **rec,
+        })
+    return out
+
+
+def _has_recommendation(c):
+    return any(c[k] is not None for k in
+               ("cpu_request_rec", "cpu_limit_rec",
+                "mem_request_rec", "mem_limit_rec"))
+
+
+def _container_patch_resources(c):
+    """Strategic-merge `resources` body for one container: only the hot
+    dimensions, each with both requests and limits (compute_recommendation
+    always pairs them). Cold dimensions are omitted so the merge preserves the
+    live object's untouched keys."""
+    req, lim = {}, {}
+    if c["cpu_limit_rec"] is not None:      # cpu hot
+        req["cpu"] = cpu_quantity(c["cpu_request_rec"])
+        lim["cpu"] = cpu_quantity(c["cpu_limit_rec"])
+    if c["mem_limit_rec"] is not None:      # mem hot
+        req["memory"] = mem_quantity(c["mem_request_rec"])
+        lim["memory"] = mem_quantity(c["mem_limit_rec"])
+    res = {}
+    if req:
+        res["requests"] = req
+    if lim:
+        res["limits"] = lim
+    return res
+
+
+def _summary_cell(kind, cur, rec):
+    fmt = cpu_quantity if kind == "cpu" else mem_quantity
+    cur_s = "-" if cur is None else fmt(cur)
+    new = rec if rec is not None else cur
+    new_s = "-" if new is None else fmt(new)
+    return f"{cur_s}→{new_s}"
+
+
+def _container_summary_line(c):
+    """One human old->new line per container, e.g.
+    `web: cpu req 500m->900m, lim 1000m->1130m | mem req 64Mi->64Mi, lim ...`."""
+    cpu = (f"cpu req {_summary_cell('cpu', c['cpu_request_cur'], c['cpu_request_rec'])}"
+           f", lim {_summary_cell('cpu', c['cpu_limit_cur'], c['cpu_limit_rec'])}")
+    mem = (f"mem req {_summary_cell('mem', c['mem_request_cur'], c['mem_request_rec'])}"
+           f", lim {_summary_cell('mem', c['mem_limit_cur'], c['mem_limit_rec'])}")
+    return f"{c['container']}: {cpu} | {mem}"
+
+
+_APPLY_DIMS = ("cpu_request", "cpu_limit", "mem_request", "mem_limit")
+
+
+def _exceeds_reason(base, summary):
+    fmt = cpu_quantity if base.startswith("cpu") else mem_quantity
+    return (f"{base} sum {fmt(summary[base + '_rec_sum'])} "
+            f"> quota {fmt(summary[base + '_quota'])}")
+
+
+def build_apply_plan(trees, target_util=80.0):
+    """Pure model behind both apply serializers. Returns
+    {target_util, skipped: [...], patches: [...]}. A namespace whose
+    namespace_recommendation_summary flags INCREASE_QUOTA contributes no patches
+    and one `skipped` entry (with per-dimension reasons); every other namespace
+    contributes one patch per workload that has at least one hot container."""
+    plan = {"target_util": target_util, "skipped": [], "patches": []}
+    for node in sorted(trees, key=lambda n: (n["stage"], n["namespace"])):
+        summary = namespace_recommendation_summary(node, target_util)
+        if summary["quota_action"] == "INCREASE_QUOTA":
+            reasons = [_exceeds_reason(b, summary) for b in _APPLY_DIMS
+                       if summary[b + "_status"] == "EXCEEDS"]
+            plan["skipped"].append({"namespace": node["namespace"],
+                                    "stage": node["stage"], "reasons": reasons})
+            continue
+        for wl in node["workloads"]:
+            hot = [c for c in workload_container_recommendations(wl, target_util)
+                   if _has_recommendation(c)]
+            if not hot:
+                continue
+            containers = [{"name": c["container"],
+                           "resources": _container_patch_resources(c)}
+                          for c in hot]
+            plan["patches"].append({
+                "stage": node["stage"], "namespace": node["namespace"],
+                "kind": wl["kind"], "name": wl["name"],
+                "summary_lines": [_container_summary_line(c) for c in hot],
+                "patch": {"spec": {"template": {"spec":
+                                                {"containers": containers}}}},
+            })
+    return plan
+
+
+def _yaml_dq(s):
+    """Double-quote a scalar so it round-trips through any YAML parser."""
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _yaml_inline_map(d):
+    return "{" + ", ".join(f"{k}: {_yaml_dq(v)}" for k, v in d.items()) + "}"
+
+
+def render_recommendations_apply_yaml(trees, stream, target_util=80.0):
+    """Human-reviewable multi-doc patch YAML: one ResourcePatch per hot workload,
+    a SKIPPED header block for INCREASE_QUOTA namespaces. Hand-emitted (stdlib
+    only) with quoted string scalars."""
+    plan = build_apply_plan(trees, target_util)
+    w = stream.write
+    w("# recommendations-apply.yaml — generated by fetch-cluster-usage.py\n")
+    w(f"# target_util={target_util:g}\n")
+    w("# SKIPPED (namespace quota must be raised first — "
+      "quota_action=INCREASE_QUOTA):\n")
+    if plan["skipped"]:
+        for s in plan["skipped"]:
+            reasons = "; ".join(s["reasons"]) if s["reasons"] else "quota exceeded"
+            w(f"#   {s['namespace']}: {reasons}\n")
+    else:
+        w("#   (none)\n")
+    for p in plan["patches"]:
+        w("---\n")
+        w(f"# {p['namespace']} / {p['kind']} {p['name']}\n")
+        for line in p["summary_lines"]:
+            w(f"#   {line}\n")
+        w("apiVersion: forensic-dashboards/v1\n")
+        w("kind: ResourcePatch\n")
+        w("target:\n")
+        w(f"  kind: {_yaml_dq(p['kind'])}\n")
+        w(f"  namespace: {_yaml_dq(p['namespace'])}\n")
+        w(f"  name: {_yaml_dq(p['name'])}\n")
+        w("patch:\n")
+        w("  spec:\n")
+        w("    template:\n")
+        w("      spec:\n")
+        w("        containers:\n")
+        for c in p["patch"]["spec"]["template"]["spec"]["containers"]:
+            w(f"          - name: {_yaml_dq(c['name'])}\n")
+            w("            resources:\n")
+            res = c["resources"]
+            if "requests" in res:
+                w(f"              requests: {_yaml_inline_map(res['requests'])}\n")
+            if "limits" in res:
+                w(f"              limits: {_yaml_inline_map(res['limits'])}\n")
+
+
+def render_recommendations_apply_json(trees, stream, target_util=80.0):
+    """Machine-readable sidecar consumed by apply-recommendations.py (stdlib
+    json, so the applier needs no YAML dependency). Same patches as the YAML."""
+    plan = build_apply_plan(trees, target_util)
+    obj = {
+        "generated_by": "fetch-cluster-usage.py",
+        "target_util": target_util,
+        "skipped": plan["skipped"],
+        "patches": [{"namespace": p["namespace"], "stage": p["stage"],
+                     "kind": p["kind"], "name": p["name"],
+                     "summary": p["summary_lines"], "patch": p["patch"]}
+                    for p in plan["patches"]],
+    }
+    json.dump(obj, stream, indent=2)
+    stream.write("\n")
+
+
+# ------------------------------------------ per-storageclass storage CSV (wide)
+
+def storage_classes_in(trees):
+    """Column order for the storage CSV: the canonical STORAGE_CLASSES first
+    (stable, fixed layout), then any extra storageclass found in the data but
+    not listed (sorted) so a renamed/unexpected class is surfaced, not dropped."""
+    extra = sorted({cls for node in trees
+                    for cls in (node.get("storage") or {})
+                    if cls not in STORAGE_CLASSES})
+    return list(STORAGE_CLASSES) + extra
+
+
+def storage_rows(trees, classes=None):
+    """One dict per namespace (sorted by stage, then namespace) with keys
+    `stage`, `namespace`, and `<class>_used` / `<class>_hard` (bytes) for every
+    class. A class absent from a namespace's quota is 0 (not None), so the matrix
+    is dense — every class shown for every namespace, including zeros."""
+    if classes is None:
+        classes = storage_classes_in(trees)
+    rows = []
+    for node in sorted(trees, key=lambda n: (n["stage"], n["namespace"])):
+        store = node.get("storage") or {}
+        row = {"stage": node["stage"], "namespace": node["namespace"]}
+        for cls in classes:
+            entry = store.get(cls) or {}
+            row[f"{cls}_used"] = entry.get("used") or 0
+            row[f"{cls}_hard"] = entry.get("hard") or 0
+        rows.append(row)
+    return rows
+
+
+def render_storage_csv(trees, stream):
+    """Per-namespace storage quota CSV (wide): two raw-byte columns
+    (`<class>_used_bytes`, `<class>_hard_bytes`) per storageclass."""
+    classes = storage_classes_in(trees)
+    cols = ["stage", "namespace"]
+    for cls in classes:
+        cols += [f"{cls}_used_bytes", f"{cls}_hard_bytes"]
+    writer = csv.DictWriter(stream, fieldnames=cols, extrasaction="ignore")
+    writer.writeheader()
+    for row in storage_rows(trees, classes):
+        out = {"stage": row["stage"], "namespace": row["namespace"]}
+        for cls in classes:
+            out[f"{cls}_used_bytes"] = row[f"{cls}_used"]
+            out[f"{cls}_hard_bytes"] = row[f"{cls}_hard"]
+        writer.writerow(out)
+
+
+def render_storage_human_csv(trees, stream):
+    """Human-readable twin: same rows, each byte value formatted with its unit
+    (`10.0Gi`, `0.0B`); the `_bytes` header suffix is dropped."""
+    classes = storage_classes_in(trees)
+    cols = ["stage", "namespace"]
+    for cls in classes:
+        cols += [f"{cls}_used", f"{cls}_hard"]
+    writer = csv.DictWriter(stream, fieldnames=cols, extrasaction="ignore")
+    writer.writeheader()
+    for row in storage_rows(trees, classes):
+        out = {"stage": row["stage"], "namespace": row["namespace"]}
+        for cls in classes:
+            out[f"{cls}_used"] = fmt_bytes(row[f"{cls}_used"])
+            out[f"{cls}_hard"] = fmt_bytes(row[f"{cls}_hard"])
+        writer.writerow(out)
+
+
 def render_ooms_csv(trees, stream):
     cols = ["stage", "namespace", "pod", "container", "source", "oom_events",
             "restart_count", "exit_code", "finished_at"]
@@ -1382,6 +1734,12 @@ def render_stdout_formats(trees, formats, stream, window, cluster, levels,
         render_recommendations_csv(trees, stream, target_util=target_util)
     if "recommendations-human" in formats:
         render_recommendations_human_csv(trees, stream, target_util=target_util)
+    if "storage" in formats:
+        render_storage_csv(trees, stream)
+    if "storage-human" in formats:
+        render_storage_human_csv(trees, stream)
+    if "recommendations-apply" in formats:
+        render_recommendations_apply_yaml(trees, stream, target_util=target_util)
 
 
 # ----------------------------------------------------- persisting to disk/PVC
@@ -1407,10 +1765,15 @@ Erzeugt von scripts/python/fetch-cluster-usage.py.
 - `namespaces-human.csv` — dieselben Zeilen wie `namespaces.csv`, aber jeder Wert mit Einheit (z. B. `200m`, `6.3Mi`, `4.9%`) statt Rohzahl.
 - `recommendations.csv` — Empfehlung zum Right-Sizing: eine Zeile pro **heißem** Workload (Spitze nahe/über dem Limit), aktuelle Werte neben den empfohlenen. Rohzahlen.
 - `recommendations-human.csv` — dieselben Zeilen wie `recommendations.csv`, aber jeder Wert mit Einheit (z. B. `200m`, `1.13c`, `6.3Mi`) statt Rohzahl.
+- `recommendations-apply.yaml` — anwendbares Patch-Manifest: ein `ResourcePatch`-Dokument pro **heißem** Workload, das die empfohlenen `requests`/`limits` pro Container als Strategic-Merge-Patch setzt. Namespaces, deren Summe das ResourceQuota überschreiten würde (`quota_action=INCREASE_QUOTA`), werden **übersprungen** und im `SKIPPED`-Kopfblock genannt (Quota zuerst manuell erhöhen). Zum menschlichen Review gedacht.
+- `recommendations-apply.json` — maschinenlesbares Pendant zu `recommendations-apply.yaml` (dieselben Patches), das `apply-recommendations.py` mit der Python-Standardbibliothek liest (kein YAML-Paket nötig).
+- `storage.csv`    — Speicher-Kontingent pro Namespace und StorageClass: genau eine Zeile pro Namespace, je StorageClass eine `*_used_bytes`- und eine `*_hard_bytes`-Spalte (gebucht vs. Hard-Kontingent, in Bytes). Fehlt eine StorageClass im Kontingent des Namespace, steht `0`.
+- `storage-human.csv` — dieselben Zeilen wie `storage.csv`, aber jeder Wert mit Einheit (z. B. `10.0Gi`, `0.0B`) statt Rohzahl; der `_bytes`-Suffix entfällt im Spaltennamen.
 - `ooms.csv`       — eine Zeile pro OOM-getötetem Container.
 - `summary.txt`    — menschenlesbare Tabelle (CPU in Cores/Milli, Speicher in Ki/Mi/Gi, % und OOM-Anzahl) — dieselben Zahlen wie die CSVs, nur kompakt formatiert.
 - `report.json`   — dieselben Daten verschachtelt (Namespace → Workload → Pod → Container) plus Aggregationen.
 - `by-stage/<stage>/` — (im obersten Ordner) dieselben Dateien, beschränkt auf eine Stage.
+- `apply/` — (im obersten Ordner) sammelt **nur** die Apply-Manifeste an einem Ort, damit `apply-recommendations.py` nicht jeden `by-stage/`-Ordner durchsuchen muss: `all.yaml`/`all.json` (alle Namespaces zusammen), je Stage ein `<stage>.yaml`/`<stage>.json` (für einen gestaffelten Rollout — erst test, dann prod) und je Namespace ein `<stage>/<namespace>.yaml`/`.json` (um einen einzelnen Namespace dediziert anzuwenden). Namespaces ohne Änderung (keine heißen Workloads und nicht Quota-übersprungen) erhalten keine Datei.
 
 ## resources.csv — die Spalte `level` sagt, was jede Zeile aggregiert
 - `cluster`   — Gesamtsumme über alle Namespaces im Bericht.
@@ -1510,6 +1873,53 @@ Empfehlung pro Dimension: `request = aufgerundet(Spitze)`,
 In `recommendations-human.csv` tragen alle Werte ihre Einheit (CPU `c`/`m`/`µ`,
 Speicher `Ki`/`Mi`/`Gi`) — siehe Einheiten-Abschnitt oben.
 
+## recommendations-apply.yaml / .json — empfohlene Werte auf den Cluster anwenden
+`recommendations-apply.yaml` macht aus den Empfehlungen ein anwendbares
+Manifest. Es enthält **nur Workloads** (Container-`requests`/`limits`); das
+ResourceQuota wird **nie** verändert.
+- Pro heißem Workload ein `ResourcePatch`-Dokument (`apiVersion:
+  forensic-dashboards/v1`) mit `target` (kind/namespace/name) und `patch`
+  (Strategic-Merge-Body für `spec.template.spec.containers[].resources`).
+- Je Container werden nur die **heißen** Dimensionen gesetzt (CPU **und/oder**
+  Speicher, jeweils request **und** limit zusammen); kalte Dimensionen bleiben
+  weg, damit der Merge die Live-Werte unberührt lässt. Mehrere Container werden
+  per Name (Strategic-Merge-Key) getrennt aufgeführt.
+- **Quota-Schutz:** Würde die Summe der Empfehlungen eines Namespace dessen
+  ResourceQuota überschreiten (`quota_action=INCREASE_QUOTA`), wird der Namespace
+  **komplett übersprungen** und im `SKIPPED`-Kopfblock mit der überschrittenen
+  Dimension genannt. Erst Quota erhöhen, dann den Export neu erzeugen.
+- Der alt→neu-Vergleich steht im Kommentarkopf jedes Dokuments.
+
+`recommendations-apply.json` ist das maschinenlesbare Pendant (dieselben
+Patches), das der Applier ohne YAML-Abhängigkeit liest.
+
+### apply-recommendations.py — Manifest anwenden (Dry-Run-Standard)
+Eigenständiges Skript, das `recommendations-apply.json` einliest und je Patch
+`kubectl`/`oc patch ... --type=strategic` aufruft.
+- **Ohne Flag: Server-seitiger Dry-Run** (`--dry-run=server`) — validiert gegen
+  das Live-Objekt (Schema, Admission, Quota) und zeigt alt→neu, **ändert nichts**.
+- **`--execute`** wendet die Änderungen wirklich an; schlägt ein Patch fehl,
+  endet das Skript mit Exit-Code ≠ 0.
+- Flags: `--manifest PFAD` (Default `recommendations-apply.json`), `--execute`,
+  `--context NAME`, `--oc` (statt `kubectl`), `--kubectl PFAD`.
+- Ein zwischenzeitlich gelöschter Workload (`NotFound`) wird übersprungen, nicht
+  als Fehler gewertet. Der `SKIPPED`-Block wird beim Anwenden erneut ausgegeben.
+
+## storage.csv Spalten
+Speicher-Kontingent (`requests.storage`) pro Namespace, aufgeschlüsselt nach
+**StorageClass**. Quelle ist die **ResourceQuota** des Namespace (Schlüssel
+`<class>.storageclass.storage.k8s.io/requests.storage`). Breites Format: eine
+Zeile pro Namespace, je StorageClass zwei Spalten.
+- `stage`, `namespace` — Identität der Zeile.
+- `<class>_used_bytes` — gebuchter Speicher dieser StorageClass (Quota *Used*), in Bytes.
+- `<class>_hard_bytes` — Hard-Kontingent dieser StorageClass (Quota *Hard*), in Bytes.
+Die StorageClasses stehen in fester Reihenfolge; eine im Quota des Namespace
+**nicht** vorhandene Klasse erscheint als `0` (nicht leer), damit die Matrix
+dicht ist — jede Klasse für jeden Namespace, auch Nullwerte. Eine im Cluster
+gefundene, aber nicht gelistete Klasse wird hinten angehängt (nie verworfen).
+In `storage-human.csv` tragen die Werte ihre Einheit (`Ki`/`Mi`/`Gi`/`Ti`,
+`0.0B` für Null), und der `_bytes`-Suffix entfällt im Spaltennamen.
+
 ## ooms.csv Spalten
 - `stage`, `namespace`, `pod`, `container` — welcher Container OOM erlitten hat.
 - `source`        — `live` (aktueller Pod-Zustand), `thanos` (historisch) oder `both`.
@@ -1554,6 +1964,17 @@ def write_report_files(trees, out_dir, window, cluster,
     with open(os.path.join(out_dir, "recommendations-human.csv"), "w",
               encoding="utf-8") as f:
         render_recommendations_human_csv(trees, f, target_util=target_util)
+    with open(os.path.join(out_dir, "recommendations-apply.yaml"), "w",
+              encoding="utf-8") as f:
+        render_recommendations_apply_yaml(trees, f, target_util=target_util)
+    with open(os.path.join(out_dir, "recommendations-apply.json"), "w",
+              encoding="utf-8") as f:
+        render_recommendations_apply_json(trees, f, target_util=target_util)
+    with open(os.path.join(out_dir, "storage.csv"), "w", encoding="utf-8") as f:
+        render_storage_csv(trees, f)
+    with open(os.path.join(out_dir, "storage-human.csv"), "w",
+              encoding="utf-8") as f:
+        render_storage_human_csv(trees, f)
     with open(os.path.join(out_dir, "ooms.csv"), "w", encoding="utf-8") as f:
         render_ooms_csv(trees, f)
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
@@ -1566,9 +1987,46 @@ def write_report_files(trees, out_dir, window, cluster,
     return out_dir
 
 
+def write_apply_manifest_pair(trees, path_noext, target_util=80.0):
+    """Write `<path_noext>.yaml` + `<path_noext>.json` apply manifests for
+    `trees` (the human-reviewable YAML and the applier's JSON sidecar)."""
+    with open(path_noext + ".yaml", "w", encoding="utf-8") as f:
+        render_recommendations_apply_yaml(trees, f, target_util=target_util)
+    with open(path_noext + ".json", "w", encoding="utf-8") as f:
+        render_recommendations_apply_json(trees, f, target_util=target_util)
+
+
+def write_apply_manifests(trees, apply_dir, target_util=80.0):
+    """Collect every recommendations-apply manifest into one folder so
+    apply-recommendations.py never has to hunt through by-stage/. Writes, under
+    apply_dir:
+      - `all.{yaml,json}`        — the full set across all namespaces;
+      - `<stage>.{yaml,json}`    — one per stage, for a staged rollout;
+      - `<stage>/<namespace>.{yaml,json}` — one per namespace, for applying a
+        single namespace on its own. A namespace with nothing to apply (no hot
+        workloads and not quota-skipped) gets no file.
+    Returns apply_dir."""
+    os.makedirs(apply_dir, exist_ok=True)
+    write_apply_manifest_pair(trees, os.path.join(apply_dir, "all"), target_util)
+    for stage, stage_nodes in sorted(group_by_stage(trees).items()):
+        write_apply_manifest_pair(stage_nodes,
+                                  os.path.join(apply_dir, stage), target_util)
+        stage_subdir = os.path.join(apply_dir, stage)
+        for node in sorted(stage_nodes, key=lambda n: n["namespace"]):
+            plan = build_apply_plan([node], target_util)
+            if not plan["patches"] and not plan["skipped"]:
+                continue   # nothing to apply for this namespace -> no file
+            os.makedirs(stage_subdir, exist_ok=True)
+            write_apply_manifest_pair(
+                [node], os.path.join(stage_subdir, node["namespace"]),
+                target_util)
+    return apply_dir
+
+
 def write_all_reports(trees, out_dir, window, cluster, target_util=80.0):
     """Combined report (cluster + per-stage rollups) at out_dir, plus a
-    self-contained per-stage report under out_dir/by-stage/<stage>/."""
+    self-contained per-stage report under out_dir/by-stage/<stage>/ and an
+    out_dir/apply/ folder gathering every recommendations-apply manifest."""
     write_report_files(trees, out_dir, window, cluster,
                        summary_kinds=("cluster", "stage"),
                        target_util=target_util)
@@ -1577,6 +2035,7 @@ def write_all_reports(trees, out_dir, window, cluster, target_util=80.0):
                            os.path.join(out_dir, "by-stage", stage),
                            window, cluster, summary_kinds=("stage",),
                            target_util=target_util)
+    write_apply_manifests(trees, os.path.join(out_dir, "apply"), target_util)
     return out_dir
 
 
@@ -1762,12 +2221,17 @@ def build_parser():
     out.add_argument("--format", action="append",
                      choices=["text", "json", "csv", "resources-human",
                               "namespaces-human", "recommendations",
-                              "recommendations-human", "none"],
+                              "recommendations-human", "recommendations-apply",
+                              "storage", "storage-human", "none"],
                      help="stdout format(s), repeatable (default: text). "
                           "'csv' = raw resources.csv; 'resources-human' / "
                           "'namespaces-human' = the unit-formatted CSVs; "
                           "'recommendations' / 'recommendations-human' = the "
                           "per-workload right-sizing CSV (raw / unit-formatted); "
+                          "'recommendations-apply' = the per-workload patch YAML "
+                          "manifest (for apply-recommendations.py); "
+                          "'storage' / 'storage-human' = per-namespace "
+                          "per-storageclass storage quota (raw / unit-formatted); "
                           "'none' = no stdout (pair with --output-dir to only "
                           "write files).")
     out.add_argument("--target-util", type=float, default=80.0,
