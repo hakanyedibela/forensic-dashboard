@@ -1622,3 +1622,436 @@ def test_write_report_files_recommendations_honour_target_util(fcu, tmp_path):
 def test_legend_documents_recommendations(fcu):
     assert "recommendations.csv" in fcu.LEGEND_TEXT
     assert "recommendations-human.csv" in fcu.LEGEND_TEXT
+
+
+# --- namespace storage quota (per-storageclass requests.storage) ------------
+
+_SC = "storageclass.storage.k8s.io/requests.storage"
+
+
+def test_parse_storage_quota_classes_and_bytes(fcu):
+    s = fcu.parse_storage_quota([_quota(
+        hard={f"block-silver.{_SC}": "100Gi", f"file-gold.{_SC}": "10Gi",
+              "requests.cpu": "5"},
+        used={f"block-silver.{_SC}": "0", f"file-gold.{_SC}": "5Gi"})])
+    assert s["block-silver"]["hard"] == 100 * 1024**3
+    assert s["block-silver"]["used"] == 0
+    assert s["file-gold"]["hard"] == 10 * 1024**3
+    assert s["file-gold"]["used"] == 5 * 1024**3
+    # non-storage quota keys are ignored
+    assert "requests.cpu" not in s
+
+
+def test_parse_storage_quota_empty(fcu):
+    assert fcu.parse_storage_quota([]) == {}
+    assert fcu.parse_storage_quota(None) == {}
+
+
+def test_parse_storage_quota_min_hard_max_used(fcu):
+    # across multiple quotas: smallest hard cap binds, largest used books
+    s = fcu.parse_storage_quota([
+        _quota(hard={f"file-silver.{_SC}": "50Gi"},
+               used={f"file-silver.{_SC}": "10Gi"}),
+        _quota(hard={f"file-silver.{_SC}": "20Gi"},
+               used={f"file-silver.{_SC}": "12Gi"})])
+    assert s["file-silver"]["hard"] == 20 * 1024**3
+    assert s["file-silver"]["used"] == 12 * 1024**3
+
+
+def test_parse_storage_quota_noobaa_dotted_class(fcu):
+    s = fcu.parse_storage_quota([_quota(
+        hard={f"openshift-storage.noobaa.io.{_SC}": "1Ti"})])
+    assert s["openshift-storage.noobaa.io"]["hard"] == 1024**4
+
+
+def test_collect_namespace_populates_storage(fcu):
+    pods = [{
+        "metadata": {"name": "web-1", "namespace": "ns1", "labels": {}},
+        "spec": {"nodeName": "n1", "containers": [
+            {"name": "web", "resources": {}}]},
+        "status": {"containerStatuses": []},
+    }]
+    quotas = [_quota(hard={f"file-gold.{_SC}": "10Gi"},
+                     used={f"file-gold.{_SC}": "3Gi"})]
+    node = fcu.collect_namespace(QuotaFakeK8s(pods=pods, quotas=quotas), "ns1",
+                                 thanos=None, window="24h", step="5m")
+    assert node["storage"]["file-gold"]["hard"] == 10 * 1024**3
+    assert node["storage"]["file-gold"]["used"] == 3 * 1024**3
+
+
+def test_collect_namespace_storage_defaults_empty(fcu):
+    pods = [{
+        "metadata": {"name": "web-1", "namespace": "ns1", "labels": {}},
+        "spec": {"nodeName": "n1", "containers": [{"name": "web",
+                                                   "resources": {}}]},
+        "status": {"containerStatuses": []},
+    }]
+    node = fcu.collect_namespace(QuotaFakeK8s(pods=pods, quotas=[]), "ns1",
+                                 thanos=None, window="24h", step="5m")
+    assert node["storage"] == {}
+
+
+def _storage_node(namespace, stage, storage):
+    return {"namespace": namespace, "stage": stage,
+            "totals": {"pod_count": 0, "container_count": 0, "oom_count": 0},
+            "workloads": [], "ooms": [], "storage": storage}
+
+
+def test_storage_rows_one_per_namespace_missing_is_zero(fcu):
+    trees = [
+        _storage_node("pid-b", "test", {"file-gold": {"used": 5, "hard": 10}}),
+        _storage_node("pid-a", "test", {}),
+    ]
+    rows = fcu.storage_rows(trees)
+    # sorted by (stage, namespace)
+    assert [r["namespace"] for r in rows] == ["pid-a", "pid-b"]
+    # every canonical class present, absent -> 0 (dense matrix)
+    for cls in fcu.STORAGE_CLASSES:
+        assert rows[0][f"{cls}_used"] == 0
+        assert rows[0][f"{cls}_hard"] == 0
+    assert rows[1]["file-gold_used"] == 5
+    assert rows[1]["file-gold_hard"] == 10
+
+
+def test_storage_classes_union_surfaces_unknown_class(fcu):
+    trees = [_storage_node("ns1", "test",
+                           {"surprise-class": {"used": 1, "hard": 2}})]
+    classes = fcu.storage_classes_in(trees)
+    assert classes[:len(fcu.STORAGE_CLASSES)] == fcu.STORAGE_CLASSES
+    assert "surprise-class" in classes  # appended, not dropped
+
+
+def test_render_storage_csv_header_and_values(fcu):
+    trees = [_storage_node("ns1", "test",
+                           {"block-silver": {"used": 0, "hard": 100 * 1024**3}})]
+    buf = io.StringIO()
+    fcu.render_storage_csv(trees, buf)
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    assert "block-silver_used_bytes" in rows[0]
+    assert "block-silver_hard_bytes" in rows[0]
+    assert rows[0]["block-silver_hard_bytes"] == str(100 * 1024**3)
+    assert rows[0]["block-silver_used_bytes"] == "0"
+    assert rows[0]["namespace"] == "ns1"
+
+
+def test_render_storage_human_csv_formats_bytes(fcu):
+    trees = [_storage_node("ns1", "test",
+                           {"file-gold": {"used": 0, "hard": 10 * 1024**3}})]
+    buf = io.StringIO()
+    fcu.render_storage_human_csv(trees, buf)
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    # header drops the _bytes suffix, values carry the unit inline
+    assert "file-gold_hard" in rows[0]
+    assert "file-gold_hard_bytes" not in rows[0]
+    assert rows[0]["file-gold_hard"] == "10.0Gi"
+    assert rows[0]["file-gold_used"] == "0.0B"   # 0 stays 0, not '-'
+
+
+def test_stdout_format_storage(fcu):
+    trees = [_storage_node("ns1", "test",
+                           {"file-gold": {"used": 0, "hard": 1024}})]
+    buf = io.StringIO()
+    fcu.render_stdout_formats(trees, ["storage"], buf, window="24h",
+                              cluster="c", levels=["namespace"])
+    assert "file-gold_used_bytes" in buf.getvalue()
+    buf2 = io.StringIO()
+    fcu.render_stdout_formats(trees, ["storage-human"], buf2, window="24h",
+                              cluster="c", levels=["namespace"])
+    assert "file-gold_hard" in buf2.getvalue()
+
+
+def test_write_report_files_includes_storage(fcu, tmp_path):
+    trees = [_storage_node("ns1", "test",
+                           {"file-gold": {"used": 0, "hard": 1024}})]
+    fcu.write_report_files(trees, str(tmp_path), window="24h", cluster="c")
+    assert (tmp_path / "storage.csv").exists()
+    assert (tmp_path / "storage-human.csv").exists()
+
+
+def test_legend_documents_storage(fcu):
+    assert "storage.csv" in fcu.LEGEND_TEXT
+    assert "storage-human.csv" in fcu.LEGEND_TEXT
+
+
+# --- apply manifest: quantity helpers ---------------------------------------
+
+@pytest.mark.parametrize("cores,expected", [
+    (0.32, "320m"), (0.9, "900m"), (1.13, "1130m"), (2.0, "2000m"),
+    (0.01, "10m"),
+])
+def test_cpu_quantity_roundtrips(fcu, cores, expected):
+    q = fcu.cpu_quantity(cores)
+    assert q == expected
+    assert fcu.parse_cpu(q) == pytest.approx(cores)
+
+
+@pytest.mark.parametrize("nbytes,expected", [
+    (256 * 1024**2, "256Mi"),
+    (10 * 1024**3, "10Gi"),
+    (119 * 1024**2, "119Mi"),
+    (2 * 1024**3, "2Gi"),
+])
+def test_mem_quantity_roundtrips(fcu, nbytes, expected):
+    q = fcu.mem_quantity(nbytes)
+    assert q == expected
+    assert fcu.parse_mem(q) == nbytes
+
+
+# --- apply manifest: per-container recommendations --------------------------
+
+MI = 1024 * 1024
+
+
+def _cleaf(container, **kw):
+    return _leaf(pod="web-1", container=container, **kw)
+
+
+def _wl_with_containers(fcu, kind, name, leaves):
+    """Workload node with one pod holding the given container leaves."""
+    return {"kind": kind, "name": name,
+            "pods": [{"name": leaves[0]["pod"], "totals": {},
+                      "containers": leaves}],
+            "totals": fcu.rollup(leaves)}
+
+
+def test_workload_container_recommendations_per_container(fcu):
+    leaves = [
+        _cleaf("web", cpu_peak=0.9, cpu_limit=1.0, cpu_request=0.5,
+               mem_peak=50 * MI, mem_limit=128 * MI, mem_request=64 * MI),
+        _cleaf("sidecar", cpu_peak=0.05, cpu_limit=1.0, cpu_request=0.5,
+               mem_peak=10 * MI, mem_limit=128 * MI, mem_request=64 * MI),
+    ]
+    wl = _wl_with_containers(fcu, "Deployment", "web", leaves)
+    recs = fcu.workload_container_recommendations(wl, target_util=80.0)
+    by = {r["container"]: r for r in recs}
+    # web cpu is hot (0.9 > 0.8*1.0); mem cold (50Mi < 0.8*128Mi)
+    assert by["web"]["cpu_limit_rec"] == fcu.round_up_cpu_10m(0.9 / 0.8)
+    assert by["web"]["mem_limit_rec"] is None
+    # sidecar cold on both
+    assert by["sidecar"]["cpu_limit_rec"] is None
+    assert by["sidecar"]["mem_limit_rec"] is None
+
+
+# --- apply manifest: build_apply_plan + renderers ---------------------------
+
+def _ns_apply_node(namespace, stage, workloads, quota):
+    return {"namespace": namespace, "stage": stage, "totals": quota,
+            "workloads": workloads, "ooms": []}
+
+
+def _hot_web_tree(fcu, quota=None):
+    quota = quota or {"cpu_request": 10.0, "cpu_limit": 10.0,
+                      "mem_request": 100 * 1024**3, "mem_limit": 100 * 1024**3}
+    leaves = [_cleaf("web", cpu_peak=0.9, cpu_limit=1.0, cpu_request=0.5,
+                     mem_peak=50 * MI, mem_limit=128 * MI, mem_request=64 * MI)]
+    wl = _wl_with_containers(fcu, "Deployment", "web", leaves)
+    return [_ns_apply_node("pid-1-app-test-01", "test", [wl], quota)]
+
+
+def test_build_apply_plan_one_patch_per_hot_workload(fcu):
+    plan = fcu.build_apply_plan(_hot_web_tree(fcu), target_util=80.0)
+    assert plan["skipped"] == []
+    assert len(plan["patches"]) == 1
+    p = plan["patches"][0]
+    assert p["namespace"] == "pid-1-app-test-01"
+    assert p["kind"] == "Deployment" and p["name"] == "web"
+    conts = p["patch"]["spec"]["template"]["spec"]["containers"]
+    assert conts[0]["name"] == "web"
+    # cpu hot -> set; mem cold -> absent
+    assert conts[0]["resources"]["requests"]["cpu"] == "900m"
+    assert "memory" not in conts[0]["resources"]["requests"]
+    assert "memory" not in conts[0]["resources"].get("limits", {})
+
+
+def test_build_apply_plan_skips_quota_exceeding_namespace(fcu):
+    # tiny cpu_limit quota -> rec sum (1130m) EXCEEDS -> skip + warn
+    tree = _hot_web_tree(fcu, quota={"cpu_request": 10.0, "cpu_limit": 1.0,
+                                "mem_request": 100 * 1024**3,
+                                "mem_limit": 100 * 1024**3})
+    plan = fcu.build_apply_plan(tree, target_util=80.0)
+    assert plan["patches"] == []
+    assert len(plan["skipped"]) == 1
+    assert plan["skipped"][0]["namespace"] == "pid-1-app-test-01"
+    assert any("cpu_limit" in r for r in plan["skipped"][0]["reasons"])
+
+
+def test_apply_yaml_round_trips_and_shape(fcu):
+    yaml = pytest.importorskip("yaml")
+    buf = io.StringIO()
+    fcu.render_recommendations_apply_yaml(_hot_web_tree(fcu), buf, target_util=80.0)
+    text = buf.getvalue()
+    assert text.startswith("# recommendations-apply.yaml")
+    docs = [d for d in yaml.safe_load_all(text) if d]
+    assert len(docs) == 1
+    d = docs[0]
+    assert d["kind"] == "ResourcePatch"
+    assert d["target"] == {"kind": "Deployment",
+                           "namespace": "pid-1-app-test-01", "name": "web"}
+    res = d["patch"]["spec"]["template"]["spec"]["containers"][0]["resources"]
+    assert res["requests"]["cpu"] == "900m"
+
+
+def test_apply_yaml_skip_block_lists_namespace(fcu):
+    yaml = pytest.importorskip("yaml")
+    tree = _hot_web_tree(fcu, quota={"cpu_request": 10.0, "cpu_limit": 1.0,
+                                "mem_request": 100 * 1024**3,
+                                "mem_limit": 100 * 1024**3})
+    buf = io.StringIO()
+    fcu.render_recommendations_apply_yaml(tree, buf, target_util=80.0)
+    text = buf.getvalue()
+    assert "SKIPPED" in text
+    assert "pid-1-app-test-01" in text
+    # no documents
+    assert [d for d in yaml.safe_load_all(text) if d] == []
+
+
+def test_apply_yaml_empty_when_no_hot(fcu):
+    yaml = pytest.importorskip("yaml")
+    leaves = [_cleaf("web", cpu_peak=0.1, cpu_limit=1.0, cpu_request=0.5,
+                     mem_peak=10 * MI, mem_limit=128 * MI, mem_request=64 * MI)]
+    wl = _wl_with_containers(fcu, "Deployment", "web", leaves)
+    tree = [_ns_apply_node("pid-1-app-test-01", "test", [wl],
+                           {"cpu_request": 10.0, "cpu_limit": 10.0,
+                            "mem_request": 100 * 1024**3,
+                            "mem_limit": 100 * 1024**3})]
+    buf = io.StringIO()
+    fcu.render_recommendations_apply_yaml(tree, buf, target_util=80.0)
+    assert [d for d in yaml.safe_load_all(buf.getvalue()) if d] == []
+
+
+def test_apply_json_sidecar_matches_plan(fcu):
+    buf = io.StringIO()
+    fcu.render_recommendations_apply_json(_hot_web_tree(fcu), buf, target_util=80.0)
+    obj = json.loads(buf.getvalue())
+    assert obj["target_util"] == 80.0
+    assert obj["skipped"] == []
+    assert len(obj["patches"]) == 1
+    p = obj["patches"][0]
+    assert p["kind"] == "Deployment" and p["name"] == "web"
+    conts = p["patch"]["spec"]["template"]["spec"]["containers"]
+    assert conts[0]["resources"]["requests"]["cpu"] == "900m"
+
+
+def test_write_report_files_includes_apply_manifest(fcu, tmp_path):
+    leaves = [_cleaf("web", cpu_peak=0.9, cpu_limit=1.0, cpu_request=0.5,
+                     mem_peak=50 * MI, mem_limit=128 * MI, mem_request=64 * MI)]
+    wl = _wl_with_containers(fcu, "Deployment", "web", leaves)
+    tree = [{"stage": "test", "namespace": "pid-1-app-test-01",
+             "totals": {"cpu_request": 10.0, "cpu_limit": 10.0,
+                        "mem_request": 100 * 1024**3, "mem_limit": 100 * 1024**3,
+                        "pod_count": 1, "container_count": 1, "oom_count": 0},
+             "workloads": [wl], "ooms": []}]
+    fcu.write_report_files(tree, str(tmp_path), window="24h", cluster="c")
+    assert (tmp_path / "recommendations-apply.yaml").exists()
+    assert (tmp_path / "recommendations-apply.json").exists()
+    obj = json.loads((tmp_path / "recommendations-apply.json").read_text())
+    assert obj["patches"][0]["name"] == "web"
+
+
+def test_stdout_format_recommendations_apply(fcu):
+    leaves = [_cleaf("web", cpu_peak=0.9, cpu_limit=1.0, cpu_request=0.5,
+                     mem_peak=50 * MI, mem_limit=128 * MI, mem_request=64 * MI)]
+    wl = _wl_with_containers(fcu, "Deployment", "web", leaves)
+    tree = [{"stage": "test", "namespace": "pid-1-app-test-01",
+             "totals": {"cpu_request": 10.0, "cpu_limit": 10.0,
+                        "mem_request": 100 * 1024**3, "mem_limit": 100 * 1024**3},
+             "workloads": [wl], "ooms": []}]
+    buf = io.StringIO()
+    fcu.render_stdout_formats(tree, ["recommendations-apply"], buf,
+                              window="24h", cluster="c", levels=["namespace"])
+    assert "kind: ResourcePatch" in buf.getvalue()
+
+
+def test_legend_documents_apply_manifest(fcu):
+    assert "recommendations-apply.yaml" in fcu.LEGEND_TEXT
+    assert "apply-recommendations.py" in fcu.LEGEND_TEXT
+
+
+# --- apply manifests collected into a single apply/ folder ------------------
+
+def _apply_ns(fcu, name, stage):
+    leaves = [_cleaf("web", cpu_peak=0.9, cpu_limit=1.0, cpu_request=0.5,
+                     mem_peak=50 * MI, mem_limit=128 * MI, mem_request=64 * MI)]
+    wl = _wl_with_containers(fcu, "Deployment", "web", leaves)
+    return {"stage": stage, "namespace": name,
+            "totals": {"cpu_request": 10.0, "cpu_limit": 10.0,
+                       "mem_request": 100 * 1024**3, "mem_limit": 100 * 1024**3,
+                       "pod_count": 1, "container_count": 1, "oom_count": 0},
+            "workloads": [wl], "ooms": [], "storage": {}}
+
+
+def test_write_apply_manifests_folder(fcu, tmp_path):
+    trees = [_apply_ns(fcu, "pid-1-app-test-01", "test"),
+             _apply_ns(fcu, "pid-2-app-prod-01", "prod")]
+    fcu.write_apply_manifests(trees, str(tmp_path / "apply"))
+    apply = tmp_path / "apply"
+    # combined (all stages) + one pair per stage
+    for f in ("all.yaml", "all.json", "test.yaml", "test.json",
+              "prod.yaml", "prod.json"):
+        assert (apply / f).exists(), f
+    allobj = json.loads((apply / "all.json").read_text())
+    assert {p["namespace"] for p in allobj["patches"]} == {
+        "pid-1-app-test-01", "pid-2-app-prod-01"}
+    prodobj = json.loads((apply / "prod.json").read_text())
+    assert [p["namespace"] for p in prodobj["patches"]] == ["pid-2-app-prod-01"]
+
+
+def test_write_all_reports_includes_apply_folder(fcu, tmp_path):
+    trees = [_apply_ns(fcu, "pid-1-app-test-01", "test")]
+    fcu.write_all_reports(trees, str(tmp_path), window="24h", cluster="c")
+    assert (tmp_path / "apply" / "all.json").exists()
+    assert (tmp_path / "apply" / "test.json").exists()
+
+
+def test_write_apply_manifests_per_namespace_grouped_by_stage(fcu, tmp_path):
+    trees = [_apply_ns(fcu, "pid-1-app-test-01", "test"),
+             _apply_ns(fcu, "pid-2-api-test-01", "test"),
+             _apply_ns(fcu, "pid-3-web-prod-01", "prod")]
+    fcu.write_apply_manifests(trees, str(tmp_path / "apply"))
+    apply = tmp_path / "apply"
+    # per-namespace dedicated manifests live under apply/<stage>/
+    for f in ("test/pid-1-app-test-01.yaml", "test/pid-1-app-test-01.json",
+              "test/pid-2-api-test-01.json", "prod/pid-3-web-prod-01.json"):
+        assert (apply / f).exists(), f
+    # each carries only its own namespace's patches
+    obj = json.loads((apply / "prod" / "pid-3-web-prod-01.json").read_text())
+    assert [p["namespace"] for p in obj["patches"]] == ["pid-3-web-prod-01"]
+    # the per-stage file and the same-named stage dir coexist
+    assert (apply / "test.json").exists() and (apply / "test").is_dir()
+    # combined + per-stage still there
+    assert (apply / "all.json").exists() and (apply / "test.json").exists()
+
+
+def test_write_apply_manifests_skips_namespace_with_nothing_to_apply(fcu, tmp_path):
+    # a quiet namespace (no hot workloads, quota not exceeded) gets no file
+    leaves = [_cleaf("web", cpu_peak=0.1, cpu_limit=1.0, cpu_request=0.5,
+                     mem_peak=10 * MI, mem_limit=128 * MI, mem_request=64 * MI)]
+    wl = _wl_with_containers(fcu, "Deployment", "web", leaves)
+    quiet = {"stage": "test", "namespace": "pid-quiet-test-01",
+             "totals": {"cpu_request": 10.0, "cpu_limit": 10.0,
+                        "mem_request": 100 * 1024**3, "mem_limit": 100 * 1024**3,
+                        "pod_count": 1, "container_count": 1, "oom_count": 0},
+             "workloads": [wl], "ooms": [], "storage": {}}
+    fcu.write_apply_manifests([quiet], str(tmp_path / "apply"))
+    assert not (tmp_path / "apply" / "test" / "pid-quiet-test-01.json").exists()
+    assert (tmp_path / "apply" / "all.json").exists()   # combined still written
+
+
+def test_write_apply_manifests_per_namespace_includes_quota_skipped(fcu, tmp_path):
+    # a quota-exceeding namespace has no patches but IS skipped -> still gets a
+    # per-namespace file (header-only, naming it in the SKIPPED block)
+    leaves = [_cleaf("api", cpu_peak=3.0, cpu_limit=4.0, cpu_request=2.0,
+                     mem_peak=8 * 1024**3, mem_limit=10 * 1024**3,
+                     mem_request=6 * 1024**3)]
+    wl = _wl_with_containers(fcu, "Deployment", "api", leaves)
+    over = {"stage": "prod", "namespace": "pid-over-prod-01",
+            "totals": {"cpu_request": 1.0, "cpu_limit": 1.0,
+                       "mem_request": 1024**3, "mem_limit": 1024**3,
+                       "pod_count": 1, "container_count": 1, "oom_count": 0},
+            "workloads": [wl], "ooms": [], "storage": {}}
+    fcu.write_apply_manifests([over], str(tmp_path / "apply"))
+    p = tmp_path / "apply" / "prod" / "pid-over-prod-01.json"
+    assert p.exists()
+    obj = json.loads(p.read_text())
+    assert obj["patches"] == []
+    assert obj["skipped"][0]["namespace"] == "pid-over-prod-01"
