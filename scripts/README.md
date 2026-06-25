@@ -691,6 +691,57 @@ oom-test   startup-app-58f65dd8c9-bv..  startup    E - STARTUP OVERRUN         5
 
 ---
 
+## `python/reconcile-state.py`
+
+Reconciles the **current** cluster state (`snapshot.json`) against the **desired** manifests (`desired/*.yaml`) for every namespace under a `state-loop-<ts>/` output directory produced by `fetch-cluster-state.py`. Matching is **presence-level** only: resources are keyed by `(kind, name)` — field values are not compared.
+
+Writes one CSV per stage:
+
+| Output file | Content |
+|---|---|
+| `_reconcile-<stage>.csv` | One row per `(kind, name)` per namespace; columns below. |
+
+### CSV columns
+
+| Column | Values / meaning |
+|---|---|
+| `stage` | Stage name (e.g. `phase`, `test`, `prod`). |
+| `namespace` | Kubernetes namespace name. |
+| `kind` | Resource kind (`Deployment`, `HorizontalPodAutoscaler`, `Namespace`, etc.). |
+| `name` | Resource name. |
+| `in_current` | `True` / `False` — found in `snapshot.json`. |
+| `in_desired` | `True` / `False` — found in `desired/*.yaml`. |
+| `status` | `IN_SYNC`, `MISSING_IN_CLUSTER`, or `NOT_DESIRED`. |
+
+**Status taxonomy:**
+
+- `IN_SYNC` — present in both snapshot and desired manifests.
+- `MISSING_IN_CLUSTER` — declared in desired manifests but absent from the cluster snapshot.
+- `NOT_DESIRED` — present in the cluster snapshot but not covered by any desired manifest.
+
+### Requirements
+
+- Python 3.6.8+
+- PyYAML (optional; the script falls back to a line extractor if not available)
+- A `state-loop-<ts>/` directory with `by-stage/<stage>/<ns>/snapshot.json` + `desired/*.yaml`
+
+### Usage
+
+```bash
+python3 scripts/python/reconcile-state.py \
+  --input-dir reports/state-loop-<ts>/
+```
+
+Output CSVs are written to the root of `--input-dir`:
+
+```
+reports/state-loop-<ts>/_reconcile-phase.csv
+reports/state-loop-<ts>/_reconcile-prod.csv
+...
+```
+
+---
+
 ## Adding a new script
 
 Conventions for additions to this directory:
