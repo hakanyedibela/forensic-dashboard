@@ -2001,3 +2001,57 @@ def test_write_all_reports_includes_apply_folder(fcu, tmp_path):
     fcu.write_all_reports(trees, str(tmp_path), window="24h", cluster="c")
     assert (tmp_path / "apply" / "all.json").exists()
     assert (tmp_path / "apply" / "test.json").exists()
+
+
+def test_write_apply_manifests_per_namespace_grouped_by_stage(fcu, tmp_path):
+    trees = [_apply_ns(fcu, "pid-1-app-test-01", "test"),
+             _apply_ns(fcu, "pid-2-api-test-01", "test"),
+             _apply_ns(fcu, "pid-3-web-prod-01", "prod")]
+    fcu.write_apply_manifests(trees, str(tmp_path / "apply"))
+    apply = tmp_path / "apply"
+    # per-namespace dedicated manifests live under apply/<stage>/
+    for f in ("test/pid-1-app-test-01.yaml", "test/pid-1-app-test-01.json",
+              "test/pid-2-api-test-01.json", "prod/pid-3-web-prod-01.json"):
+        assert (apply / f).exists(), f
+    # each carries only its own namespace's patches
+    obj = json.loads((apply / "prod" / "pid-3-web-prod-01.json").read_text())
+    assert [p["namespace"] for p in obj["patches"]] == ["pid-3-web-prod-01"]
+    # the per-stage file and the same-named stage dir coexist
+    assert (apply / "test.json").exists() and (apply / "test").is_dir()
+    # combined + per-stage still there
+    assert (apply / "all.json").exists() and (apply / "test.json").exists()
+
+
+def test_write_apply_manifests_skips_namespace_with_nothing_to_apply(fcu, tmp_path):
+    # a quiet namespace (no hot workloads, quota not exceeded) gets no file
+    leaves = [_cleaf("web", cpu_peak=0.1, cpu_limit=1.0, cpu_request=0.5,
+                     mem_peak=10 * MI, mem_limit=128 * MI, mem_request=64 * MI)]
+    wl = _wl_with_containers(fcu, "Deployment", "web", leaves)
+    quiet = {"stage": "test", "namespace": "pid-quiet-test-01",
+             "totals": {"cpu_request": 10.0, "cpu_limit": 10.0,
+                        "mem_request": 100 * 1024**3, "mem_limit": 100 * 1024**3,
+                        "pod_count": 1, "container_count": 1, "oom_count": 0},
+             "workloads": [wl], "ooms": [], "storage": {}}
+    fcu.write_apply_manifests([quiet], str(tmp_path / "apply"))
+    assert not (tmp_path / "apply" / "test" / "pid-quiet-test-01.json").exists()
+    assert (tmp_path / "apply" / "all.json").exists()   # combined still written
+
+
+def test_write_apply_manifests_per_namespace_includes_quota_skipped(fcu, tmp_path):
+    # a quota-exceeding namespace has no patches but IS skipped -> still gets a
+    # per-namespace file (header-only, naming it in the SKIPPED block)
+    leaves = [_cleaf("api", cpu_peak=3.0, cpu_limit=4.0, cpu_request=2.0,
+                     mem_peak=8 * 1024**3, mem_limit=10 * 1024**3,
+                     mem_request=6 * 1024**3)]
+    wl = _wl_with_containers(fcu, "Deployment", "api", leaves)
+    over = {"stage": "prod", "namespace": "pid-over-prod-01",
+            "totals": {"cpu_request": 1.0, "cpu_limit": 1.0,
+                       "mem_request": 1024**3, "mem_limit": 1024**3,
+                       "pod_count": 1, "container_count": 1, "oom_count": 0},
+            "workloads": [wl], "ooms": [], "storage": {}}
+    fcu.write_apply_manifests([over], str(tmp_path / "apply"))
+    p = tmp_path / "apply" / "prod" / "pid-over-prod-01.json"
+    assert p.exists()
+    obj = json.loads(p.read_text())
+    assert obj["patches"] == []
+    assert obj["skipped"][0]["namespace"] == "pid-over-prod-01"
