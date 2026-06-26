@@ -70,11 +70,13 @@ def write_apply_report(path, mode, results, skipped):
     namespaces — so the report is a complete, honest record."""
     applied = [r for r in results if r["status"] == "applied"]
     failed = [r for r in results if r["status"] == "failed"]
+    skipped_failed = [r for r in results if r["status"] == "skipped-failed"]
     notfound = [r for r in results if r["status"] == "not-found"]
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"# apply-recommendations report — {mode} — {ts}\n")
         f.write(f"# {len(applied)} applied, {len(failed)} failed, "
+                f"{len(skipped_failed)} skipped (would fail), "
                 f"{len(notfound)} not found, "
                 f"{len(skipped)} namespace(s) skipped (quota)\n")
         f.write("# Applied recommendations (one line each):\n")
@@ -84,6 +86,10 @@ def write_apply_report(path, mode, results, skipped):
         if failed:
             f.write("#\n# FAILED (not applied):\n")
             for r in failed:
+                f.write(f"#   {r['label']}: {r['detail']}\n")
+        if skipped_failed:
+            f.write("#\n# SKIPPED — would fail to patch (best-effort, ignored):\n")
+            for r in skipped_failed:
                 f.write(f"#   {r['label']}: {r['detail']}\n")
         if notfound:
             f.write("#\n# SKIPPED — workload not found on the cluster:\n")
@@ -98,17 +104,25 @@ def write_apply_report(path, mode, results, skipped):
 
 
 def apply_manifest(manifest, runner=subprocess_runner, execute=False,
-                   binary="kubectl", context=None, out=None, report=None):
+                   binary="kubectl", context=None, out=None, report=None,
+                   skip_failed=False):
     """Apply every patch in `manifest` via `runner`. Re-prints the SKIPPED
     (quota) block, performs a server-side dry-run unless `execute`, treats a
     NotFound workload as a non-fatal skip, and returns a non-zero exit code if
     any patch failed under `--execute`. When `report` is a path, also writes a
-    text report of the applied recommendations there (see write_apply_report)."""
+    text report of the applied recommendations there (see write_apply_report).
+
+    With `skip_failed` (best-effort), every patch is first validated with a
+    server-side dry-run and only the ones that pass are applied; patches that
+    would fail are skipped (not fatal), so a few bad patches never block the rest
+    and the run still exits 0."""
     if out is None:                      # resolve at call time, not import time
         out = sys.stdout
     skipped = manifest.get("skipped", []) or []
     patches = manifest.get("patches", []) or []
     mode = "EXECUTE (mutating)" if execute else "DRY-RUN (server, no changes)"
+    if skip_failed:
+        mode += ", skip-failed"
     print(f"apply-recommendations: {mode} — {len(patches)} workload(s)", file=out)
 
     if skipped:
@@ -131,6 +145,21 @@ def apply_manifest(manifest, runner=subprocess_runner, execute=False,
         summary = p.get("summary", []) or []
         for line in summary:
             print(f"  {label}  {line}", file=out)
+
+        # Best-effort: validate first (server dry-run); apply only if it passes.
+        if skip_failed and execute:
+            vrc, vso, vse = runner(build_argv(p, binary, context, execute=False))
+            if vrc != 0:
+                if _is_not_found(vso, vse):
+                    status, detail = "not-found", ""
+                    print(f"  SKIP {label} (not found)", file=out)
+                else:
+                    status, detail = "skipped-failed", (vse or vso).strip()
+                    print(f"  SKIP {label} (would fail): {detail}", file=out)
+                results.append({"label": label, "summary": summary,
+                                "status": status, "detail": detail})
+                continue
+
         rc, so, se = runner(build_argv(p, binary, context, execute))
         if rc == 0:
             status, detail = "applied", ""
@@ -138,6 +167,9 @@ def apply_manifest(manifest, runner=subprocess_runner, execute=False,
         elif _is_not_found(so, se):
             status, detail = "not-found", ""
             print(f"  SKIP {label} (not found)", file=out)
+        elif skip_failed:
+            status, detail = "skipped-failed", (se or so).strip()
+            print(f"  SKIP {label} (failed): {detail}", file=out)
         else:
             status, detail = "failed", (se or so).strip()
             failures += 1
@@ -145,7 +177,11 @@ def apply_manifest(manifest, runner=subprocess_runner, execute=False,
         results.append({"label": label, "summary": summary, "status": status,
                         "detail": detail})
 
-    print(f"done: {len(patches)} processed, {failures} failed", file=out)
+    n_applied = sum(1 for r in results if r["status"] == "applied")
+    n_skipped = sum(1 for r in results
+                    if r["status"] in ("skipped-failed", "not-found"))
+    print(f"done: {len(patches)} processed — {n_applied} applied, "
+          f"{n_skipped} skipped, {failures} failed", file=out)
     if report is not None:
         write_apply_report(report, mode, results, skipped)
     return 1 if failures else 0
@@ -168,6 +204,11 @@ def build_parser():
     p.add_argument("--report", metavar="PATH",
                    help="Also write a text report listing each applied "
                         "recommendation (one per line) to PATH.")
+    p.add_argument("--skip-failed", action="store_true",
+                   help="Best-effort: validate each patch with a server dry-run "
+                        "first and apply only the ones that pass; patches that "
+                        "would fail are skipped (not fatal) so the rest still "
+                        "apply and the run exits 0. Use with --execute.")
     return p
 
 
@@ -191,7 +232,7 @@ def main(argv=None):
         return 2
     return apply_manifest(manifest, execute=args.execute,
                           binary=binary, context=args.context,
-                          report=args.report)
+                          report=args.report, skip_failed=args.skip_failed)
 
 
 if __name__ == "__main__":

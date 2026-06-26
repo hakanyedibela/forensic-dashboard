@@ -1065,6 +1065,9 @@ python3 scripts/python/fetch-cluster-usage.py --kubectl --output-dir ./reports/u
 ./apply-recommendations.py --manifest ./reports/usage/apply/test.json --execute
 ./apply-recommendations.py --manifest ./reports/usage/apply/prod.json --execute
 
+# best-effort: apply only the patches that pass validation, skip the rest
+./apply-recommendations.py --manifest ./reports/usage/apply/all.json --execute --skip-failed
+
 # write a text report of what was applied (one line per recommendation)
 ./apply-recommendations.py --manifest ./reports/usage/apply/all.json --execute \
   --report ./reports/usage/apply-report.txt
@@ -1098,6 +1101,7 @@ done: 1 processed, 0 failed
 | `--oc` | Use the `oc` binary instead of `kubectl`. |
 | `--kubectl PATH` | kubectl binary path (default `kubectl`). |
 | `--report PATH` | Also write a text report of the run to `PATH`: one line per **applied** recommendation (`<namespace>/<kind> <name>  <container: old→new>`), with a header (mode, timestamp, counts) and a `#`-comment footer listing anything not applied — failures, not-found workloads, and quota-skipped namespaces. |
+| `--skip-failed` | **Best-effort.** Validate each patch with a server dry-run first and apply only the ones that pass; patches that would fail are **skipped** (not fatal) so the rest still apply and the run exits `0`. Use with `--execute`. |
 
 ### Applied-recommendations report (`--report`)
 
