@@ -1,0 +1,25 @@
+flowchart LR
+    subgraph CL["OpenShift cluster"]
+        K[("Workloads and quotas<br/>CPU · memory · storage")]
+        M[("Thanos / Prometheus<br/>real usage over time")]
+    end
+
+    K --> T
+    M --> T
+    T["fetch-cluster-usage.py<br/><b>measures usage vs. what's reserved</b>"]
+
+    T --> R["Reports<br/>(CSV / Excel-friendly + text summary)"]
+    T --> REC["Right-sizing recommendations<br/>(CPU / memory per workload)"]
+
+    REC --> DR{"apply-recommendations.py<br/><b>dry-run safety check</b><br/>(changes nothing)"}
+    DR --> REV["Admin reviews the report"]
+    REV -->|approved| AP["Apply to cluster<br/>(optional, explicit)"]
+
+    R --> GL[("GitLab repo<br/>full history / audit trail")]
+    DR --> GL
+
+    classDef src fill:#e8f0fe,stroke:#4285f4,color:#173;
+    classDef tool fill:#fff4e5,stroke:#f5a623,color:#000;
+    classDef out fill:#e6f4ea,stroke:#34a853,color:#000;
+    classDef safe fill:#fde7e9,stroke:#d93025,color:#000;
+    class K,M src; class T,REC tool; class R,GL,REV out; class DR,AP safe;

@@ -1,0 +1,26 @@
+flowchart TB
+    MAN["recommendations-apply.json<br/>(workload patches + quota-skipped list)"]
+    MAN --> LOOP{"for each workload patch"}
+
+    LOOP --> MODE{"--execute set?"}
+    MODE -->|no default| DRY["oc patch --dry-run=server<br/>validate only · change nothing"]
+    MODE -->|yes| EXE["oc patch<br/>apply for real"]
+
+    DRY --> RES{"result"}
+    EXE --> RES
+    RES -->|OK| OK["record applied"]
+    RES -->|NotFound| SK["skip (workload gone) — non-fatal"]
+    RES -->|error| FA["record FAILED<br/>(non-zero exit under --execute)"]
+
+    OK --> REP["apply-report.txt<br/>one line per applied recommendation"]
+    SK --> REP
+    FA --> REP
+
+    NOTE["Quota-exceeding namespaces were already<br/>left out of the manifest (SKIPPED block,<br/>re-printed here) — raise quota first"]
+    MAN -.-> NOTE
+
+    classDef in fill:#e8f0fe,stroke:#4285f4,color:#000;
+    classDef safe fill:#fde7e9,stroke:#d93025,color:#000;
+    classDef act fill:#fff4e5,stroke:#f5a623,color:#000;
+    classDef out fill:#e6f4ea,stroke:#34a853,color:#000;
+    class MAN,NOTE in; class DRY safe; class EXE act; class REP,OK,SK,FA out;

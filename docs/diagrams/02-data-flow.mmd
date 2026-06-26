@@ -1,0 +1,37 @@
+flowchart TB
+    subgraph IN["Inputs"]
+        direction TB
+        A1["Kubernetes API<br/>pods · deployments/statefulsets/daemonsets<br/>ResourceQuota · PersistentVolumeClaims<br/>StorageClasses · namespaces"]
+        A2["Thanos / Prometheus<br/>CPU rate · memory working-set<br/>peak & avg over --window"]
+        A3["Live pod state<br/>lastState = OOMKilled"]
+    end
+
+    subgraph PROC["fetch-cluster-usage.py"]
+        direction TB
+        P1["Build tree<br/>namespace → workload → pod → container"]
+        P2["Attach real usage<br/>(now / peak / avg)"]
+        P3["Overlay ResourceQuota<br/>CPU/mem Hard+Used · storage per StorageClass"]
+        P4["PVCs → capacity + StorageClass<br/>(+ description annotation)"]
+        P5["compute_recommendation<br/>hot workloads → request/limit"]
+        P6["namespace quota gate<br/>fits quota? else INCREASE_QUOTA"]
+        P1 --> P2 --> P3 --> P4 --> P5 --> P6
+    end
+
+    subgraph OUT["Outputs (per run, also split by-stage)"]
+        direction TB
+        O1["resources.csv / -human.csv<br/>cluster→…→container + level=pvc rows"]
+        O2["namespaces.csv / -human.csv<br/>CPU/mem + storage quota & PVC share %"]
+        O3["recommendations.csv / -human.csv"]
+        O4["recommendations-apply.yaml / .json<br/>+ apply/ folder (all · stage · namespace)"]
+        O5["ooms.csv · report.json · summary.txt · LEGEND.md"]
+    end
+
+    A1 --> P1
+    A2 --> P2
+    A3 --> P1
+    PROC --> O1 & O2 & O3 & O4 & O5
+
+    classDef src fill:#e8f0fe,stroke:#4285f4,color:#000;
+    classDef proc fill:#fff4e5,stroke:#f5a623,color:#000;
+    classDef out fill:#e6f4ea,stroke:#34a853,color:#000;
+    class A1,A2,A3 src; class P1,P2,P3,P4,P5,P6 proc; class O1,O2,O3,O4,O5 out;
