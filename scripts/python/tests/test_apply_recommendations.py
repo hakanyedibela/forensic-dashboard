@@ -250,3 +250,68 @@ def test_main_passes_report_path_with_quota_skips(apprec, tmp_path):
     assert "0 applied" in text
     assert "pid-9-app-prod-01" in text
     assert "cpu_limit sum 4000m > quota 1000m" in text
+
+
+# --- --skip-failed (best-effort: validate, apply only the OK ones) ----------
+
+def test_parser_has_skip_failed(apprec):
+    assert apprec.build_parser().parse_args(["--skip-failed"]).skip_failed is True
+    assert apprec.build_parser().parse_args([]).skip_failed is False
+
+
+def test_skip_failed_applies_only_passing(apprec):
+    # call order: p-ok validate(OK), p-ok apply(OK), p-bad validate(FAIL)
+    runner = _recording_runner([
+        (0, "patched (dry run)", ""),                 # ok: validate
+        (0, "patched", ""),                           # ok: real apply
+        (1, "", "admission webhook denied the request"),  # bad: validate -> skip
+    ])
+    out = io.StringIO()
+    rc = apprec.apply_manifest(
+        _manifest([_patch_doc(name="ok"), _patch_doc(name="bad")]),
+        runner=runner, execute=True, skip_failed=True, out=out)
+    assert rc == 0                                    # best-effort -> exit 0
+    text = out.getvalue()
+    assert "OK   ns1/Deployment ok" in text
+    assert "SKIP ns1/Deployment bad (would fail)" in text
+    assert len(runner.calls) == 3                     # bad never got a real apply
+    assert "--dry-run=server" in runner.calls[0]      # validate is a dry-run
+    assert "--dry-run=server" not in runner.calls[1]  # real apply mutates
+    assert "--dry-run=server" in runner.calls[2]      # bad only validated
+
+
+def test_skip_failed_not_found_is_skipped(apprec):
+    runner = _recording_runner([
+        (1, "", 'Error from server (NotFound): deployments.apps "x" not found')])
+    out = io.StringIO()
+    rc = apprec.apply_manifest(_manifest([_patch_doc(name="x")]),
+                               runner=runner, execute=True, skip_failed=True,
+                               out=out)
+    assert rc == 0
+    assert "SKIP ns1/Deployment x (not found)" in out.getvalue()
+    assert len(runner.calls) == 1                     # validate only, no apply
+
+
+def test_skip_failed_report_lists_skipped(apprec, tmp_path):
+    runner = _recording_runner([
+        (0, "dry ok", ""), (0, "applied", ""),        # ok
+        (1, "", "denied by policy")])                  # bad: validate fails
+    report = tmp_path / "r.txt"
+    apprec.apply_manifest(
+        _manifest([_patch_doc(name="ok"), _patch_doc(name="bad")]),
+        runner=runner, execute=True, skip_failed=True,
+        out=io.StringIO(), report=str(report))
+    text = report.read_text()
+    assert "1 applied" in text and "1 skipped (would fail)" in text
+    assert "SKIPPED — would fail to patch" in text
+    assert "ns1/Deployment bad: denied by policy" in text
+    body = [l for l in text.splitlines() if l and not l.startswith("#")]
+    assert any("ns1/Deployment ok" in l for l in body)   # ok still in applied lines
+
+
+def test_without_skip_failed_failure_still_fatal(apprec):
+    # regression: default behaviour unchanged — a failed patch -> exit 1
+    runner = _recording_runner([(1, "", "boom")])
+    rc = apprec.apply_manifest(_manifest([_patch_doc()]), runner=runner,
+                               execute=True, skip_failed=False, out=io.StringIO())
+    assert rc == 1

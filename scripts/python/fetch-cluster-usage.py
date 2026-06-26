@@ -2009,8 +2009,13 @@ Eigenständiges Skript, das `recommendations-apply.json` einliest und je Patch
   das Live-Objekt (Schema, Admission, Quota) und zeigt alt→neu, **ändert nichts**.
 - **`--execute`** wendet die Änderungen wirklich an; schlägt ein Patch fehl,
   endet das Skript mit Exit-Code ≠ 0.
+- **`--skip-failed`** (Best-Effort): validiert jeden Patch zuerst per
+  Server-Dry-Run und wendet nur die fehlerfreien an; Patches, die fehlschlagen
+  würden, werden **übersprungen** (nicht fatal), die übrigen laufen durch und der
+  Exit-Code bleibt `0`. Mit `--execute` verwenden.
 - Flags: `--manifest PFAD` (Default `recommendations-apply.json`), `--execute`,
-  `--context NAME`, `--oc` (statt `kubectl`), `--kubectl PFAD`.
+  `--skip-failed`, `--report PFAD`, `--context NAME`, `--oc` (statt `kubectl`),
+  `--kubectl PFAD`.
 - Ein zwischenzeitlich gelöschter Workload (`NotFound`) wird übersprungen, nicht
   als Fehler gewertet. Der `SKIPPED`-Block wird beim Anwenden erneut ausgegeben.
 
