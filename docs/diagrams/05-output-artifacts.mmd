@@ -1,0 +1,13 @@
+flowchart LR
+    RUN(["report run / one GitLab commit"])
+
+    RUN --> CSV["CSV reports<br/>resources(-human) · namespaces(-human)<br/>recommendations(-human) · ooms"]
+    RUN --> TXT["summary.txt<br/>human tables incl. STORAGE block"]
+    RUN --> JSON["report.json<br/>full nested data"]
+    RUN --> LEG["LEGEND.md<br/>column/row reference (DE)"]
+    RUN --> APPLY["apply/<br/>all · &lt;stage&gt; · &lt;stage&gt;/&lt;namespace&gt;<br/>(.yaml review + .json for the applier)"]
+    RUN --> AREP["apply-report.txt<br/>what the dry-run/execute did"]
+
+    classDef run fill:#ede7f6,stroke:#673ab7,color:#000;
+    classDef out fill:#e6f4ea,stroke:#34a853,color:#000;
+    class RUN run; class CSV,TXT,JSON,LEG,APPLY,AREP out;

@@ -6,9 +6,15 @@ and archive the reports — safely (dry-run by default) and on a schedule.
 
 > **Viewing this:** the diagrams below are [Mermaid](https://mermaid.js.org) and
 > render automatically in **GitLab** and **GitHub** markdown and in VS Code
-> (Mermaid preview). For a slide/PNG, paste a block into <https://mermaid.live>
-> and export. The doc is split into a one-screen **overview (for management)**
-> and **detailed views (for admins)**.
+> (Mermaid preview). The doc is split into a one-screen **overview (for
+> management)** and **detailed views (for admins)**.
+>
+> **Slide-ready images:** pre-rendered **PNG** (for PowerPoint/Keynote) and
+> **SVG** (crisp at any zoom) of every diagram live in the `docs/diagrams/`
+> folder — `01-overview`, `02-data-flow`, `03-cronjob-pipeline`,
+> `04-apply-workflow`, `05-output-artifacts`. Regenerate
+> them from the `.mmd` sources with the Mermaid CLI
+> (`mmdc -i docs/diagrams/<name>.mmd -o docs/diagrams/<name>.png -b white -s 3`).
 
 ---
 

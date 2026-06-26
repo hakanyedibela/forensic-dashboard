@@ -1,0 +1,30 @@
+flowchart TB
+    CRON["CronJob: cluster-usage<br/>schedule 0 6 */5 * * · tz Europe/Berlin"]
+
+    subgraph POD["Job pod (initContainers run in order, then push)"]
+        direction TB
+        S1["1 · get-oc<br/>image: origin-cli<br/>copy static oc → /tools"]
+        S2["2 · fetch<br/>image: python:3.12-slim<br/>fetch-cluster-usage.py --in-cluster → /work"]
+        S3["3 · apply<br/>image: python:3.12-slim<br/>apply-recommendations.py --oc (dry-run)<br/>→ /work/apply-report.txt"]
+        S4["4 · push<br/>image: alpine/git<br/>commit /work → GitLab over HTTPS+PAT"]
+        S1 --> S2 --> S3 --> S4
+    end
+
+    CRON --> POD
+
+    VOLS["emptyDir volumes: /tools (oc) · /work (reports) · /gitwork"]
+    SA["ServiceAccount: cluster-usage<br/>RBAC read: pods, quotas, PVCs,<br/>storageclasses, workloads, namespaces<br/>+ patch deploy/statefulset (server dry-run)"]
+    SEC["Secret: gitlab-push (PAT)"]
+    GL[("GitLab repo<br/>reports/&lt;YYYY-MM-DD&gt;/")]
+
+    SA -. token .-> S2
+    SA -. token .-> S3
+    POD --- VOLS
+    SEC -. PAT .-> S4
+    S4 --> GL
+
+    classDef cron fill:#ede7f6,stroke:#673ab7,color:#000;
+    classDef step fill:#fff4e5,stroke:#f5a623,color:#000;
+    classDef infra fill:#eceff1,stroke:#607d8b,color:#000;
+    classDef out fill:#e6f4ea,stroke:#34a853,color:#000;
+    class CRON cron; class S1,S2,S3,S4 step; class VOLS,SA,SEC infra; class GL out;
