@@ -1802,6 +1802,107 @@ def render_recommendations_apply_json(trees, stream, target_util=80.0):
     stream.write("\n")
 
 
+# ------------------------------------------- t-shirt sizing report (sizing.csv)
+
+# Standard t-shirt ladder: (name, cpu_limit_cores, mem_limit_bytes). A workload
+# maps to the smallest size whose cpu AND memory limits cover it. Tune freely.
+TSHIRT_SIZES = [
+    ("XS", 0.25, 256 * 1024 ** 2),
+    ("S",  0.5,  512 * 1024 ** 2),
+    ("M",  1.0,  1 * 1024 ** 3),
+    ("L",  2.0,  2 * 1024 ** 3),
+    ("XL", 4.0,  4 * 1024 ** 3),
+]
+
+
+def tshirt_size(cpu_limit, mem_limit):
+    """Smallest t-shirt size whose cpu+mem limits cover the given limits. Both
+    None -> '-'; larger than the biggest size -> 'XL+'. A missing dimension is
+    treated as 'no constraint', so a half-specified workload still gets a size
+    from the dimension that is set."""
+    if cpu_limit is None and mem_limit is None:
+        return "-"
+    for name, cpu_cap, mem_cap in TSHIRT_SIZES:
+        cpu_ok = cpu_limit is None or cpu_limit <= cpu_cap
+        mem_ok = mem_limit is None or mem_limit <= mem_cap
+        if cpu_ok and mem_ok:
+            return name
+    return "XL+"
+
+
+def ideal_shape(totals, target_util=80.0):
+    """Right-sized request/limit for cpu+mem from the measured peak (for every
+    workload, not just hot ones): request = round_up(peak),
+    limit = round_up(peak / target_util). None where the peak is missing."""
+    frac = target_util / 100.0
+    cp, mp = totals.get("cpu_peak"), totals.get("mem_peak")
+    return {
+        "cpu_request": round_up_cpu_10m(cp) if cp is not None else None,
+        "cpu_limit": round_up_cpu_10m(cp / frac) if cp is not None else None,
+        "mem_request": round_up_mem_mi(mp) if mp is not None else None,
+        "mem_limit": round_up_mem_mi(mp / frac) if mp is not None else None,
+    }
+
+
+def _q_cpu(v):
+    return cpu_quantity(v) if v is not None else "-"
+
+
+def _q_mem(v):
+    return mem_quantity(v) if v is not None else "-"
+
+
+def _shape_text(cpu_req, cpu_lim, mem_req, mem_lim):
+    return (f"cpu {_q_cpu(cpu_req)}/{_q_cpu(cpu_lim)} · "
+            f"mem {_q_mem(mem_req)}/{_q_mem(mem_lim)}")
+
+
+SIZING_COLUMNS = ["namespace", "workload", "cpu_req", "cpu_lim",
+                  "mem_req", "mem_lim", "current_shape", "should_shape",
+                  "current_size", "should_size"]
+
+
+def _sizing_row(namespace, workload, t, target_util):
+    cr, cl = t.get("cpu_request"), t.get("cpu_limit")
+    mr, ml = t.get("mem_request"), t.get("mem_limit")
+    rec = ideal_shape(t, target_util)
+    return {
+        "namespace": namespace, "workload": workload,
+        "cpu_req": _q_cpu(cr), "cpu_lim": _q_cpu(cl),
+        "mem_req": _q_mem(mr), "mem_lim": _q_mem(ml),
+        "current_shape": _shape_text(cr, cl, mr, ml),
+        "should_shape": _shape_text(rec["cpu_request"], rec["cpu_limit"],
+                                    rec["mem_request"], rec["mem_limit"]),
+        "current_size": tshirt_size(cl, ml),
+        "should_size": tshirt_size(rec["cpu_limit"], rec["mem_limit"]),
+    }
+
+
+def sizing_rows(trees, target_util=80.0):
+    """One row per namespace (total) and per workload: current cpu/mem
+    request+limit, the current vs. right-sized 'shape' text, and the t-shirt size
+    each maps to — to decide which size to set."""
+    rows = []
+    for node in sorted(trees, key=lambda n: (n["stage"], n["namespace"])):
+        rows.append(_sizing_row(node["namespace"], "(namespace total)",
+                                node["totals"], target_util))
+        for wl in node["workloads"]:
+            rows.append(_sizing_row(node["namespace"],
+                                    f"{wl['kind']}/{wl['name']}",
+                                    wl["totals"], target_util))
+    return rows
+
+
+def render_sizing_csv(trees, stream, target_util=80.0):
+    """T-shirt sizing report: current shape vs. right-sized 'should' shape per
+    namespace and workload."""
+    writer = csv.DictWriter(stream, fieldnames=SIZING_COLUMNS,
+                            extrasaction="ignore")
+    writer.writeheader()
+    for row in sizing_rows(trees, target_util):
+        writer.writerow(row)
+
+
 def render_ooms_csv(trees, stream):
     cols = ["stage", "namespace", "pod", "container", "source", "oom_events",
             "restart_count", "exit_code", "finished_at"]
@@ -1851,6 +1952,8 @@ def render_stdout_formats(trees, formats, stream, window, cluster, levels,
         render_recommendations_human_csv(trees, stream, target_util=target_util)
     if "recommendations-apply" in formats:
         render_recommendations_apply_yaml(trees, stream, target_util=target_util)
+    if "sizing" in formats:
+        render_sizing_csv(trees, stream, target_util=target_util)
 
 
 # ----------------------------------------------------- persisting to disk/PVC
@@ -1878,6 +1981,7 @@ Erzeugt von scripts/python/fetch-cluster-usage.py.
 - `recommendations-human.csv` — dieselben Zeilen wie `recommendations.csv`, aber jeder Wert mit Einheit (z. B. `200m`, `1.13c`, `6.3Mi`) statt Rohzahl.
 - `recommendations-apply.yaml` — anwendbares Patch-Manifest: ein `ResourcePatch`-Dokument pro **heißem** Workload, das die empfohlenen `requests`/`limits` pro Container als Strategic-Merge-Patch setzt. Namespaces, deren Summe das ResourceQuota überschreiten würde (`quota_action=INCREASE_QUOTA`), werden **übersprungen** und im `SKIPPED`-Kopfblock genannt (Quota zuerst manuell erhöhen). Zum menschlichen Review gedacht.
 - `recommendations-apply.json` — maschinenlesbares Pendant zu `recommendations-apply.yaml` (dieselben Patches), das `apply-recommendations.py` mit der Python-Standardbibliothek liest (kein YAML-Paket nötig).
+- `sizing.csv`     — T-Shirt-Sizing: je Namespace (Summe) und Workload die aktuellen CPU/Speicher-Requests/Limits, eine `current_shape`- vs. `should_shape`-Beschreibung (rechtsskaliert aus dem Spitzenverbrauch) und die T-Shirt-Größe (`current_size`/`should_size`), an der man die zu setzende Größe ablesen kann.
 - `ooms.csv`       — eine Zeile pro OOM-getötetem Container.
 - `summary.txt`    — menschenlesbare Tabelle (CPU in Cores/Milli, Speicher in Ki/Mi/Gi, % und OOM-Anzahl) — dieselben Zahlen wie die CSVs, nur kompakt formatiert. Enthält je Namespace zusätzlich einen **STORAGE**-Block (Quota used/hard/%, je StorageClass Quota- und PVC-Nutzung samt Anteil, sowie eine PVC-Liste mit Beschreibung) und oben eine Übersicht „BY NAMESPACE — storage quota".
 - `report.json`   — dieselben Daten verschachtelt (Namespace → Workload → Pod → Container) plus Aggregationen.
@@ -2019,6 +2123,30 @@ Eigenständiges Skript, das `recommendations-apply.json` einliest und je Patch
 - Ein zwischenzeitlich gelöschter Workload (`NotFound`) wird übersprungen, nicht
   als Fehler gewertet. Der `SKIPPED`-Block wird beim Anwenden erneut ausgegeben.
 
+## sizing.csv — T-Shirt-Sizing (current_shape vs should_shape)
+Eine Zeile pro Namespace-Summe und pro Workload. Spalten:
+- `namespace`, `workload` — Identität (`(namespace total)` für die Namespace-Summe).
+- `cpu_req`, `cpu_lim`, `mem_req`, `mem_lim` — aktuell konfigurierte Werte.
+- `current_shape` — aktuelle Form als Text: `cpu <req>/<lim> · mem <req>/<lim>`.
+- `should_shape` — rechtsskalierte Empfehlung aus dem Spitzenverbrauch
+  (`request = aufgerundet(Spitze)`, `limit = aufgerundet(Spitze / target_util)`).
+- `current_size` / `should_size` — die T-Shirt-Größe, in die die aktuellen bzw.
+  empfohlenen **Limits** passen (kleinste Größe, deren CPU- **und** Speicher-Limit
+  abdecken; größer als XL → `XL+`; ohne Limit → `-`).
+
+T-Shirt-Leiter (Standard, in `TSHIRT_SIZES` anpassbar):
+```
+Größe  CPU-Limit  Speicher-Limit
+XS     250m       256Mi
+S      500m       512Mi
+M      1          1Gi
+L      2          2Gi
+XL     4          4Gi
+```
+`current_shape` vs. `should_shape` (bzw. `current_size` vs. `should_size`) zeigt,
+ob ein Workload/Namespace zu groß (verschwendet) oder zu klein (OOM-Risiko)
+dimensioniert ist, und welche Größe zu setzen ist.
+
 ## Speicher (Storage) — in resources.csv und namespaces.csv
 Das Speicher-Kontingent (`requests.storage`) steckt direkt in den Haupt-CSVs
 (`resources.csv` und `namespaces.csv`), nicht in einer eigenen Datei.
@@ -2104,6 +2232,8 @@ def write_report_files(trees, out_dir, window, cluster,
     with open(os.path.join(out_dir, "recommendations-apply.json"), "w",
               encoding="utf-8") as f:
         render_recommendations_apply_json(trees, f, target_util=target_util)
+    with open(os.path.join(out_dir, "sizing.csv"), "w", encoding="utf-8") as f:
+        render_sizing_csv(trees, f, target_util=target_util)
     with open(os.path.join(out_dir, "ooms.csv"), "w", encoding="utf-8") as f:
         render_ooms_csv(trees, f)
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
@@ -2415,7 +2545,7 @@ def build_parser():
                      choices=["text", "json", "csv", "resources-human",
                               "namespaces-human", "recommendations",
                               "recommendations-human", "recommendations-apply",
-                              "none"],
+                              "sizing", "none"],
                      help="stdout format(s), repeatable (default: text). "
                           "'csv' = raw resources.csv; 'resources-human' / "
                           "'namespaces-human' = the unit-formatted CSVs; "
