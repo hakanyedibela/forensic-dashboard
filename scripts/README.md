@@ -874,6 +874,7 @@ column and `level` row:
   recommendations-human.csv   # same, unit-formatted
   recommendations-apply.yaml  # applyable patch manifest (one ResourcePatch per hot workload)
   recommendations-apply.json  # machine-readable twin, consumed by apply-recommendations.py
+  sizing.csv                  # t-shirt sizing: current vs. right-sized shape + size, per ns & workload
   ooms.csv                    # one row per OOM-killed container
   report.json                 # nested tree + cluster_totals + stage_summaries
   LEGEND.md                   # Legende (German): was jede Spalte und jede `level`-Zeile bedeutet
@@ -957,6 +958,16 @@ Storage lives in the main CSVs — there is no separate `storage.csv`.
 
 The used % is the storageclass quota (Used÷Hard); per-PVC disk fill is not
 queried (capacity only).
+
+#### T-shirt sizing (`sizing.csv`)
+
+One row per namespace (total) and per workload, to decide which t-shirt size to
+set: `cpu_req`/`cpu_lim`/`mem_req`/`mem_lim` (current), `current_shape` vs.
+`should_shape` (a `cpu …/… · mem …/…` text — current vs. right-sized from the
+measured peak), and `current_size`/`should_size` (the t-shirt size the **limits**
+map to). Default ladder (tune `TSHIRT_SIZES`): XS `250m`/`256Mi`, S `500m`/`512Mi`,
+M `1`/`1Gi`, L `2`/`2Gi`, XL `4`/`4Gi` (cpu-limit / mem-limit); over XL → `XL+`.
+Stream it with `--format sizing`.
 
 #### Apply manifest
 

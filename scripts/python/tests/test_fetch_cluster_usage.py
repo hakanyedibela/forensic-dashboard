@@ -2226,3 +2226,59 @@ def test_write_apply_manifests_per_namespace_includes_quota_skipped(fcu, tmp_pat
     obj = json.loads(p.read_text())
     assert obj["patches"] == []
     assert obj["skipped"][0]["namespace"] == "pid-over-prod-01"
+
+
+# --- t-shirt sizing report (sizing.csv) -------------------------------------
+
+def test_tshirt_size_mapping(fcu):
+    assert fcu.tshirt_size(0.25, 256 * MI) == "XS"
+    assert fcu.tshirt_size(0.5, 512 * MI) == "S"
+    assert fcu.tshirt_size(0.53, 475 * MI) == "M"      # cpu just over S's 500m
+    assert fcu.tshirt_size(2.0, 2 * GI) == "L"
+    assert fcu.tshirt_size(4.0, 4 * GI) == "XL"
+    assert fcu.tshirt_size(8.0, 8 * GI) == "XL+"        # bigger than the ladder
+    assert fcu.tshirt_size(None, None) == "-"
+
+
+def test_ideal_shape_from_peak(fcu):
+    rec = fcu.ideal_shape({"cpu_peak": 0.42, "mem_peak": 380 * MI},
+                          target_util=80.0)
+    assert rec["cpu_request"] == fcu.round_up_cpu_10m(0.42)
+    assert rec["cpu_limit"] == fcu.round_up_cpu_10m(0.42 / 0.8)
+    assert rec["mem_request"] == fcu.round_up_mem_mi(380 * MI)
+    assert fcu.ideal_shape({})["cpu_request"] is None   # no peak -> None
+
+
+def test_sizing_csv_columns_and_values(fcu):
+    leaves = [_cleaf("api", cpu_request=0.25, cpu_limit=0.5, cpu_peak=1.6,
+                     mem_request=256 * MI, mem_limit=512 * MI, mem_peak=1500 * MI)]
+    wl = _wl_with_containers(fcu, "Deployment", "api", leaves)
+    node = {"stage": "prod", "namespace": "pid-1", "workloads": [wl],
+            "ooms": [], "totals": wl["totals"]}
+    buf = io.StringIO()
+    fcu.render_sizing_csv([node], buf, target_util=80.0)
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    assert list(rows[0].keys())[:8] == [
+        "namespace", "workload", "cpu_req", "cpu_lim", "mem_req", "mem_lim",
+        "current_shape", "should_shape"]
+    assert rows[0]["workload"] == "(namespace total)"   # namespace rollup first
+    api = [r for r in rows if r["workload"] == "Deployment/api"][0]
+    assert api["cpu_lim"] == "500m"
+    assert "cpu 250m/500m" in api["current_shape"]
+    assert "mem 256Mi/512Mi" in api["current_shape"]
+    assert api["current_size"] == "S"
+    # peak 1.6c / 1500Mi -> right-size up to L
+    assert api["should_size"] == "L"
+    assert "1600m" in api["should_shape"]
+
+
+def test_sizing_written_to_report_dir(fcu, tmp_path):
+    leaves = [_cleaf("api", cpu_limit=0.5, cpu_peak=1.6, mem_limit=512 * MI,
+                     mem_peak=1500 * MI)]
+    wl = _wl_with_containers(fcu, "Deployment", "api", leaves)
+    node = {"stage": "prod", "namespace": "pid-1", "workloads": [wl],
+            "ooms": [], "totals": wl["totals"]}
+    fcu.write_report_files([node], str(tmp_path), window="24h", cluster="c")
+    text = (tmp_path / "sizing.csv").read_text()
+    assert "current_shape,should_shape" in text
+    assert "Deployment/api" in text
