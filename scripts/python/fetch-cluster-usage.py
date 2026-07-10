@@ -482,8 +482,9 @@ def storage_totals(storage):
 
 
 def pvc_records(items):
-    """PersistentVolumeClaim list -> [{name, storageclass, capacity}] sorted by
-    name. Capacity is the provisioned status.capacity.storage (Bound PVCs) or,
+    """PersistentVolumeClaim list -> [{name, storageclass, capacity, used,
+    used_pct}] sorted by name.
+    Capacity is the provisioned status.capacity.storage (Bound PVCs) or,
     failing that, the requested spec.resources.requests.storage, parsed to bytes.
     storageClassName missing -> '-'."""
     out = []
@@ -499,6 +500,10 @@ def pvc_records(items):
             "name": meta.get("name", ""),
             "storageclass": spec.get("storageClassName") or "-",
             "capacity": parse_mem(cap),
+            # Real disk usage (kubelet volume stats via Thanos); filled by
+            # attach_pvc_usage(), None = no data.
+            "used": None,
+            "used_pct": None,
         })
     return sorted(out, key=lambda p: p["name"])
 
@@ -711,6 +716,14 @@ def oom_queries(namespace, window):
     }
 
 
+def pvc_usage_query(namespace):
+    """PromQL for real per-PVC disk usage: the kubelet's volume stats, in bytes.
+    max by (persistentvolumeclaim) dedups the series when several kubelets
+    report the same volume (e.g. around a pod reschedule)."""
+    return (f"max by (persistentvolumeclaim) "
+            f'(kubelet_volume_stats_used_bytes{{namespace="{namespace}"}})')
+
+
 def parse_vector_by_pod_container(payload):
     """Thanos instant-vector payload -> {(pod, container): float}. Series
     missing pod/container labels are skipped."""
@@ -728,6 +741,21 @@ def parse_vector_by_pod_container(payload):
     return out
 
 
+def parse_vector_by_pvc(payload):
+    """Thanos instant-vector payload -> {persistentvolumeclaim: float}. Series
+    missing the persistentvolumeclaim label (or unparseable) are skipped."""
+    out = {}
+    for s in payload.get("data", {}).get("result", []):
+        pvc = s.get("metric", {}).get("persistentvolumeclaim")
+        if not pvc:
+            continue
+        try:
+            out[pvc] = float(s.get("value", [None, None])[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
 # --------------------------------------------------- attach observed signals
 
 def attach_usage(leaves, usage_maps):
@@ -738,6 +766,19 @@ def attach_usage(leaves, usage_maps):
         for field, m in usage_maps.items():
             if key in m:
                 leaf[field] = m[key]
+
+
+def attach_pvc_usage(pvcs, used_map):
+    """Fill used/used_pct on each pvc_records entry from the kubelet volume
+    stats vector ({pvc name: bytes}). PVCs without a series stay None (no data
+    — e.g. Thanos off, volume unmounted, or a block-mode volume that reports
+    no filesystem stats); used_pct is used/capacity, None without capacity."""
+    for p in pvcs:
+        v = used_map.get(p["name"])
+        if v is None:
+            continue
+        p["used"] = int(v)
+        p["used_pct"] = util_pct(p["used"], p.get("capacity"))
 
 
 def thanos_ooms(namespace, events_map):
@@ -1186,6 +1227,11 @@ def collect_namespace(fcu_k8s, namespace, thanos, window, step,
     sc_desc = sc_desc or {}
     for p in node["pvcs"]:
         p["description"] = sc_desc.get(p["storageclass"], "")
+    # Real per-PVC disk usage from the kubelet volume stats (same degradation
+    # as cpu/mem: no Thanos, or a volume without filesystem stats -> None).
+    if node["pvcs"] and thanos is not None and getattr(thanos, "available", True):
+        used_map = parse_vector_by_pvc(thanos.query(pvc_usage_query(namespace)))
+        attach_pvc_usage(node["pvcs"], used_map)
 
     if include_idle:
         present = {(w["kind"], w["name"]) for w in node["workloads"]}
@@ -1226,6 +1272,9 @@ CSV_FIELDS = [
     ("storageclass", "storageclass"),
     ("storageclass_description", "storageclass_description"),
     ("storage_capacity_bytes", "storage_capacity"),
+    # Real per-PVC disk usage (kubelet volume stats via Thanos), level=pvc only.
+    ("pvc_used_bytes", "pvc_used"),
+    ("pvc_used_pct", "pvc_used_pct"),
     ("oom_count", "oom_count"), ("pod_count", "pod_count"),
     ("container_count", "container_count"),
 ]
@@ -1252,7 +1301,7 @@ _IDENTITY_KEYS = {"level", "stage", "namespace", "workload_kind", "workload",
                   "storageclass_description"}
 # PVC-only metric columns: meaningful on level=pvc rows in resources.csv but not
 # at the namespace level, so they're excluded from the namespaces.csv summary.
-_PVC_ONLY_KEYS = {"storage_capacity"}
+_PVC_ONLY_KEYS = {"storage_capacity", "pvc_used", "pvc_used_pct"}
 METRIC_FIELDS = [(h, k) for h, k in CSV_FIELDS
                  if k not in _IDENTITY_KEYS and k not in _PVC_ONLY_KEYS]
 NS_CSV_FIELDS = [("stage", "stage"), ("namespace", "namespace")] + METRIC_FIELDS
@@ -1265,10 +1314,14 @@ for _cls in STORAGE_CLASSES:
                            f"{_cls}_used_pct"]
 # Per-storageclass PVC usage in the namespace (aggregated from the PVCs, not the
 # quota): <class>_pvc_bytes = sum of that class's PVC capacities, <class>_pvc_pct
-# = that class's share of the namespace's total PVC capacity.
+# = that class's share of the namespace's total PVC capacity,
+# <class>_pvc_used_bytes = real disk usage summed over that class's PVCs
+# (kubelet volume stats; blank = no data), <class>_pvc_used_pct = real usage
+# / that class's PVC capacity.
 NS_PVC_COLUMNS = []
 for _cls in STORAGE_CLASSES:
-    NS_PVC_COLUMNS += [f"{_cls}_pvc_bytes", f"{_cls}_pvc_pct"]
+    NS_PVC_COLUMNS += [f"{_cls}_pvc_bytes", f"{_cls}_pvc_pct",
+                       f"{_cls}_pvc_used_bytes", f"{_cls}_pvc_used_pct"]
 NS_CSV_COLUMNS = ([h for h, _ in NS_CSV_FIELDS]
                   + NS_STORAGE_COLUMNS + NS_PVC_COLUMNS)
 
@@ -1280,8 +1333,10 @@ _CPU_METRIC_KEYS = {"cpu_request", "cpu_limit", "cpu_now", "cpu_peak", "cpu_avg"
                     "cpu_request_used", "cpu_limit_used"}
 _MEM_METRIC_KEYS = {"mem_request", "mem_limit", "mem_now", "mem_peak",
                     "mem_request_used", "mem_limit_used"}
-_STORAGE_BYTES_KEYS = {"storage_used", "storage_hard", "storage_capacity"}
-_PCT_METRIC_KEYS = {"cpu_peak_util_pct", "mem_peak_util_pct", "storage_used_pct"}
+_STORAGE_BYTES_KEYS = {"storage_used", "storage_hard", "storage_capacity",
+                       "pvc_used"}
+_PCT_METRIC_KEYS = {"cpu_peak_util_pct", "mem_peak_util_pct",
+                    "storage_used_pct", "pvc_used_pct"}
 _HEADER_TO_KEY = dict(CSV_FIELDS)
 
 
@@ -1302,28 +1357,41 @@ NS_HUMAN_CSV_COLUMNS = ([_human_header(h) for h, _ in NS_CSV_FIELDS]
 
 def _ns_pvc_cells(node, human):
     """Per-storageclass PVC usage for namespaces.csv: <class>_pvc_bytes (sum of
-    the namespace's PVC capacities of that class) and <class>_pvc_pct (that
-    class's share of the namespace's total PVC capacity). Dense over the
-    canonical class set; share is blank when the namespace has no PVCs."""
+    the namespace's PVC capacities of that class), <class>_pvc_pct (that
+    class's share of the namespace's total PVC capacity),
+    <class>_pvc_used_bytes (real disk usage summed over that class's PVCs —
+    None/blank when no PVC of the class has kubelet stats, since no data is not
+    0) and <class>_pvc_used_pct (real usage / that class's PVC capacity).
+    Capacity columns are dense over the canonical class set; share is blank
+    when the namespace has no PVCs."""
     by_class = {}
+    used_by_class = {}
     total = 0
     for p in node.get("pvcs", []):
-        cap = p.get("capacity")
-        if cap is None:
-            continue
         cls = p.get("storageclass")
-        by_class[cls] = by_class.get(cls, 0) + cap
-        total += cap
+        cap = p.get("capacity")
+        if cap is not None:
+            by_class[cls] = by_class.get(cls, 0) + cap
+            total += cap
+        used = p.get("used")
+        if used is not None:
+            used_by_class[cls] = used_by_class.get(cls, 0) + used
     cells = {}
     for cls in STORAGE_CLASSES:
         b = by_class.get(cls, 0)
         pct = util_pct(b, total) if total else None
+        used = used_by_class.get(cls)
+        used_pct = util_pct(used, by_class.get(cls))
         if human:
             cells[f"{cls}_pvc"] = fmt_bytes(b)
             cells[f"{cls}_pvc_pct"] = fmt_pct(pct)
+            cells[f"{cls}_pvc_used"] = fmt_bytes(used)
+            cells[f"{cls}_pvc_used_pct"] = fmt_pct(used_pct)
         else:
             cells[f"{cls}_pvc_bytes"] = b
             cells[f"{cls}_pvc_pct"] = "" if pct is None else pct
+            cells[f"{cls}_pvc_used_bytes"] = "" if used is None else used
+            cells[f"{cls}_pvc_used_pct"] = "" if used_pct is None else used_pct
     return cells
 
 
@@ -1440,7 +1508,10 @@ def flatten_rows(trees):
         # capacity + storageclass and the cpu/mem columns left blank.
         for pvc in node.get("pvcs", []):
             rows.append(_row_from_totals(
-                "pvc", stage, ns, {"storage_capacity": pvc["capacity"]},
+                "pvc", stage, ns,
+                {"storage_capacity": pvc["capacity"],
+                 "pvc_used": pvc.get("used"),
+                 "pvc_used_pct": pvc.get("used_pct")},
                 pvc=pvc["name"], storageclass=pvc["storageclass"],
                 storageclass_description=pvc.get("description", "")))
     return rows
@@ -2162,12 +2233,19 @@ Das Speicher-Kontingent (`requests.storage`) steckt direkt in den Haupt-CSVs
 Used/Hard %). Die Klassen stehen in fester Reihenfolge; eine im Quota nicht
 vorhandene Klasse erscheint als `0` (dichte Matrix).
 
-**Pro StorageClass — tatsächliche PVC-Nutzung (nur in `namespaces.csv`):** je
-Klasse zwei Spalten `<class>_pvc_bytes` (Summe der PVC-Kapazitäten dieser Klasse
-im Namespace) und `<class>_pvc_pct` (Anteil dieser Klasse an der gesamten
-PVC-Kapazität des Namespace). So sieht man z. B., wie viel Speicher `file-silver`
-im Namespace belegt und welchen Anteil das ausmacht — unabhängig von der Quota.
-Leer im `*_pct`, wenn der Namespace keine PVCs hat.
+**Pro StorageClass — PVC-Kapazität und reale Nutzung (nur in `namespaces.csv`):**
+je Klasse vier Spalten:
+- `<class>_pvc_bytes` — Summe der PVC-Kapazitäten dieser Klasse im Namespace.
+- `<class>_pvc_pct` — Anteil dieser Klasse an der gesamten PVC-Kapazität des
+  Namespace. Leer, wenn der Namespace keine PVCs hat.
+- `<class>_pvc_used_bytes` — **tatsächlich belegter** Speicher, summiert über
+  die PVCs dieser Klasse (Kubelet-Metrik `kubelet_volume_stats_used_bytes` via
+  Thanos). Leer = keine Daten (Thanos aus/nicht erreichbar, Volume nicht
+  gemountet oder Block-Mode ohne Filesystem-Statistik) — nicht 0.
+- `<class>_pvc_used_pct` — tatsächlich belegt ÷ PVC-Kapazität dieser Klasse.
+So sieht man z. B., wie viel Speicher `file-silver` im Namespace reserviert,
+welchen Anteil das ausmacht und wie viel davon wirklich beschrieben ist —
+unabhängig von der Quota.
 
 **PVCs (nur in `resources.csv`):** je PersistentVolumeClaim eine Zeile mit
 `level=pvc`. Quelle ist `oc get pvc`.
@@ -2177,8 +2255,14 @@ Leer im `*_pct`, wenn der Namespace keine PVCs hat.
   `description` (bzw. `…/description`); leer, wenn nicht gesetzt.
 - `storage_capacity_bytes` — bereitgestellte Kapazität (`status.capacity.storage`,
   sonst `spec.resources.requests.storage`).
+- `pvc_used_bytes` — **tatsächlich belegter** Speicher des Volumes (Kubelet-Metrik
+  `kubelet_volume_stats_used_bytes` via Thanos). Leer = keine Daten (Thanos
+  aus/nicht erreichbar, Volume nicht gemountet oder Block-Mode ohne
+  Filesystem-Statistik) — nicht 0.
+- `pvc_used_pct` — tatsächlich belegt ÷ bereitgestellte Kapazität, in Prozent.
 Die CPU-/Speicher-Spalten sind in `pvc`-Zeilen leer; umgekehrt sind
-`pvc`/`storageclass`/`storage_capacity_bytes` in den übrigen Zeilen leer.
+`pvc`/`storageclass`/`storage_capacity_bytes`/`pvc_used_bytes` in den übrigen
+Zeilen leer.
 In den `*-human.csv` tragen die Byte-Werte ihre Einheit (`Ki`/`Mi`/`Gi`/`Ti`)
 und `*_pct` das `%`-Zeichen; der `_bytes`-Suffix entfällt im Spaltennamen.
 
@@ -2377,19 +2461,28 @@ def _ns_pvc_by_class(node):
 
 
 def _storage_class_rows(node):
-    """Per-storageclass text rows: quota Used/Hard/% and PVC capacity/share, for
-    every class that has either quota or PVC data in the namespace."""
+    """Per-storageclass text rows: quota Used/Hard/%, PVC capacity/share and
+    real PVC usage (kubelet stats; '-' = no data), for every class that has
+    either quota or PVC data in the namespace."""
     store = node.get("storage") or {}
     by_class, total = _ns_pvc_by_class(node)
+    used_by_class = {}
+    for p in node.get("pvcs", []):
+        if p.get("used") is not None:
+            cls = p.get("storageclass")
+            used_by_class[cls] = used_by_class.get(cls, 0) + p["used"]
     rows = []
     for cls in sorted(set(store) | set(by_class)):
         q = store.get(cls) or {}
         pvc_b = by_class.get(cls, 0)
+        used = used_by_class.get(cls)
         rows.append([cls,
                      fmt_bytes(q.get("used")), fmt_bytes(q.get("hard")),
                      fmt_pct(util_pct(q.get("used"), q.get("hard"))),
                      fmt_bytes(pvc_b),
-                     fmt_pct(util_pct(pvc_b, total) if total else None)])
+                     fmt_pct(util_pct(pvc_b, total) if total else None),
+                     fmt_bytes(used),
+                     fmt_pct(util_pct(used, by_class.get(cls)))])
     return rows
 
 
@@ -2473,15 +2566,18 @@ def render_text(trees, stream, levels=("namespace", "workload", "pod",
             cls_rows = _storage_class_rows(node)
             if cls_rows:
                 _print_table(["STORAGECLASS", "Q used", "Q hard", "Q %",
-                              "PVC used", "PVC share"], cls_rows, stream)
+                              "PVC cap", "PVC share", "PVC used", "PVC use%"],
+                             cls_rows, stream)
             if node.get("pvcs"):
                 stream.write("\n  PVCs\n")
                 pvc_rows = [[p["name"], p["storageclass"],
                              fmt_bytes(p.get("capacity")),
+                             fmt_bytes(p.get("used")),
+                             fmt_pct(p.get("used_pct")),
                              p.get("description", "")]
                             for p in node["pvcs"]]
-                _print_table(["PVC", "STORAGECLASS", "CAPACITY", "DESCRIPTION"],
-                             pvc_rows, stream)
+                _print_table(["PVC", "STORAGECLASS", "CAPACITY", "USED",
+                              "USED %", "DESCRIPTION"], pvc_rows, stream)
 
         if node["ooms"]:
             stream.write("\nOOM-KILLED\n")

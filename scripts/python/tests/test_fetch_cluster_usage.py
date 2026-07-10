@@ -1722,7 +1722,7 @@ def test_pvc_records_capacity_and_class(fcu):
     recs = fcu.pvc_records(items)
     assert [r["name"] for r in recs] == ["abc-0", "data-1"]   # sorted
     assert recs[1] == {"name": "data-1", "storageclass": "file-silver",
-                       "capacity": 10 * GI}
+                       "capacity": 10 * GI, "used": None, "used_pct": None}
     assert recs[0]["capacity"] == 5 * GI                       # from spec request
 
 
@@ -1942,6 +1942,161 @@ def test_legend_documents_storage_in_main_csvs(fcu):
     assert "storage.csv" not in fcu.LEGEND_TEXT          # old file gone
     assert "storage_used_bytes" in fcu.LEGEND_TEXT        # documented in main CSVs
     assert "level=pvc" in fcu.LEGEND_TEXT
+
+
+# --- real PVC usage (kubelet_volume_stats via Thanos) ------------------------
+
+def test_pvc_usage_query_targets_kubelet_volume_stats(fcu):
+    q = fcu.pvc_usage_query("ns1")
+    assert "kubelet_volume_stats_used_bytes" in q
+    assert 'namespace="ns1"' in q
+    assert "persistentvolumeclaim" in q
+
+
+def test_parse_vector_by_pvc(fcu):
+    payload = {"data": {"result": [
+        {"metric": {"persistentvolumeclaim": "data-0"},
+         "value": [0, str(4 * GI)]},
+        {"metric": {}, "value": [0, "1"]},           # no pvc label -> skipped
+        {"metric": {"persistentvolumeclaim": "bad"},
+         "value": [0, "oops"]},                       # unparseable -> skipped
+    ]}}
+    assert fcu.parse_vector_by_pvc(payload) == {"data-0": float(4 * GI)}
+
+
+def test_pvc_records_carry_used_defaults(fcu):
+    recs = fcu.pvc_records([{"metadata": {"name": "x"}, "spec": {},
+                             "status": {}}])
+    assert recs[0]["used"] is None
+    assert recs[0]["used_pct"] is None
+
+
+def test_attach_pvc_usage_sets_used_and_pct(fcu):
+    pvcs = [{"name": "data-0", "capacity": 8 * GI, "used": None,
+             "used_pct": None},
+            {"name": "data-1", "capacity": None, "used": None,
+             "used_pct": None},
+            {"name": "data-2", "capacity": 8 * GI, "used": None,
+             "used_pct": None}]
+    fcu.attach_pvc_usage(pvcs, {"data-0": float(4 * GI), "data-1": float(GI)})
+    assert pvcs[0]["used"] == 4 * GI
+    assert pvcs[0]["used_pct"] == pytest.approx(50.0)
+    assert pvcs[1]["used"] == GI
+    assert pvcs[1]["used_pct"] is None           # no capacity -> no percentage
+    assert pvcs[2]["used"] is None               # no series -> stays None
+    assert pvcs[2]["used_pct"] is None
+
+
+def test_collect_namespace_pvc_usage_from_thanos(fcu):
+    from conftest import FakeThanos
+    pods = [{"metadata": {"name": "w-1", "namespace": "ns1", "labels": {}},
+             "spec": {"nodeName": "n1", "containers": [{"name": "c",
+                                                        "resources": {}}]},
+             "status": {"containerStatuses": []}}]
+    pvcs = [{"metadata": {"name": "data-0"},
+             "spec": {"storageClassName": "file-silver",
+                      "resources": {"requests": {"storage": "8Gi"}}},
+             "status": {"capacity": {"storage": "8Gi"}}}]
+    thanos = FakeThanos({"kubelet_volume_stats_used_bytes": [
+        {"metric": {"persistentvolumeclaim": "data-0"},
+         "value": [0, str(2 * GI)]}]})
+    node = fcu.collect_namespace(StorageFakeK8s(pods=pods, pvcs=pvcs), "ns1",
+                                 thanos=thanos, window="24h", step="5m")
+    assert node["pvcs"][0]["used"] == 2 * GI
+    assert node["pvcs"][0]["used_pct"] == pytest.approx(25.0)
+
+
+def test_collect_namespace_pvc_usage_none_without_thanos(fcu):
+    pods = [{"metadata": {"name": "w-1", "namespace": "ns1", "labels": {}},
+             "spec": {"nodeName": "n1", "containers": [{"name": "c",
+                                                        "resources": {}}]},
+             "status": {"containerStatuses": []}}]
+    pvcs = [{"metadata": {"name": "data-0"},
+             "spec": {"storageClassName": "file-silver",
+                      "resources": {"requests": {"storage": "8Gi"}}},
+             "status": {"capacity": {"storage": "8Gi"}}}]
+    node = fcu.collect_namespace(StorageFakeK8s(pods=pods, pvcs=pvcs), "ns1",
+                                 thanos=None, window="24h", step="5m")
+    assert node["pvcs"][0]["used"] is None
+    assert node["pvcs"][0]["used_pct"] is None
+
+
+def test_resources_csv_pvc_used_columns(fcu):
+    node = _sto_node(fcu, "ns1", "test", {})
+    node["pvcs"] = [{"name": "data-0", "storageclass": "file-silver",
+                     "capacity": 8 * GI, "used": 2 * GI, "used_pct": 25.0,
+                     "description": ""}]
+    buf = io.StringIO()
+    fcu.render_resources_csv([node], buf, summary_kinds=())
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    r = [r for r in rows if r["level"] == "pvc"][0]
+    assert r["pvc_used_bytes"] == str(2 * GI)
+    assert float(r["pvc_used_pct"]) == pytest.approx(25.0)
+    ns_row = [r for r in rows if r["level"] == "namespace"][0]
+    assert ns_row["pvc_used_bytes"] == ""         # blank on non-pvc rows
+
+
+def test_resources_human_pvc_used_units(fcu):
+    node = _sto_node(fcu, "ns1", "test", {})
+    node["pvcs"] = [{"name": "data-0", "storageclass": "file-silver",
+                     "capacity": 8 * GI, "used": 2 * GI, "used_pct": 25.0,
+                     "description": ""}]
+    buf = io.StringIO()
+    fcu.render_resources_human_csv([node], buf, summary_kinds=())
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    r = [r for r in rows if r["level"] == "pvc"][0]
+    assert r["pvc_used"] == "2.0Gi"
+    assert r["pvc_used_pct"] == "25.0%"
+
+
+def test_namespaces_csv_pvc_used_per_class(fcu):
+    node = _sto_node(fcu, "ns1", "test", {})
+    node["pvcs"] = [
+        {"name": "a", "storageclass": "file-silver", "capacity": 50 * GI,
+         "used": 10 * GI, "used_pct": 20.0},
+        {"name": "b", "storageclass": "file-silver", "capacity": 30 * GI,
+         "used": None, "used_pct": None},           # no stats for this one
+        {"name": "c", "storageclass": "file-gold", "capacity": 20 * GI,
+         "used": None, "used_pct": None},
+    ]
+    buf = io.StringIO()
+    fcu.render_namespaces_csv([node], buf)
+    row = list(_csv.DictReader(io.StringIO(buf.getvalue())))[0]
+    assert row["file-silver_pvc_used_bytes"] == str(10 * GI)
+    # used% is used / that class's PVC capacity (10Gi / 80Gi)
+    assert float(row["file-silver_pvc_used_pct"]) == pytest.approx(12.5)
+    # a class with no usage data stays blank (no data != 0)
+    assert row["file-gold_pvc_used_bytes"] == ""
+    assert row["file-gold_pvc_used_pct"] == ""
+
+
+def test_namespaces_human_pvc_used_units(fcu):
+    node = _sto_node(fcu, "ns1", "test", {})
+    node["pvcs"] = [{"name": "a", "storageclass": "file-silver",
+                     "capacity": 50 * GI, "used": 10 * GI, "used_pct": 20.0}]
+    buf = io.StringIO()
+    fcu.render_namespaces_human_csv([node], buf)
+    row = list(_csv.DictReader(io.StringIO(buf.getvalue())))[0]
+    assert row["file-silver_pvc_used"] == "10.0Gi"
+    assert row["file-silver_pvc_used_pct"] == "20.0%"
+    assert row["file-gold_pvc_used"] == "-"        # no data -> dash
+
+
+def test_summary_text_pvc_real_used(fcu):
+    node = _sto_node(fcu, "ns1", "test", {})
+    node["pvcs"] = [{"name": "app-0", "storageclass": "file-silver",
+                     "capacity": 8 * GI, "used": 2 * GI, "used_pct": 25.0,
+                     "description": "RWX volumes"}]
+    buf = io.StringIO()
+    fcu.render_text([node], buf, levels=("namespace",))
+    out = buf.getvalue()
+    assert "USED" in out                           # PVC list has a used column
+    assert "2.0Gi" in out and "25.0%" in out
+
+
+def test_legend_documents_pvc_used(fcu):
+    assert "pvc_used_bytes" in fcu.LEGEND_TEXT
+    assert "kubelet_volume_stats_used_bytes" in fcu.LEGEND_TEXT
 
 
 # --- apply manifest: quantity helpers ---------------------------------------
