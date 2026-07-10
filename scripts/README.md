@@ -946,18 +946,26 @@ Storage lives in the main CSVs — there is no separate `storage.csv`.
   `storage_used_pct` (Used, Hard, Used÷Hard), plus a per-StorageClass triple
   `<class>_used_bytes` / `<class>_hard_bytes` / `<class>_used_pct` over a fixed
   class set (a class the quota doesn't mention shows `0`, so the matrix is dense).
-  It also gets the **actual PVC usage per StorageClass**: `<class>_pvc_bytes` (sum
-  of that class's PVC capacities in the namespace) and `<class>_pvc_pct` (that
-  class's share of the namespace's total PVC storage) — e.g. see that file-silver
-  is 62.5 % of a namespace's storage, independent of any quota.
+  It also gets the **PVC capacity and real usage per StorageClass**:
+  `<class>_pvc_bytes` (sum of that class's PVC capacities in the namespace),
+  `<class>_pvc_pct` (that class's share of the namespace's total PVC storage),
+  `<class>_pvc_used_bytes` (real disk usage summed over that class's PVCs, from
+  the kubelet's `kubelet_volume_stats_used_bytes` via Thanos) and
+  `<class>_pvc_used_pct` (real usage ÷ that class's PVC capacity) — e.g. see
+  that file-silver is 62.5 % of a namespace's storage and 20 % actually written,
+  independent of any quota.
 - **`resources.csv`** gains the storage totals on the `namespace`/`stage`/`cluster`
   rows, and one **`level=pvc`** row per PersistentVolumeClaim carrying `pvc`
   (name), `storageclass`, `storageclass_description` (from the StorageClass's
-  `description` annotation), and `storage_capacity_bytes` (provisioned capacity).
-  The cpu/mem columns are blank on `pvc` rows and vice-versa.
+  `description` annotation), `storage_capacity_bytes` (provisioned capacity),
+  `pvc_used_bytes` (real disk usage from the kubelet volume stats) and
+  `pvc_used_pct` (used ÷ capacity). The cpu/mem columns are blank on `pvc` rows
+  and vice-versa.
 
-The used % is the storageclass quota (Used÷Hard); per-PVC disk fill is not
-queried (capacity only).
+The quota used % is Used÷Hard from the storageclass quota. The per-PVC real
+usage degrades like the cpu/mem metrics: blank when Thanos is off/unreachable,
+the volume is unmounted, or it is a block-mode volume without filesystem stats
+(blank means no data, not 0).
 
 #### T-shirt sizing (`sizing.csv`)
 
