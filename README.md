@@ -24,6 +24,7 @@ rke2-observability/
 │   ├── dash-loki-logs.yaml         # Loki log overview dashboard
 │   ├── dash-oomkilled-thanos.yaml  # OOMKilled deep-dive dashboard
 │   ├── dash-oom-metrics.yaml       # pure-metrics OOMKilled view (no logs/network/storage) + top-peak summary
+│   ├── dash-oom-triage.yaml        # minimal fast-loading triage view — variables scoped to OOMKilled pods only
 │   └── dash-oom-forensics.yaml     # per-pod metrics + logs + network on one timeline
 ├── scripts/                        # CLI tools for OOM forensics (oc/kubectl-driven)
 └── samples/                        # OOM simulation apps for dashboard testing
@@ -542,6 +543,24 @@ Layout:
 - **CPU & restarts** — CPU usage, CPU throttling, container restart rate.
 
 Open via `http://localhost:3000/d/oom-metrics`. The dashboard links to the Thanos deep-dive and to the forensics view for the currently selected pod.
+
+## OOM Triage dashboard (minimal, fast)
+
+`dashboards/dash-oom-triage.yaml` is the smallest dashboard in this repo (8 panels) and is built for slow production clusters where the bigger dashboards take too long to load. Two things keep it fast:
+
+- The `namespace` and `pod` variables are populated **only from pods that were actually OOMKilled** (`label_values(kube_pod_container_status_last_terminated_reason{reason="OOMKilled"}, ...)`), so every panel queries a handful of series instead of thousands — even with "All" selected.
+- No long-range aggregations, no auto-refresh, instant queries for the stat/table panels.
+
+Layout:
+
+- **Summary row** — OOMKills (24 h), distinct affected pods, restarts (1 h) of the OOM pods.
+- **OOMKilled containers table** — entry point: namespace/pod/container/node, memory limit, restart count. Pick the suspicious pod in the `pod` selector, all panels below then show only that pod.
+- **Memory** — working_set vs limit (dashed red), OOMKill annotations.
+- **CPU** — usage + CFS throttling.
+- **Network** — rx/tx per pod.
+- **Logs (Loki)** — error/OOM-filtered log lines of the selected pods, time-synced with the metric panels.
+
+Open via `http://localhost:3000/d/oom-triage`. Links to the lean overview and the forensics deep-dive (carrying over the selected namespace/pod).
 
 ## OOM Forensics dashboard
 
