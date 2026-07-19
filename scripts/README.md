@@ -17,6 +17,8 @@ Helper scripts for working with the OOM observability stack from the command lin
 | [`apply-recommendations.py`](#apply-recommendationspy) | Apply the recommended CPU/memory resources from `fetch-cluster-usage.py` to the cluster. Reads `recommendations-apply.json`, shells out to `kubectl`/`oc patch`. **Server-side dry-run by default**; real changes need `--execute`. Namespaces whose recommendations would exceed their ResourceQuota are skipped with a warning. |
 | [`upload-helm-charts.sh` / `.ps1` / `.cmd`](./README-upload-helm-charts.md) | Upload Helm charts (`.tgz` or unpacked chart dirs) to a JFrog Artifactory Helm repo — bash, PowerShell, and CMD ports with identical behaviour (HEAD-probe skip, `--dry-run`, checksum upload). Docs: [`README-upload-helm-charts.md`](./README-upload-helm-charts.md). |
 | [`embed-tgz.sh`](./README-upload-helm-charts.md#embed-tgzsh--tgz--self-extracting-script--back) | Embed `.tgz` files into standalone self-extracting shell scripts (base64 + sha256) and restore them back — for transferring chart binaries through text-only channels. Docs: [`README-upload-helm-charts.md`](./README-upload-helm-charts.md). |
+| [`fetch-cli-tools.sh`](./README-cli-tools.md#fetch-cli-toolssh) | Download pinned CLI tools for RHEL (linux/amd64) — aws-cli 2.35.14, helm 3.21.2, argo 3.4.4, argocd 3.4.4, sops 3.13.2 — with upstream checksum verification; `--embed` chains straight into `embed-cli.sh`. Docs: [`README-cli-tools.md`](./README-cli-tools.md). |
+| [`embed-cli.sh`](./README-cli-tools.md#embed-clish) | Generalized `embed-tgz.sh`: embed **any** binary (CLI tools, zips) into a self-extracting script and restore it — sha256-verified, executable bit preserved. Docs: [`README-cli-tools.md`](./README-cli-tools.md). |
 
 ---
 
