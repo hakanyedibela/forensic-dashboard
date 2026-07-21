@@ -13,3 +13,9 @@ __pycache__/
 
 # debug logs
 *.log
+/scripts/cli-tools/
+*.tgz
+*.zip
+*.tar.gz
+/scripts/embedded/
+*.7z
