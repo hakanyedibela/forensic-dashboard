@@ -11,7 +11,7 @@ Pinned versions (defaults, overridable via environment):
 
 | Tool | Version | Env override | Artifact |
 |---|---|---|---|
-| AWS CLI v2 | 2.35.14 | `AWS_CLI_VERSION` | installer zip (`awscli-exe-linux-x86_64-<v>.zip`) |
+| AWS CLI v2 | **latest** (rolling; pin with e.g. `2.35.14`) | `AWS_CLI_VERSION` | installer zip (`awscli-exe-linux-x86_64[-<v>].zip`) **+ `.7z` twin** (contents recompressed; needs `7zz`/`7z`/`7za` + `unzip` on PATH, otherwise skipped with a warning) |
 | Helm | 3.21.2 | `HELM_VERSION` | single binary `helm` (unpacked from upstream tar.gz, sha256-verified) |
 | Argo Workflows CLI | 3.4.4 | `ARGO_VERSION` | single binary `argo` (gunzipped) |
 | Argo CD CLI | 3.4.4 | `ARGOCD_VERSION` | single binary `argocd` (opt-in — not in the default set) |
@@ -68,9 +68,10 @@ HELM_VERSION=3.22.0 SOPS_VERSION=3.14.0 ./scripts/fetch-cli-tools.sh helm sops
 
 ```
 cli-tools/
-  awscli-exe-linux-x86_64-2.35.14.zip          # AWS installer (not a single binary)
-  awscli-exe-linux-x86_64-2.35.14.zip.sha256.local
-  awscli-exe-linux-x86_64-2.35.14.zip.sh       # self-extracting
+  awscli-exe-linux-x86_64.zip                  # AWS installer, latest (not a single binary)
+  awscli-exe-linux-x86_64.7z                   # same contents, 7z-recompressed (~40M vs ~70M zip)
+  awscli-exe-linux-x86_64.zip.sha256.local
+  awscli-exe-linux-x86_64.zip.sh               # self-extracting
   helm                                          # ELF x86-64 binary
   helm.sh                                       # self-extracting
   argo

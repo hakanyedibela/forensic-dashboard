@@ -4,11 +4,16 @@
 # through text-only channels).
 #
 # Tools and pinned versions (override via environment):
-#   aws     AWS CLI v2        $AWS_CLI_VERSION  (default 2.35.14)  -> installer .zip
+#   aws     AWS CLI v2        $AWS_CLI_VERSION  (default latest)   -> installer .zip + .7z
 #   helm    Helm              $HELM_VERSION     (default 3.21.2)   -> single binary
 #   argo    Argo Workflows    $ARGO_VERSION     (default 3.4.4)    -> single binary
 #   argocd  Argo CD           $ARGOCD_VERSION   (default 3.4.4)    -> single binary
 #   sops    SOPS              $SOPS_VERSION     (default 3.13.2)   -> single binary
+#
+# aws defaults to "latest" (AWS's rolling awscli-exe-linux-x86_64.zip alias);
+# pin with AWS_CLI_VERSION=2.35.14. Next to the .zip a .7z twin is created
+# (zip contents recompressed) when a 7z tool (7zz/7z/7za) and unzip are on
+# PATH — so you end up with both a .zip and a .7z of the AWS installer.
 #
 # By default fetches aws, helm, argo, sops. Pass tool names to select a
 # subset (e.g. `fetch-cli-tools.sh helm sops`); pass `argocd` explicitly if
@@ -30,11 +35,11 @@
 #   -h, --help             this help
 set -euo pipefail
 
-usage() { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
-AWS_CLI_VERSION="${AWS_CLI_VERSION:-2.35.14}"
+AWS_CLI_VERSION="${AWS_CLI_VERSION:-latest}"
 HELM_VERSION="${HELM_VERSION:-3.21.2}"
 ARGO_VERSION="${ARGO_VERSION:-3.4.4}"
 ARGOCD_VERSION="${ARGOCD_VERSION:-3.4.4}"
@@ -88,17 +93,47 @@ skip_existing() {  # $1 = path; returns 0 (=skip) when present and not --force
 FAILED=0
 ARTIFACTS=()
 
+# aws_7z ZIP — recompress the AWS installer zip's contents into a .7z twin.
+# Non-fatal: without a 7z tool or unzip on PATH only the .zip is kept.
+aws_7z() {
+  local zip="$1" seven tool="" t tmp absdir
+  seven="${zip%.zip}.7z"
+  for t in 7zz 7z 7za; do
+    if command -v "$t" >/dev/null; then tool="$t"; break; fi
+  done
+  [ -n "$tool" ] || { echo "warn: no 7z tool (7zz/7z/7za) on PATH — skipping .7z" >&2; return 0; }
+  command -v unzip >/dev/null || { echo "warn: unzip not on PATH — skipping .7z" >&2; return 0; }
+  if skip_existing "$seven"; then echo "skip   $seven (exists; --force to recreate)"; ARTIFACTS+=("$seven"); return 0; fi
+  absdir=$(cd "$(dirname "$seven")" && pwd)
+  tmp=$(mktemp -d)
+  unzip -q "$zip" -d "$tmp"
+  rm -f "$seven"
+  (cd "$tmp" && "$tool" a -bso0 -bsp0 "$absdir/$(basename "$seven")" .) || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  echo "created  $seven"
+  ARTIFACTS+=("$seven")
+}
+
 do_aws() {
-  local zip="awscli-exe-linux-x86_64-${AWS_CLI_VERSION}.zip"
-  local url="https://awscli.amazonaws.com/${zip}"
-  local dest="$OUTDIR/$zip"
-  if [ "$DRY_RUN" -eq 1 ]; then echo "would fetch $url -> $dest"; return; fi
-  if skip_existing "$dest"; then echo "skip   $dest (exists; --force to refetch)"; ARTIFACTS+=("$dest"); return; fi
+  local zip url dest
+  if [ "$AWS_CLI_VERSION" = "latest" ]; then
+    zip="awscli-exe-linux-x86_64.zip"      # AWS's rolling latest alias
+  else
+    zip="awscli-exe-linux-x86_64-${AWS_CLI_VERSION}.zip"
+  fi
+  url="https://awscli.amazonaws.com/${zip}"
+  dest="$OUTDIR/$zip"
+  if [ "$DRY_RUN" -eq 1 ]; then echo "would fetch $url -> $dest (+ .7z twin)"; return; fi
+  if skip_existing "$dest"; then
+    echo "skip   $dest (exists; --force to refetch)"
+    ARTIFACTS+=("$dest"); aws_7z "$dest"; return
+  fi
   fetch "$url" "$dest"
   # AWS publishes no plain .sha256 next to the zip (only GPG .sig) — record
   # our own checksum so the transfer is at least locally verifiable.
   sha256_of "$dest" > "${dest}.sha256.local"
   ARTIFACTS+=("$dest")
+  aws_7z "$dest"
 }
 
 do_helm() {
