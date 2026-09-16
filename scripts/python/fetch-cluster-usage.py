@@ -481,6 +481,16 @@ def storage_totals(storage):
     return (sum(used) if used else None, sum(hard) if hard else None)
 
 
+def pvc_totals(pvcs):
+    """Sum a namespace's PVCs into (capacity, used) bytes. Capacity is dense
+    (0 without PVCs); used is None when no PVC has kubelet stats (no data is
+    not 0). Feeds the storage_capacity / pvc_used / pvc_used_pct rollup on the
+    namespace totals (summed again at stage/cluster)."""
+    cap = sum(p.get("capacity") or 0 for p in pvcs or [])
+    used = sum_usage(p.get("used") for p in pvcs or [])
+    return cap, used
+
+
 def pvc_records(items):
     """PersistentVolumeClaim list -> [{name, storageclass, capacity, used,
     used_pct}] sorted by name.
@@ -1232,6 +1242,12 @@ def collect_namespace(fcu_k8s, namespace, thanos, window, step,
     if node["pvcs"] and thanos is not None and getattr(thanos, "available", True):
         used_map = parse_vector_by_pvc(thanos.query(pvc_usage_query(namespace)))
         attach_pvc_usage(node["pvcs"], used_map)
+    # Namespace-level PVC rollup (capacity sum, real used sum, used%) so the
+    # summary tables / namespaces.csv / cluster+stage rows carry it too.
+    p_cap, p_used = pvc_totals(node["pvcs"])
+    node["totals"]["storage_capacity"] = p_cap
+    node["totals"]["pvc_used"] = p_used
+    node["totals"]["pvc_used_pct"] = util_pct(p_used, p_cap)
 
     if include_idle:
         present = {(w["kind"], w["name"]) for w in node["workloads"]}
@@ -1265,14 +1281,16 @@ CSV_FIELDS = [
     ("mem_peak_bytes", "mem_peak"),
     ("mem_peak_util_pct", "mem_peak_util_pct"),
     # Storage: namespace-level ResourceQuota requests.storage Used/Hard (+%),
-    # summed at stage/cluster; storageclass + capacity carry the per-PVC rows.
+    # summed at stage/cluster; storageclass + description identify PVC rows.
     ("storage_used_bytes", "storage_used"),
     ("storage_hard_bytes", "storage_hard"),
     ("storage_used_pct", "storage_used_pct"),
     ("storageclass", "storageclass"),
     ("storageclass_description", "storageclass_description"),
+    # PVC capacity and real disk usage (kubelet volume stats via Thanos): the
+    # single volume on level=pvc rows, the sum over the namespace's PVCs on
+    # namespace rows, summed again at stage/cluster.
     ("storage_capacity_bytes", "storage_capacity"),
-    # Real per-PVC disk usage (kubelet volume stats via Thanos), level=pvc only.
     ("pvc_used_bytes", "pvc_used"),
     ("pvc_used_pct", "pvc_used_pct"),
     ("oom_count", "oom_count"), ("pod_count", "pod_count"),
@@ -1299,11 +1317,7 @@ def _row_from_totals(level, stage, namespace, totals, **ids):
 _IDENTITY_KEYS = {"level", "stage", "namespace", "workload_kind", "workload",
                   "pod", "container", "pvc", "storageclass",
                   "storageclass_description"}
-# PVC-only metric columns: meaningful on level=pvc rows in resources.csv but not
-# at the namespace level, so they're excluded from the namespaces.csv summary.
-_PVC_ONLY_KEYS = {"storage_capacity", "pvc_used", "pvc_used_pct"}
-METRIC_FIELDS = [(h, k) for h, k in CSV_FIELDS
-                 if k not in _IDENTITY_KEYS and k not in _PVC_ONLY_KEYS]
+METRIC_FIELDS = [(h, k) for h, k in CSV_FIELDS if k not in _IDENTITY_KEYS]
 NS_CSV_FIELDS = [("stage", "stage"), ("namespace", "namespace")] + METRIC_FIELDS
 # Per-storageclass quota columns appended only to namespaces.csv (the totals
 # storage_used/hard/used_pct already come in via METRIC_FIELDS). Dense over the
@@ -1448,6 +1462,11 @@ def aggregate_totals(totals_list):
     agg["storage_used"] = sum_usage([t.get("storage_used") for t in totals_list])
     agg["storage_hard"] = sum_usage([t.get("storage_hard") for t in totals_list])
     agg["storage_used_pct"] = util_pct(agg["storage_used"], agg["storage_hard"])
+    # PVC capacity / real used sum across namespaces; used% recomputed.
+    agg["storage_capacity"] = sum_usage([t.get("storage_capacity")
+                                         for t in totals_list])
+    agg["pvc_used"] = sum_usage([t.get("pvc_used") for t in totals_list])
+    agg["pvc_used_pct"] = util_pct(agg["pvc_used"], agg["storage_capacity"])
     for f in ("oom_count", "pod_count", "container_count"):
         agg[f] = sum(t.get(f, 0) for t in totals_list)
     return agg
@@ -1517,33 +1536,64 @@ def flatten_rows(trees):
     return rows
 
 
+# CSV columns with no data in any row are dropped from the written file so a
+# report without PVCs/quota/Thanos does not carry dozens of blank or all-zero
+# columns. --keep-empty-columns turns this off (stable schema for diffing).
+DROP_EMPTY_COLUMNS = True
+# A cell counts as empty when it is None/''/'-' or a zero, raw (0, 0.0, '0')
+# or unit-formatted ('0.0B', '0c', '0.0%').
+_ZERO_CELL_RE = re.compile(r"^0(?:\.0+)?(?:[A-Za-zµ%]{0,2})$")
+
+
+def _cell_is_empty(v):
+    if v is None or v == "" or v == "-":
+        return True
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v == 0
+    return bool(_ZERO_CELL_RE.match(str(v)))
+
+
+def prune_empty_columns(columns, rows):
+    """Columns (in order) that hold at least one non-empty cell across rows.
+    Without rows nothing can be judged, so every column stays (header-only
+    files keep their full schema)."""
+    if not rows:
+        return list(columns)
+    return [c for c in columns
+            if not all(_cell_is_empty(r.get(c)) for r in rows)]
+
+
+def _write_csv(stream, columns, rows):
+    """Write header + rows, pruning all-empty columns unless disabled."""
+    rows = list(rows)
+    cols = prune_empty_columns(columns, rows) if DROP_EMPTY_COLUMNS else columns
+    writer = csv.DictWriter(stream, fieldnames=cols, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+
+
 def render_resources_csv(trees, stream, summary_kinds=("cluster", "stage")):
     """Write the flat per-level CSV. summary_kinds controls which rollup rows
     are prepended (cluster grand total and/or per-stage totals)."""
-    writer = csv.DictWriter(stream, fieldnames=CSV_COLUMNS, extrasaction="ignore")
-    writer.writeheader()
-    for row in summary_rows(trees, summary_kinds) + flatten_rows(trees):
-        writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
+    _write_csv(stream, CSV_COLUMNS,
+               [{k: ("" if v is None else v) for k, v in row.items()}
+                for row in summary_rows(trees, summary_kinds) + flatten_rows(trees)])
 
 
 def render_resources_human_csv(trees, stream, summary_kinds=("cluster", "stage")):
     """Human-readable twin of render_resources_csv: identical rows, but every
     metric is formatted with its unit inline (200m, 6.3Mi, 4.9%). Same
     summary_kinds semantics."""
-    writer = csv.DictWriter(stream, fieldnames=HUMAN_CSV_COLUMNS,
-                            extrasaction="ignore")
-    writer.writeheader()
-    for row in summary_rows(trees, summary_kinds) + flatten_rows(trees):
-        writer.writerow({_human_header(h): _human_metric(_HEADER_TO_KEY[h], v)
-                         for h, v in row.items()})
+    _write_csv(stream, HUMAN_CSV_COLUMNS,
+               [{_human_header(h): _human_metric(_HEADER_TO_KEY[h], v)
+                 for h, v in row.items()}
+                for row in summary_rows(trees, summary_kinds) + flatten_rows(trees)])
 
 
 def render_namespaces_csv(trees, stream):
     """Concise one-row-per-namespace summary: total configured vs. real CPU/mem
     (no workload/pod/container detail). Sorted by stage then namespace."""
-    writer = csv.DictWriter(stream, fieldnames=NS_CSV_COLUMNS,
-                            extrasaction="ignore")
-    writer.writeheader()
+    rows = []
     for node in sorted(trees, key=lambda n: (n["stage"], n["namespace"])):
         row = {"stage": node["stage"], "namespace": node["namespace"]}
         for header, key in METRIC_FIELDS:
@@ -1551,22 +1601,22 @@ def render_namespaces_csv(trees, stream):
             row[header] = "" if v is None else v
         row.update(_ns_storage_cells(node, human=False))
         row.update(_ns_pvc_cells(node, human=False))
-        writer.writerow(row)
+        rows.append(row)
+    _write_csv(stream, NS_CSV_COLUMNS, rows)
 
 
 def render_namespaces_human_csv(trees, stream):
     """Human-readable twin of render_namespaces_csv: one row per namespace, each
     metric formatted with its unit inline (200m, 6.3Mi, 4.9%)."""
-    writer = csv.DictWriter(stream, fieldnames=NS_HUMAN_CSV_COLUMNS,
-                            extrasaction="ignore")
-    writer.writeheader()
+    rows = []
     for node in sorted(trees, key=lambda n: (n["stage"], n["namespace"])):
         row = {"stage": node["stage"], "namespace": node["namespace"]}
         for header, key in METRIC_FIELDS:
             row[_human_header(header)] = _human_metric(key, node["totals"].get(key))
         row.update(_ns_storage_cells(node, human=True))
         row.update(_ns_pvc_cells(node, human=True))
-        writer.writerow(row)
+        rows.append(row)
+    _write_csv(stream, NS_HUMAN_CSV_COLUMNS, rows)
 
 
 # (csv header, source key) for the per-workload recommendation CSV. Current
@@ -1633,21 +1683,18 @@ def recommendation_rows(trees, target_util=80.0):
 
 def render_recommendations_csv(trees, stream, target_util=80.0):
     """Per-workload recommendation CSV (only hot workloads; raw numbers)."""
-    writer = csv.DictWriter(stream, fieldnames=REC_COLUMNS, extrasaction="ignore")
-    writer.writeheader()
-    for row in recommendation_rows(trees, target_util):
-        writer.writerow({h: ("" if row.get(k) is None else row.get(k))
-                         for h, k in REC_FIELDS})
+    _write_csv(stream, REC_COLUMNS,
+               [{h: ("" if row.get(k) is None else row.get(k))
+                 for h, k in REC_FIELDS}
+                for row in recommendation_rows(trees, target_util)])
 
 
 def render_recommendations_human_csv(trees, stream, target_util=80.0):
     """Human-readable twin: same rows, each metric formatted with its unit."""
-    writer = csv.DictWriter(stream, fieldnames=REC_HUMAN_COLUMNS,
-                            extrasaction="ignore")
-    writer.writeheader()
-    for row in recommendation_rows(trees, target_util):
-        writer.writerow({_human_header(h): _rec_human(k, row.get(k))
-                         for h, k in REC_FIELDS})
+    _write_csv(stream, REC_HUMAN_COLUMNS,
+               [{_human_header(h): _rec_human(k, row.get(k))
+                 for h, k in REC_FIELDS}
+                for row in recommendation_rows(trees, target_util)])
 
 
 # ----------------------------------- apply manifest (per-workload patch YAML)
@@ -1967,21 +2014,14 @@ def sizing_rows(trees, target_util=80.0):
 def render_sizing_csv(trees, stream, target_util=80.0):
     """T-shirt sizing report: current shape vs. right-sized 'should' shape per
     namespace and workload."""
-    writer = csv.DictWriter(stream, fieldnames=SIZING_COLUMNS,
-                            extrasaction="ignore")
-    writer.writeheader()
-    for row in sizing_rows(trees, target_util):
-        writer.writerow(row)
+    _write_csv(stream, SIZING_COLUMNS, sizing_rows(trees, target_util))
 
 
 def render_ooms_csv(trees, stream):
     cols = ["stage", "namespace", "pod", "container", "source", "oom_events",
             "restart_count", "exit_code", "finished_at"]
-    writer = csv.DictWriter(stream, fieldnames=cols, extrasaction="ignore")
-    writer.writeheader()
-    for node in trees:
-        for o in node["ooms"]:
-            writer.writerow({"stage": node["stage"], **o})
+    _write_csv(stream, cols, [{"stage": node["stage"], **o}
+                              for node in trees for o in node["ooms"]])
 
 
 def render_json(trees, stream, window, cluster, summaries=True):
@@ -2054,7 +2094,7 @@ Erzeugt von scripts/python/fetch-cluster-usage.py.
 - `recommendations-apply.json` — maschinenlesbares Pendant zu `recommendations-apply.yaml` (dieselben Patches), das `apply-recommendations.py` mit der Python-Standardbibliothek liest (kein YAML-Paket nötig).
 - `sizing.csv`     — T-Shirt-Sizing: je Namespace (Summe) und Workload die aktuellen CPU/Speicher-Requests/Limits, eine `current_shape`- vs. `should_shape`-Beschreibung (rechtsskaliert aus dem Spitzenverbrauch) und die T-Shirt-Größe (`current_size`/`should_size`), an der man die zu setzende Größe ablesen kann.
 - `ooms.csv`       — eine Zeile pro OOM-getötetem Container.
-- `summary.txt`    — menschenlesbare Tabelle (CPU in Cores/Milli, Speicher in Ki/Mi/Gi, % und OOM-Anzahl) — dieselben Zahlen wie die CSVs, nur kompakt formatiert. Enthält je Namespace zusätzlich einen **STORAGE**-Block (Quota used/hard/%, je StorageClass Quota- und PVC-Nutzung samt Anteil, sowie eine PVC-Liste mit Beschreibung) und oben eine Übersicht „BY NAMESPACE — storage quota".
+- `summary.txt`    — menschenlesbare Tabelle (CPU in Cores/Milli, Speicher in Ki/Mi/Gi, % und OOM-Anzahl) — dieselben Zahlen wie die CSVs, nur kompakt formatiert. Enthält je Namespace zusätzlich einen **STORAGE**-Block (Quota used/hard/%, PVC-Kapazität/real belegt/%, je StorageClass Quota- und PVC-Nutzung samt Anteil, sowie eine PVC-Liste mit Beschreibung) und oben die Übersichten „SUMMARY — storage" (Cluster + je Stage) und „BY NAMESPACE — storage" (je Namespace), jeweils Quota used/hard/% neben PVC cap/used/use%.
 - `report.json`   — dieselben Daten verschachtelt (Namespace → Workload → Pod → Container) plus Aggregationen.
 - `by-stage/<stage>/` — (im obersten Ordner) dieselben Dateien, beschränkt auf eine Stage.
 - `apply/` — (im obersten Ordner) sammelt **nur** die Apply-Manifeste an einem Ort, damit `apply-recommendations.py` nicht jeden `by-stage/`-Ordner durchsuchen muss: `all.yaml`/`all.json` (alle Namespaces zusammen), je Stage ein `<stage>.yaml`/`<stage>.json` (für einen gestaffelten Rollout — erst test, dann prod) und je Namespace ein `<stage>/<namespace>.yaml`/`.json` (um einen einzelnen Namespace dediziert anzuwenden). Namespaces ohne Änderung (keine heißen Workloads und nicht Quota-übersprungen) erhalten keine Datei.
@@ -2098,6 +2138,14 @@ Leere Nutzungszellen bedeuten, dass Thanos keine Daten hatte (oder --no-thanos /
 
 Hinweis: `report.json` verwendet die kurzen Schlüssel (`cpu_limit`, `mem_now`, …);
 die Einheiten sind dort dieselben (CPU in Cores, Speicher in Bytes).
+
+## Leere Spalten
+In allen CSVs werden Spalten **weggelassen**, die in keiner Zeile einen Wert
+tragen (überall leer, `-` oder `0`/`0.0B`/`0c`/`0.0%`) — z. B. die PVC-Spalten
+ohne PVCs, die StorageClass-Spalten nicht genutzter Klassen oder die
+Thanos-Spalten ohne Thanos. Die Spaltenmenge kann daher von Lauf zu Lauf
+variieren. Für ein festes Schema (Diff/Import) `--keep-empty-columns` setzen.
+Dateien ohne Datenzeilen behalten den vollen Header.
 
 ## Einheiten in `resources-human.csv`, `namespaces-human.csv` und `summary.txt`
 Hier steht die Einheit **direkt am Wert** (statt im Spaltennamen), damit kleine
@@ -2228,10 +2276,18 @@ Das Speicher-Kontingent (`requests.storage`) steckt direkt in den Haupt-CSVs
 - `storage_hard_bytes` — Hard-Kontingent über alle StorageClasses (Quota *Hard*).
 - `storage_used_pct` — `storage_used / storage_hard` in Prozent (leer, wenn kein Hard-Kontingent).
 
+**PVC-Summen (in beiden CSVs, auf Namespace-Ebene über alle PVCs des
+Namespace; in `stage`/`cluster` summiert):**
+- `storage_capacity_bytes` — Summe der PVC-Kapazitäten (0 ohne PVCs).
+- `pvc_used_bytes` — **tatsächlich belegter** Speicher, summiert über alle PVCs
+  mit Kubelet-Statistik. Leer = kein PVC liefert Daten — nicht 0.
+- `pvc_used_pct` — `pvc_used / storage_capacity` in Prozent.
+
 **Pro StorageClass — Quota (nur in `namespaces.csv`):** je Klasse drei Spalten
 `<class>_used_bytes`, `<class>_hard_bytes`, `<class>_used_pct` (Used, Hard und
 Used/Hard %). Die Klassen stehen in fester Reihenfolge; eine im Quota nicht
-vorhandene Klasse erscheint als `0` (dichte Matrix).
+vorhandene Klasse erscheint als `0` — bzw. entfällt ganz, wenn sie in keinem
+Namespace vorkommt (siehe „Leere Spalten"; `--keep-empty-columns` behält sie).
 
 **Pro StorageClass — PVC-Kapazität und reale Nutzung (nur in `namespaces.csv`):**
 je Klasse vier Spalten:
@@ -2248,7 +2304,9 @@ welchen Anteil das ausmacht und wie viel davon wirklich beschrieben ist —
 unabhängig von der Quota.
 
 **PVCs (nur in `resources.csv`):** je PersistentVolumeClaim eine Zeile mit
-`level=pvc`. Quelle ist `oc get pvc`.
+`level=pvc`. Quelle ist `oc get pvc`. Dieselben drei Spalten
+`storage_capacity_bytes`/`pvc_used_bytes`/`pvc_used_pct` tragen hier den
+Einzelwert des Volumes (auf `namespace`/`stage`/`cluster`-Zeilen die Summe).
 - `pvc` — Name des PVC (in der Spalte `pvc`).
 - `storageclass` — StorageClass des PVC (`spec.storageClassName`).
 - `storageclass_description` — Beschreibung der StorageClass aus deren Annotation
@@ -2261,8 +2319,9 @@ unabhängig von der Quota.
   Filesystem-Statistik) — nicht 0.
 - `pvc_used_pct` — tatsächlich belegt ÷ bereitgestellte Kapazität, in Prozent.
 Die CPU-/Speicher-Spalten sind in `pvc`-Zeilen leer; umgekehrt sind
-`pvc`/`storageclass`/`storage_capacity_bytes`/`pvc_used_bytes` in den übrigen
-Zeilen leer.
+`pvc`/`storageclass` in den übrigen Zeilen leer, und
+`storage_capacity_bytes`/`pvc_used_bytes`/`pvc_used_pct` in
+`workload`/`pod`/`container`-Zeilen.
 In den `*-human.csv` tragen die Byte-Werte ihre Einheit (`Ki`/`Mi`/`Gi`/`Ti`)
 und `*_pct` das `%`-Zeichen; der `_bytes`-Suffix entfällt im Spaltennamen.
 
@@ -2448,6 +2507,21 @@ _USAGE_HEADERS = ["CPU req", "CPU lim", "CPU now",
                   "MEM req-used", "MEM lim-used", "MEM peak", "MEM %", "OOM"]
 
 
+def _storage_cells(t):
+    """Storage columns for a totals dict: quota Used/Hard/% and the PVC rollup
+    (capacity sum, real used sum from kubelet stats, used%)."""
+    return [
+        fmt_bytes(t.get("storage_used")), fmt_bytes(t.get("storage_hard")),
+        fmt_pct(t.get("storage_used_pct")),
+        fmt_bytes(t.get("storage_capacity")), fmt_bytes(t.get("pvc_used")),
+        fmt_pct(t.get("pvc_used_pct")),
+    ]
+
+
+_STORAGE_HEADERS = ["STO used", "STO hard", "STO %",
+                    "PVC cap", "PVC used", "PVC use%"]
+
+
 def _ns_pvc_by_class(node):
     """(by_class capacity dict, total capacity) from a namespace's PVCs."""
     by_class, total = {}, 0
@@ -2507,16 +2581,20 @@ def render_text(trees, stream, levels=("namespace", "workload", "pod",
                    for n in sorted_ns]
         _print_table(["NAMESPACE", *_USAGE_HEADERS], ns_rows, stream)
 
-        # Storage quota per namespace (only when some namespace tracks storage).
+        # Storage (quota + PVC rollup) — only when some namespace tracks it.
         if any(_has_storage(n) for n in trees):
-            stream.write("\nBY NAMESPACE — storage quota (used vs. hard)\n")
+            stream.write("\nSUMMARY — storage: quota used vs. hard, "
+                         "PVC capacity vs. real used\n")
+            rows = [["CLUSTER", *_storage_cells(cluster_summary(trees))]]
+            for stage, totals in stage_summaries(trees):
+                rows.append([f"stage/{stage}", *_storage_cells(totals)])
+            _print_table(["SCOPE", *_STORAGE_HEADERS], rows, stream)
+
+            stream.write("\nBY NAMESPACE — storage quota (used vs. hard) "
+                         "and PVCs (capacity vs. real used)\n")
             sto_rows = [[f"{n['stage']}/{n['namespace']}",
-                         fmt_bytes(n["totals"].get("storage_used")),
-                         fmt_bytes(n["totals"].get("storage_hard")),
-                         fmt_pct(n["totals"].get("storage_used_pct"))]
-                        for n in sorted_ns]
-            _print_table(["NAMESPACE", "STO used", "STO hard", "STO %"],
-                         sto_rows, stream)
+                         *_storage_cells(n["totals"])] for n in sorted_ns]
+            _print_table(["NAMESPACE", *_STORAGE_HEADERS], sto_rows, stream)
 
     for node in trees:
         stream.write("\n" + "=" * 100 + "\n")
@@ -2563,6 +2641,11 @@ def render_text(trees, stream, levels=("namespace", "workload", "pod",
                 f"  quota: used {fmt_bytes(t.get('storage_used'))}"
                 f" / hard {fmt_bytes(t.get('storage_hard'))}"
                 f" ({fmt_pct(t.get('storage_used_pct'))})\n")
+            if node.get("pvcs"):
+                stream.write(
+                    f"  pvc: capacity {fmt_bytes(t.get('storage_capacity'))}"
+                    f" / used {fmt_bytes(t.get('pvc_used'))}"
+                    f" ({fmt_pct(t.get('pvc_used_pct'))})\n")
             cls_rows = _storage_class_rows(node)
             if cls_rows:
                 _print_table(["STORAGECLASS", "Q used", "Q hard", "Q %",
@@ -2663,6 +2746,9 @@ def build_parser():
     out.add_argument("--retention-days", type=int, default=0,
                      help="With --date-subdir, prune dated folders older than N "
                           "days (0 = keep everything).")
+    out.add_argument("--keep-empty-columns", action="store_true",
+                     help="Write every CSV column even when it is empty/0 in "
+                          "all rows (default: such columns are dropped).")
     out.add_argument("--no-idle-workloads", action="store_true",
                      help="Don't list declared Deployments/StatefulSets/"
                           "DaemonSets that have no running pods.")
@@ -2735,8 +2821,9 @@ def _make_thanos(args):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    global CLI
+    global CLI, DROP_EMPTY_COLUMNS
     CLI = pick_cli_binary(prefer_kubectl=args.kubectl)
+    DROP_EMPTY_COLUMNS = not args.keep_empty_columns
     k8s = _make_k8s(args)
     thanos = _make_thanos(args)
     namespaces = select_namespaces(k8s, args.pattern, args.namespace,
