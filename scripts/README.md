@@ -941,6 +941,16 @@ carry one row per **hot** workload — a workload whose CPU or memory peak over
 `limit = round_up(peak / target_util)` (CPU to the next 10m, memory to the next
 Mi). Quiet workloads are omitted.
 
+#### Empty columns are dropped
+
+Every CSV omits columns that carry no data in any row — empty, `-`, or zero
+(`0`, `0.0B`, `0c`, `0.0%`). A run without Thanos loses the usage columns, a
+namespace set without PVCs loses the PVC columns, and the per-StorageClass
+matrix only lists classes some namespace actually uses. The column set can
+therefore differ between runs; pass `--keep-empty-columns` for a fixed schema
+(e.g. to diff daily files or feed an importer). Files without data rows keep
+their full header.
+
 #### Storage (in namespaces.csv and resources.csv)
 
 Storage lives in the main CSVs — there is no separate `storage.csv`.
@@ -949,7 +959,8 @@ Storage lives in the main CSVs — there is no separate `storage.csv`.
   ResourceQuota: totals `storage_used_bytes` / `storage_hard_bytes` /
   `storage_used_pct` (Used, Hard, Used÷Hard), plus a per-StorageClass triple
   `<class>_used_bytes` / `<class>_hard_bytes` / `<class>_used_pct` over a fixed
-  class set (a class the quota doesn't mention shows `0`, so the matrix is dense).
+  class set (a class the quota doesn't mention shows `0`; classes unused in
+  every namespace are dropped entirely unless `--keep-empty-columns` is set).
   It also gets the **PVC capacity and real usage per StorageClass**:
   `<class>_pvc_bytes` (sum of that class's PVC capacities in the namespace),
   `<class>_pvc_pct` (that class's share of the namespace's total PVC storage),
@@ -958,6 +969,11 @@ Storage lives in the main CSVs — there is no separate `storage.csv`.
   `<class>_pvc_used_pct` (real usage ÷ that class's PVC capacity) — e.g. see
   that file-silver is 62.5 % of a namespace's storage and 20 % actually written,
   independent of any quota.
+- Both CSVs also carry the **PVC rollup per namespace** (summed again on the
+  `stage`/`cluster` rows of `resources.csv`): `storage_capacity_bytes` (sum of
+  the namespace's PVC capacities, `0` without PVCs), `pvc_used_bytes` (real disk
+  usage summed over the PVCs that report kubelet stats; blank = no data) and
+  `pvc_used_pct` (used ÷ capacity).
 - **`resources.csv`** gains the storage totals on the `namespace`/`stage`/`cluster`
   rows, and one **`level=pvc`** row per PersistentVolumeClaim carrying `pvc`
   (name), `storageclass`, `storageclass_description` (from the StorageClass's
@@ -965,6 +981,12 @@ Storage lives in the main CSVs — there is no separate `storage.csv`.
   `pvc_used_bytes` (real disk usage from the kubelet volume stats) and
   `pvc_used_pct` (used ÷ capacity). The cpu/mem columns are blank on `pvc` rows
   and vice-versa.
+
+`summary.txt` shows the same rollup in human units: a `SUMMARY — storage`
+table (cluster + per stage) and the `BY NAMESPACE — storage` table both list
+quota used/hard/% next to `PVC cap` / `PVC used` / `PVC use%`, and each
+namespace's STORAGE block has a `pvc: capacity … / used … (…%)` line above
+the per-StorageClass and per-PVC tables.
 
 The quota used % is Used÷Hard from the storageclass quota. The per-PVC real
 usage degrades like the cpu/mem metrics: blank when Thanos is off/unreachable,

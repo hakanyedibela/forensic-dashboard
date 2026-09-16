@@ -524,7 +524,8 @@ def test_render_csv_has_header_and_rows(fcu):
     assert "container" in text
 
 
-def test_render_resources_human_csv_formats_values(fcu):
+def test_render_resources_human_csv_formats_values(fcu, monkeypatch):
+    monkeypatch.setattr(fcu, "DROP_EMPTY_COLUMNS", False)   # full schema
     buf = io.StringIO()
     fcu.render_resources_human_csv([_sample_tree(fcu)], buf)
     lines = buf.getvalue().splitlines()
@@ -548,7 +549,8 @@ def test_render_resources_human_csv_row_count_matches_raw(fcu):
     assert len(raw.getvalue().splitlines()) == len(human.getvalue().splitlines())
 
 
-def test_render_namespaces_human_csv_formats_values(fcu):
+def test_render_namespaces_human_csv_formats_values(fcu, monkeypatch):
+    monkeypatch.setattr(fcu, "DROP_EMPTY_COLUMNS", False)   # full schema
     buf = io.StringIO()
     fcu.render_namespaces_human_csv([_sample_tree(fcu)], buf)
     lines = buf.getvalue().splitlines()
@@ -584,7 +586,8 @@ def test_render_stdout_formats_resources_human(fcu):
     assert "200m" in out and "e-" not in out
 
 
-def test_render_stdout_formats_namespaces_human(fcu):
+def test_render_stdout_formats_namespaces_human(fcu, monkeypatch):
+    monkeypatch.setattr(fcu, "DROP_EMPTY_COLUMNS", False)   # full schema
     buf = io.StringIO()
     fcu.render_stdout_formats([_sample_tree(fcu)], ["namespaces-human"], buf,
                               window="7d", cluster="c1", levels=("namespace",))
@@ -1528,7 +1531,7 @@ def test_render_recommendations_csv_only_hot(fcu):
     rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
     assert [r["workload"] for r in rows] == ["hot"]          # cold omitted
     assert rows[0]["cpu_limit_rec_cores"] == "1.13"
-    assert rows[0]["mem_limit_rec_bytes"] == ""              # no mem peak -> blank
+    assert "mem_limit_rec_bytes" not in rows[0]              # no mem peak anywhere -> dropped
 
 
 def test_render_recommendations_csv_empty_when_no_peaks(fcu):
@@ -1825,11 +1828,11 @@ def test_namespaces_csv_storage_totals_and_per_class(fcu):
     assert row["storage_used_bytes"] == str(3 * GI)
     assert row["storage_hard_bytes"] == str(10 * GI)
     assert float(row["storage_used_pct"]) == pytest.approx(30.0)
-    # per-class columns present; the present class has values, an absent one is 0
+    # the present class has values; a class with no data anywhere is dropped
     assert row["file-gold_used_bytes"] == str(3 * GI)
     assert float(row["file-gold_used_pct"]) == pytest.approx(30.0)
-    assert row["block-silver_used_bytes"] == "0"
-    assert row["block-silver_used_pct"] == ""        # 0/0 -> blank
+    assert "block-silver_used_bytes" not in row
+    assert "block-silver_used_pct" not in row
 
 
 def test_namespaces_human_storage_units(fcu):
@@ -1857,9 +1860,9 @@ def test_namespaces_csv_pvc_per_class_share(fcu):
     assert float(row["file-silver_pvc_pct"]) == pytest.approx(62.5)
     assert float(row["file-gold_pvc_pct"]) == pytest.approx(25.0)
     assert float(row["file-network_pvc_pct"]) == pytest.approx(12.5)
-    # a class with no PVC is 0 bytes / 0% (dense, since the ns has PVCs)
-    assert row["block-silver_pvc_bytes"] == "0"
-    assert float(row["block-silver_pvc_pct"]) == pytest.approx(0.0)
+    # a class with no PVC anywhere is dropped (all-zero column)
+    assert "block-silver_pvc_bytes" not in row
+    assert "block-silver_pvc_pct" not in row
 
 
 def test_namespaces_human_pvc_share(fcu):
@@ -1873,7 +1876,8 @@ def test_namespaces_human_pvc_share(fcu):
     assert row["file-silver_pvc_pct"] == "62.5%"
 
 
-def test_namespaces_pvc_share_blank_without_pvcs(fcu):
+def test_namespaces_pvc_share_blank_without_pvcs(fcu, monkeypatch):
+    monkeypatch.setattr(fcu, "DROP_EMPTY_COLUMNS", False)   # dense schema
     node = _sto_node(fcu, "ns1", "test", {})          # pvcs == []
     buf = io.StringIO()
     fcu.render_namespaces_csv([node], buf)
@@ -1921,7 +1925,7 @@ def test_resources_csv_emits_pvc_rows(fcu):
     assert r["storageclass"] == "file-silver"
     assert r["storageclass_description"] == "RWX filesystem volumes"
     assert r["storage_capacity_bytes"] == str(8 * GI)
-    assert r["cpu_request_cores"] == ""          # cpu/mem blank on pvc rows
+    assert "cpu_request_cores" not in r          # no cpu anywhere -> dropped
     # the namespace row carries the storage quota totals
     ns_row = [r for r in rows if r["level"] == "namespace"][0]
     assert ns_row["storage_used_bytes"] == str(3 * GI)
@@ -2032,8 +2036,6 @@ def test_resources_csv_pvc_used_columns(fcu):
     r = [r for r in rows if r["level"] == "pvc"][0]
     assert r["pvc_used_bytes"] == str(2 * GI)
     assert float(r["pvc_used_pct"]) == pytest.approx(25.0)
-    ns_row = [r for r in rows if r["level"] == "namespace"][0]
-    assert ns_row["pvc_used_bytes"] == ""         # blank on non-pvc rows
 
 
 def test_resources_human_pvc_used_units(fcu):
@@ -2065,9 +2067,10 @@ def test_namespaces_csv_pvc_used_per_class(fcu):
     assert row["file-silver_pvc_used_bytes"] == str(10 * GI)
     # used% is used / that class's PVC capacity (10Gi / 80Gi)
     assert float(row["file-silver_pvc_used_pct"]) == pytest.approx(12.5)
-    # a class with no usage data stays blank (no data != 0)
-    assert row["file-gold_pvc_used_bytes"] == ""
-    assert row["file-gold_pvc_used_pct"] == ""
+    # a class with no usage data anywhere loses its used columns (capacity stays)
+    assert row["file-gold_pvc_bytes"] == str(20 * GI)
+    assert "file-gold_pvc_used_bytes" not in row
+    assert "file-gold_pvc_used_pct" not in row
 
 
 def test_namespaces_human_pvc_used_units(fcu):
@@ -2079,7 +2082,7 @@ def test_namespaces_human_pvc_used_units(fcu):
     row = list(_csv.DictReader(io.StringIO(buf.getvalue())))[0]
     assert row["file-silver_pvc_used"] == "10.0Gi"
     assert row["file-silver_pvc_used_pct"] == "20.0%"
-    assert row["file-gold_pvc_used"] == "-"        # no data -> dash
+    assert "file-gold_pvc_used" not in row         # no data anywhere -> dropped
 
 
 def test_summary_text_pvc_real_used(fcu):
@@ -2437,3 +2440,278 @@ def test_sizing_written_to_report_dir(fcu, tmp_path):
     text = (tmp_path / "sizing.csv").read_text()
     assert "current_shape,should_shape" in text
     assert "Deployment/api" in text
+
+
+# --------------------------------------------------- PVC rollup (ns/stage/cluster)
+
+def _pvc_node(fcu, namespace, stage, pvcs):
+    node = _sto_node(fcu, namespace, stage, {})
+    node["pvcs"] = pvcs
+    cap, used = fcu.pvc_totals(pvcs)
+    node["totals"]["storage_capacity"] = cap
+    node["totals"]["pvc_used"] = used
+    node["totals"]["pvc_used_pct"] = fcu.util_pct(used, cap)
+    return node
+
+
+def test_pvc_totals_sums_capacity_and_used(fcu):
+    pvcs = [{"name": "a", "storageclass": "file-silver", "capacity": 50 * GI,
+             "used": 10 * GI},
+            {"name": "b", "storageclass": "file-gold", "capacity": 30 * GI,
+             "used": None}]                                  # no stats
+    assert fcu.pvc_totals(pvcs) == (80 * GI, 10 * GI)
+
+
+def test_pvc_totals_used_none_when_no_data(fcu):
+    pvcs = [{"name": "a", "storageclass": "file-silver", "capacity": 50 * GI,
+             "used": None}]
+    assert fcu.pvc_totals(pvcs) == (50 * GI, None)
+    assert fcu.pvc_totals([]) == (0, None)
+
+
+def test_collect_namespace_sets_pvc_rollup_on_totals(fcu):
+    from conftest import FakeThanos
+    pods = [{"metadata": {"name": "w-1", "namespace": "ns1", "labels": {}},
+             "spec": {"nodeName": "n1", "containers": [{"name": "c",
+                                                        "resources": {}}]},
+             "status": {"containerStatuses": []}}]
+    pvcs = [{"metadata": {"name": "data-0"},
+             "spec": {"storageClassName": "file-silver",
+                      "resources": {"requests": {"storage": "8Gi"}}},
+             "status": {"capacity": {"storage": "8Gi"}}},
+            {"metadata": {"name": "data-1"},
+             "spec": {"storageClassName": "file-gold",
+                      "resources": {"requests": {"storage": "2Gi"}}},
+             "status": {"capacity": {"storage": "2Gi"}}}]
+    thanos = FakeThanos({"kubelet_volume_stats_used_bytes": [
+        {"metric": {"persistentvolumeclaim": "data-0"},
+         "value": [0, str(2 * GI)]}]})
+    node = fcu.collect_namespace(StorageFakeK8s(pods=pods, pvcs=pvcs), "ns1",
+                                 thanos=thanos, window="24h", step="5m")
+    t = node["totals"]
+    assert t["storage_capacity"] == 10 * GI
+    assert t["pvc_used"] == 2 * GI                 # data-1 has no stats
+    assert t["pvc_used_pct"] == pytest.approx(20.0)
+
+
+def test_collect_namespace_pvc_rollup_without_pvcs(fcu):
+    pods = [{"metadata": {"name": "w-1", "namespace": "ns1", "labels": {}},
+             "spec": {"nodeName": "n1", "containers": [{"name": "c",
+                                                        "resources": {}}]},
+             "status": {"containerStatuses": []}}]
+    node = fcu.collect_namespace(StorageFakeK8s(pods=pods), "ns1",
+                                 thanos=None, window="24h", step="5m")
+    t = node["totals"]
+    assert t["storage_capacity"] == 0
+    assert t["pvc_used"] is None
+    assert t["pvc_used_pct"] is None
+
+
+def test_aggregate_totals_rolls_up_pvc(fcu):
+    a = _pvc_node(fcu, "ns1", "test",
+                  [{"name": "a", "storageclass": "file-silver",
+                    "capacity": 50 * GI, "used": 10 * GI}])["totals"]
+    b = _pvc_node(fcu, "ns2", "test",
+                  [{"name": "b", "storageclass": "file-silver",
+                    "capacity": 30 * GI, "used": None}])["totals"]
+    agg = fcu.aggregate_totals([a, b])
+    assert agg["storage_capacity"] == 80 * GI
+    assert agg["pvc_used"] == 10 * GI
+    assert agg["pvc_used_pct"] == pytest.approx(12.5)
+
+
+def test_resources_csv_rollup_rows_carry_pvc_totals(fcu):
+    node = _pvc_node(fcu, "ns1", "test",
+                     [{"name": "data-0", "storageclass": "file-silver",
+                       "capacity": 8 * GI, "used": 2 * GI, "used_pct": 25.0,
+                       "description": ""}])
+    buf = io.StringIO()
+    fcu.render_resources_csv([node], buf)
+    rows = {r["level"]: r for r in _csv.DictReader(io.StringIO(buf.getvalue()))}
+    for level in ("namespace", "stage", "cluster"):
+        assert rows[level]["storage_capacity_bytes"] == str(8 * GI), level
+        assert rows[level]["pvc_used_bytes"] == str(2 * GI), level
+        assert float(rows[level]["pvc_used_pct"]) == pytest.approx(25.0), level
+
+
+def test_namespaces_csv_pvc_totals_columns(fcu):
+    node = _pvc_node(fcu, "ns1", "test",
+                     [{"name": "a", "storageclass": "file-silver",
+                       "capacity": 50 * GI, "used": 10 * GI},
+                      {"name": "b", "storageclass": "file-gold",
+                       "capacity": 30 * GI, "used": None}])
+    buf = io.StringIO()
+    fcu.render_namespaces_csv([node], buf)
+    row = list(_csv.DictReader(io.StringIO(buf.getvalue())))[0]
+    assert row["storage_capacity_bytes"] == str(80 * GI)
+    assert row["pvc_used_bytes"] == str(10 * GI)
+    assert float(row["pvc_used_pct"]) == pytest.approx(12.5)
+
+
+def test_namespaces_human_pvc_totals_units(fcu):
+    node = _pvc_node(fcu, "ns1", "test",
+                     [{"name": "a", "storageclass": "file-silver",
+                       "capacity": 50 * GI, "used": 10 * GI}])
+    buf = io.StringIO()
+    fcu.render_namespaces_human_csv([node], buf)
+    row = list(_csv.DictReader(io.StringIO(buf.getvalue())))[0]
+    assert row["storage_capacity"] == "50.0Gi"
+    assert row["pvc_used"] == "10.0Gi"
+    assert row["pvc_used_pct"] == "20.0%"
+
+
+def test_namespaces_human_pvc_totals_dash_without_data(fcu, monkeypatch):
+    monkeypatch.setattr(fcu, "DROP_EMPTY_COLUMNS", False)   # dense schema
+    node = _pvc_node(fcu, "ns1", "test", [])
+    buf = io.StringIO()
+    fcu.render_namespaces_human_csv([node], buf)
+    row = list(_csv.DictReader(io.StringIO(buf.getvalue())))[0]
+    assert row["storage_capacity"] == "0.0B"
+    assert row["pvc_used"] == "-"
+    assert row["pvc_used_pct"] == "-"
+
+
+def test_summary_text_by_namespace_storage_has_pvc_columns(fcu):
+    node = _pvc_node(fcu, "ns1", "test",
+                     [{"name": "a", "storageclass": "file-silver",
+                       "capacity": 50 * GI, "used": 10 * GI, "used_pct": 20.0,
+                       "description": ""}])
+    buf = io.StringIO()
+    fcu.render_text([node], buf, levels=())
+    out = buf.getvalue()
+    by_ns = out.split("BY NAMESPACE — storage", 1)[1].split("\n\n", 1)[0]
+    assert "PVC cap" in by_ns and "PVC used" in by_ns and "PVC use%" in by_ns
+    assert "50.0Gi" in by_ns and "10.0Gi" in by_ns and "20.0%" in by_ns
+
+
+def test_summary_text_storage_rollup_cluster_and_stage(fcu):
+    a = _pvc_node(fcu, "ns1", "test",
+                  [{"name": "a", "storageclass": "file-silver",
+                    "capacity": 50 * GI, "used": 10 * GI, "description": ""}])
+    b = _pvc_node(fcu, "ns2", "prod",
+                  [{"name": "b", "storageclass": "file-silver",
+                    "capacity": 30 * GI, "used": 30 * GI, "description": ""}])
+    buf = io.StringIO()
+    fcu.render_text([a, b], buf, levels=())
+    out = buf.getvalue()
+    assert "SUMMARY — storage" in out
+    block = out.split("SUMMARY — storage", 1)[1].split("\n\n", 1)[0]
+    cluster = [l for l in block.splitlines() if l.strip().startswith("CLUSTER")][0]
+    assert "80.0Gi" in cluster and "40.0Gi" in cluster and "50.0%" in cluster
+    prod = [l for l in block.splitlines() if "stage/prod" in l][0]
+    assert "30.0Gi" in prod and "100.0%" in prod
+
+
+def test_summary_text_namespace_block_has_pvc_line(fcu):
+    node = _pvc_node(fcu, "ns1", "test",
+                     [{"name": "a", "storageclass": "file-silver",
+                       "capacity": 8 * GI, "used": 2 * GI, "used_pct": 25.0,
+                       "description": ""}])
+    buf = io.StringIO()
+    fcu.render_text([node], buf, levels=("namespace",))
+    out = buf.getvalue()
+    assert "pvc: capacity 8.0Gi / used 2.0Gi (25.0%)" in out
+
+
+def test_legend_documents_pvc_rollup(fcu):
+    assert "storage_capacity_bytes" in fcu.LEGEND_TEXT
+    # the rollup semantics (summed over the namespace's PVCs) are documented
+    assert "Summe der PVC-Kapazitäten" in fcu.LEGEND_TEXT
+    assert "SUMMARY — storage" in fcu.LEGEND_TEXT
+
+
+# ------------------------------------------------ drop all-empty CSV columns
+
+def test_prune_empty_columns_drops_blank_dash_and_zero(fcu):
+    cols = ["a", "blank", "dash", "zero", "zero_unit", "mixed"]
+    rows = [{"a": "x", "blank": "", "dash": "-", "zero": 0, "zero_unit": "0.0B",
+             "mixed": ""},
+            {"a": "y", "blank": None, "dash": "-", "zero": "0", "zero_unit": "0c",
+             "mixed": "0.0%"},
+            {"a": "z", "blank": "", "dash": "-", "zero": 0.0, "zero_unit": "0.0%",
+             "mixed": "5.0%"}]
+    assert fcu.prune_empty_columns(cols, rows) == ["a", "mixed"]
+
+
+def test_prune_empty_columns_keeps_all_without_rows(fcu):
+    assert fcu.prune_empty_columns(["a", "b"], []) == ["a", "b"]
+
+
+def test_prune_empty_columns_keeps_real_values(fcu):
+    rows = [{"n": "10Gi"}, {"n": "-"}]
+    assert fcu.prune_empty_columns(["n"], rows) == ["n"]
+    rows = [{"n": 0}, {"n": 0.5}]
+    assert fcu.prune_empty_columns(["n"], rows) == ["n"]
+    rows = [{"n": "0-abc"}]                         # not a zero, a string
+    assert fcu.prune_empty_columns(["n"], rows) == ["n"]
+
+
+def test_resources_csv_drops_all_empty_columns(fcu):
+    node = _sto_node(fcu, "ns1", "test", {})        # no quota, no PVCs
+    buf = io.StringIO()
+    fcu.render_resources_csv([node], buf)
+    header = buf.getvalue().splitlines()[0].split(",")
+    assert "level" in header and "namespace" in header
+    assert "pvc" not in header
+    assert "storageclass" not in header
+    assert "pvc_used_bytes" not in header
+    assert "storage_used_bytes" not in header
+
+
+def test_resources_human_csv_drops_all_empty_columns(fcu):
+    node = _sto_node(fcu, "ns1", "test", {})
+    buf = io.StringIO()
+    fcu.render_resources_human_csv([node], buf)
+    header = buf.getvalue().splitlines()[0].split(",")
+    assert "level" in header
+    assert "pvc_used" not in header and "cpu_peak" not in header
+
+
+def test_namespaces_csv_drops_classes_without_data(fcu):
+    node = _sto_node(fcu, "ns1", "test",
+                     {"file-gold": {"used": 3 * GI, "hard": 10 * GI}})
+    buf = io.StringIO()
+    fcu.render_namespaces_csv([node], buf)
+    header = buf.getvalue().splitlines()[0].split(",")
+    assert "file-gold_used_bytes" in header and "file-gold_hard_bytes" in header
+    assert "block-silver_used_bytes" not in header
+    assert "block-silver_pvc_bytes" not in header
+    assert "file-gold_pvc_bytes" not in header       # no PVCs at all
+
+
+def test_namespaces_human_csv_drops_classes_without_data(fcu):
+    node = _sto_node(fcu, "ns1", "test",
+                     {"file-gold": {"used": 3 * GI, "hard": 10 * GI}})
+    buf = io.StringIO()
+    fcu.render_namespaces_human_csv([node], buf)
+    header = buf.getvalue().splitlines()[0].split(",")
+    assert "file-gold_used" in header
+    assert "block-silver_used" not in header
+
+
+def test_ooms_csv_keeps_header_without_rows(fcu):
+    node = _sto_node(fcu, "ns1", "test", {})
+    buf = io.StringIO()
+    fcu.render_ooms_csv([node], buf)
+    header = buf.getvalue().splitlines()[0].split(",")
+    assert header == ["stage", "namespace", "pod", "container", "source",
+                      "oom_events", "restart_count", "exit_code", "finished_at"]
+
+
+def test_keep_empty_columns_switch_restores_dense_csv(fcu, monkeypatch):
+    monkeypatch.setattr(fcu, "DROP_EMPTY_COLUMNS", False)
+    node = _sto_node(fcu, "ns1", "test", {})
+    buf = io.StringIO()
+    fcu.render_namespaces_csv([node], buf)
+    header = buf.getvalue().splitlines()[0].split(",")
+    assert header == fcu.NS_CSV_COLUMNS
+
+
+def test_parser_keep_empty_columns_flag(fcu):
+    args = fcu.build_parser().parse_args(["--keep-empty-columns"])
+    assert args.keep_empty_columns is True
+    assert fcu.build_parser().parse_args([]).keep_empty_columns is False
+
+
+def test_legend_documents_dropped_columns(fcu):
+    assert "--keep-empty-columns" in fcu.LEGEND_TEXT
