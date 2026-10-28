@@ -19,3 +19,6 @@ __pycache__/
 *.tar.gz
 /scripts/embedded/
 *.7z
+# generated for promtool test rules
+/manifests/tests/*.rules.yaml
+.gstack/

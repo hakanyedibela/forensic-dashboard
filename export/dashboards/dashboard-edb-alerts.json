@@ -1,0 +1,1643 @@
+{
+  "uid": "edb-alert-center",
+  "title": "EDB PostgreSQL — Alert Center",
+  "tags": [
+    "edb",
+    "postgres",
+    "alerts"
+  ],
+  "editable": true,
+  "schemaVersion": 39,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "timezone": "browser",
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Cluster Overview",
+      "type": "link",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "url": "/d/edb-pg-overview?${__url_time_range}&var-datasource=${datasource}&var-namespace=${namespace}&var-cluster=${cluster}",
+      "keepTime": true,
+      "includeVars": false,
+      "tooltip": "Health, performance and replication of the same cluster."
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "options": [],
+        "refresh": 1,
+        "description": "Prometheus (or Thanos Querier) datasource holding the ALERTS series."
+      },
+      {
+        "name": "scope",
+        "label": "Scope",
+        "type": "custom",
+        "hide": 0,
+        "query": "EDB Postgres : edb-postgres,All alerts : .*",
+        "options": [
+          {
+            "text": "EDB Postgres",
+            "value": "edb-postgres",
+            "selected": true
+          },
+          {
+            "text": "All alerts",
+            "value": ".*",
+            "selected": false
+          }
+        ],
+        "current": {
+          "text": "EDB Postgres",
+          "value": "edb-postgres"
+        },
+        "multi": false,
+        "includeAll": false,
+        "allValue": null,
+        "description": "EDB Postgres = only rules labelled component=edb-postgres. All alerts = every Prometheus alert (Kubernetes, nodes, ...)."
+      },
+      {
+        "name": "namespace",
+        "label": "Namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(ALERTS_FOR_STATE, namespace)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "definition": "label_values(ALERTS_FOR_STATE, namespace)",
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {},
+        "options": [],
+        "description": "Namespaces that had alerts in the selected time range. All = every namespace."
+      },
+      {
+        "name": "severity",
+        "label": "Severity",
+        "type": "custom",
+        "hide": 0,
+        "query": "critical : critical,warning : warning,info : info",
+        "options": [
+          {
+            "text": "critical",
+            "value": "critical",
+            "selected": true
+          },
+          {
+            "text": "warning",
+            "value": "warning",
+            "selected": false
+          },
+          {
+            "text": "info",
+            "value": "info",
+            "selected": false
+          }
+        ],
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "description": "Filter by alert severity. critical = act now, warning = investigate soon, info = no action."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Now",
+      "id": 1,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Critical",
+      "description": "Firing alerts with severity=critical in the current scope. Needs action now. Source: Prometheus ALERTS series (rules deployed as PrometheusRule). Rules imported into Grafana appear only in the Alert inbox.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "count(ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\", alertstate=\"firing\", severity=\"critical\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 2,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Warning",
+      "description": "Firing alerts with severity=warning. Investigate soon. Source: Prometheus ALERTS series (rules deployed as PrometheusRule). Rules imported into Grafana appear only in the Alert inbox.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "count(ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\", alertstate=\"firing\", severity=\"warning\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 3,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Info",
+      "description": "Informational alerts (e.g. PostgreSQL restarted). No action required. Source: Prometheus ALERTS series (rules deployed as PrometheusRule). Rules imported into Grafana appear only in the Alert inbox.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "count(ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\", alertstate=\"firing\", severity=\"info\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "blue",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 4,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Pending",
+      "description": "Condition true, 'for' duration not yet reached. Becomes firing if it persists.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "count(ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\", alertstate=\"pending\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 5,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Affected namespaces",
+      "description": "Namespaces with at least one firing alert. Source: Prometheus ALERTS series (rules deployed as PrometheusRule). Rules imported into Grafana appear only in the Alert inbox.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "count(count by (namespace) (ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\", alertstate=\"firing\"}))",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 6,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Oldest active alert",
+      "description": "How long the longest-running alert has been active.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "time() - min(ALERTS_FOR_STATE{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 3600
+              },
+              {
+                "color": "red",
+                "value": 86400
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "-"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 7,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "alertlist",
+      "title": "Alert inbox (expand an alert for summary / description)",
+      "description": "Every firing/pending alert, whether Prometheus evaluates the rule (PrometheusRule) or Grafana does (rules imported into Grafana). 'View alert rule' opens the rule with its query and history.",
+      "options": {
+        "viewMode": "list",
+        "groupMode": "default",
+        "groupBy": [],
+        "maxItems": 100,
+        "sortOrder": 3,
+        "dashboardAlerts": false,
+        "alertName": "",
+        "alertInstanceLabelFilter": "{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\"}",
+        "datasource": null,
+        "folder": null,
+        "showInstances": true,
+        "stateFilter": {
+          "firing": true,
+          "pending": true,
+          "recovering": true,
+          "noData": false,
+          "normal": false,
+          "error": true
+        }
+      },
+      "id": 8,
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "table",
+      "title": "Active alerts",
+      "description": "One row per active alert instance. 'active since' comes from ALERTS_FOR_STATE.\n\n- **severity**: critical = act now, warning = investigate soon, info = no action needed.\n- **alertname**: Name of the Prometheus rule (manifests/edb-postgres-alerts.yaml).\n- **pod**: Instance the alert refers to. Empty for cluster-wide alerts (backups, primary election).\n- **alertstate**: FIRING = condition held for the rule's 'for' duration. pending = condition true, 'for' not yet reached.\n- **namespace**: Kubernetes namespace of the affected workload.\n- **active since**: When the condition first became true (ALERTS_FOR_STATE), including the pending phase.\n- **duration**: Time since 'active since'.\n- **what it means / what to do**: Description of the rule; <label> placeholders refer to the columns on the left.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "(ALERTS_FOR_STATE{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\"} + ignoring (alertstate) group_right () (ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\"} * 0)) * 1000",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B",
+          "expr": "time() - (ALERTS_FOR_STATE{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\"} + ignoring (alertstate) group_right () (ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\"} * 0))",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "C",
+          "expr": "label_replace((ALERTS_FOR_STATE{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\"} + ignoring (alertstate) group_right () (ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\"} * 0)), \"action\", \"$1\", \"alertname\", \"(.*)\")",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "severity",
+                "alertstate",
+                "alertname",
+                "namespace",
+                "pod",
+                "Value #A",
+                "Value #B",
+                "action"
+              ]
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "component": true,
+              "job": true,
+              "namespace": false,
+              "instance": true,
+              "endpoint": true,
+              "container": true,
+              "service": true,
+              "prometheus": true,
+              "alertstate": false,
+              "cluster": true,
+              "stats_reset": true,
+              "value": true,
+              "Value #C": true
+            },
+            "renameByName": {
+              "Value #A": "active since",
+              "Value #B": "duration",
+              "action": "what it means / what to do"
+            },
+            "indexByName": {
+              "severity": 0,
+              "alertstate": 1,
+              "alertname": 2,
+              "namespace": 3,
+              "pod": 4,
+              "Value #A": 5,
+              "Value #B": 6,
+              "action": 7
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "severity"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "text": "critical",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "text": "warning",
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "text": "info",
+                        "color": "blue",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "alertstate"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "firing": {
+                        "text": "FIRING",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "pending": {
+                        "text": "pending",
+                        "color": "yellow",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "severity"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "alertname"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 260
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "namespace"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 140
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "pod"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 160
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "active since"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.width",
+                "value": 100
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "what it means / what to do"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "CNPInstanceDown": {
+                        "text": "The instance manager cannot reach PostgreSQL on <pod> (cluster <cluster>).",
+                        "color": "text",
+                        "index": 0
+                      },
+                      "CNPMetricsTargetDown": {
+                        "text": "Prometheus cannot scrape port 9187 of <pod>. Pod down, TLS mismatch on the PodMonitor, or NetworkPolicy.",
+                        "color": "text",
+                        "index": 1
+                      },
+                      "CNPNoPrimary": {
+                        "text": "All instances are in recovery and the cluster is not in replica mode. Writes are failing.",
+                        "color": "text",
+                        "index": 2
+                      },
+                      "CNPMultiplePrimaries": {
+                        "text": "More than one instance is out of recovery (split brain). Check `kubectl cnp status`.",
+                        "color": "text",
+                        "index": 3
+                      },
+                      "CNPFencingActive": {
+                        "text": "Fencing is on; PostgreSQL on this instance is stopped. Remove the k8s.enterprisedb.io/fencedInstances annotation when done.",
+                        "color": "text",
+                        "index": 4
+                      },
+                      "CNPManualSwitchoverRequired": {
+                        "text": "The operator needs a manual switchover to proceed (e.g. primaryUpdateStrategy: supervised).",
+                        "color": "text",
+                        "index": 5
+                      },
+                      "CNPNoHighAvailability": {
+                        "text": "A single node failure takes down the whole cluster. Check pod anti-affinity.",
+                        "color": "text",
+                        "index": 6
+                      },
+                      "CNPMetricsCollectionError": {
+                        "text": "At least one monitoring query errors. Dashboards/alerts based on it are blind. Check instance logs for 'cnp_metrics_exporter'.",
+                        "color": "text",
+                        "index": 7
+                      },
+                      "CNPPostgresRestarted": {
+                        "text": "Postmaster restarted inside the running pod in the last 15 minutes (crash recovery, config reload with restart, promotion).",
+                        "color": "text",
+                        "index": 8
+                      },
+                      "CNPReplicationLag": {
+                        "text": "Standby is lagging behind the primary by more than 5 minutes.",
+                        "color": "text",
+                        "index": 9
+                      },
+                      "CNPReplicationLagCritical": {
+                        "text": "Standby is lagging behind the primary by more than 15 minutes. A failover now loses data.",
+                        "color": "text",
+                        "index": 10
+                      },
+                      "CNPReplicaNotStreaming": {
+                        "text": "Instance is in recovery but has no WAL receiver. Expected only on a replica cluster's designated primary restoring from object store.",
+                        "color": "text",
+                        "index": 11
+                      },
+                      "CNPSyncReplicasDegraded": {
+                        "text": "Synchronous replication is degraded. Depending on dataDurability, commits block or durability is reduced.",
+                        "color": "text",
+                        "index": 12
+                      },
+                      "CNPReplicationSlotInactive": {
+                        "text": "An inactive slot on the primary retains WAL indefinitely and will fill pg_wal.",
+                        "color": "text",
+                        "index": 13
+                      },
+                      "CNPReplicationSlotWALRetention": {
+                        "text": "Slot consumer is far behind or gone.",
+                        "color": "text",
+                        "index": 14
+                      },
+                      "CNPLongRunningTransaction": {
+                        "text": "db=<datname> user=<usename> app=<application_name>. Long transactions block vacuum.",
+                        "color": "text",
+                        "index": 15
+                      },
+                      "CNPBackendsBlockedOnLocks": {
+                        "text": "More than 10 backends have been waiting on locks held by other sessions for 5 minutes.",
+                        "color": "text",
+                        "index": 16
+                      },
+                      "CNPConnectionsNearLimit": {
+                        "text": "New connections will be refused when the limit is reached. Consider a Pooler (PgBouncer).",
+                        "color": "text",
+                        "index": 17
+                      },
+                      "CNPConnectionsNearLimitCritical": {
+                        "text": "Connections are about to be refused.",
+                        "color": "text",
+                        "index": 18
+                      },
+                      "CNPXIDWraparoundRisk": {
+                        "text": "Over 300M transactions since the oldest unfrozen XID. Check autovacuum and long transactions.",
+                        "color": "text",
+                        "index": 19
+                      },
+                      "CNPXIDWraparoundCritical": {
+                        "text": "Halfway to wraparound shutdown (~2.1B). Run VACUUM FREEZE now.",
+                        "color": "text",
+                        "index": 20
+                      },
+                      "CNPDeadlocks": {
+                        "text": "More than 10 deadlocks in the last hour.",
+                        "color": "text",
+                        "index": 21
+                      },
+                      "CNPWALVolumeFillingUp": {
+                        "text": "Usually failing WAL archiving or an inactive replication slot.",
+                        "color": "text",
+                        "index": 22
+                      },
+                      "CNPWALVolumeFillingUpCritical": {
+                        "text": "PostgreSQL stops when pg_wal is full.",
+                        "color": "text",
+                        "index": 23
+                      },
+                      "CNPWALArchivingFailing": {
+                        "text": "Last archive attempt failed and no success since. PITR is broken and pg_wal is filling up. Check object-store credentials/reachability.",
+                        "color": "text",
+                        "index": 24
+                      },
+                      "CNPWALArchiveBacklog": {
+                        "text": "Archiving is not keeping up with WAL generation.",
+                        "color": "text",
+                        "index": 25
+                      },
+                      "CNPBackupTooOld": {
+                        "text": "No successful backup in 26h. Assumes a daily ScheduledBackup.",
+                        "color": "text",
+                        "index": 26
+                      },
+                      "CNPBackupMissing": {
+                        "text": "Two daily backups missed.",
+                        "color": "text",
+                        "index": 27
+                      },
+                      "CNPLastBackupFailed": {
+                        "text": "The last failed backup is newer than the last successful one. `kubectl get backups -n <namespace>`.",
+                        "color": "text",
+                        "index": 28
+                      },
+                      "CNPNoBackupEver": {
+                        "text": "Backup metrics exist but report no completed backup for 26h. Missing ScheduledBackup or broken object store.",
+                        "color": "text",
+                        "index": 29
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto",
+                  "wrapText": true
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "lg",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "duration",
+            "desc": true
+          }
+        ]
+      },
+      "id": 9,
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "row",
+      "title": "History (selected time range)",
+      "id": 10,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      }
+    },
+    {
+      "type": "state-timeline",
+      "title": "Firing alerts over time",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "max by (alertname, namespace, pod) (ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\", alertstate=\"firing\"}) or on () label_replace(vector(0), \"alertname\", \"no alerts\", \"\", \"\")",
+          "legendFormat": "{{alertname}} {{namespace}}/{{pod}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "no alerts",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "firing",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "alignValue": "left",
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "id": 11,
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "One row per alert instance; red = firing, empty = not firing. Hover for start and end. Source: Prometheus ALERTS series (rules deployed as PrometheusRule). Rules imported into Grafana appear only in the Alert inbox."
+    },
+    {
+      "type": "timeseries",
+      "title": "Firing alerts by severity",
+      "description": "Number of firing alerts per severity over time (stacked). Peaks mark incident windows. Source: Prometheus ALERTS series (rules deployed as PrometheusRule). Rules imported into Grafana appear only in the Alert inbox.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "count by (severity) (ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\", alertstate=\"firing\"})",
+          "legendFormat": "{{severity}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "critical"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "warning"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "info"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 12,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 35
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Top alerts by time firing",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "topk(10, sum by (alertname) (count_over_time(ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\", alertstate=\"firing\"}[$__range:1m])))",
+          "legendFormat": "{{alertname}}",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "description": "Sum over all instances of an alert, 1-minute resolution.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "color": {
+            "mode": "thresholds"
+          },
+          "displayName": "${__field.labels.alertname}",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "orange",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "id": 13,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 35
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "table",
+      "title": "Alert log",
+      "description": "Every alert instance that fired in the selected range (1-minute resolution). Range limited by Prometheus retention.\n\n- **severity**: critical = act now, warning = investigate soon, info = no action needed.\n- **alertname**: Name of the Prometheus rule (manifests/edb-postgres-alerts.yaml).\n- **pod**: Instance the alert refers to. Empty for cluster-wide alerts (backups, primary election).\n- **status**: FIRING = still firing at the end of the time range; resolved = not firing any more.\n- **namespace**: Kubernetes namespace of the affected workload.\n- **first seen**: First minute the alert was firing within the selected time range.\n- **last seen**: Last minute the alert was firing within the selected time range.\n- **minutes firing**: Minutes in firing state within the selected time range (1-minute resolution).",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "min_over_time(timestamp(ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\", alertstate=\"firing\"})[$__range:1m]) * 1000",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B",
+          "expr": "max_over_time(timestamp(ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\", alertstate=\"firing\"})[$__range:1m]) * 1000",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "C",
+          "expr": "count_over_time(ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\", alertstate=\"firing\"}[$__range:1m])",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "D",
+          "expr": "ALERTS{component=~\"$scope\", severity=~\"$severity\", namespace=~\"$namespace\", alertstate=\"firing\"}",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "severity",
+                "Value #D",
+                "alertname",
+                "namespace",
+                "pod",
+                "Value #A",
+                "Value #B",
+                "Value #C"
+              ]
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "component": true,
+              "job": true,
+              "namespace": false,
+              "instance": true,
+              "endpoint": true,
+              "container": true,
+              "service": true,
+              "prometheus": true,
+              "alertstate": true,
+              "cluster": true,
+              "stats_reset": true,
+              "value": true
+            },
+            "renameByName": {
+              "Value #A": "first seen",
+              "Value #B": "last seen",
+              "Value #C": "minutes firing",
+              "Value #D": "status"
+            },
+            "indexByName": {
+              "severity": 0,
+              "Value #D": 1,
+              "alertname": 2,
+              "namespace": 3,
+              "pod": 4,
+              "Value #A": 5,
+              "Value #B": 6,
+              "Value #C": 7
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "severity"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "text": "critical",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "text": "warning",
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "text": "info",
+                        "color": "blue",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "alertname"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 260
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "first seen"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "last seen"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "minutes firing"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "m"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "status"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "FIRING",
+                        "color": "red",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "noValue",
+                "value": "resolved"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "last seen",
+            "desc": true
+          }
+        ]
+      },
+      "id": 14,
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    }
+  ],
+  "id": null
+}

@@ -1,0 +1,117 @@
+# promtool unit tests for ../edb-postgres-alerts.yaml
+#
+#   yq '.spec' manifests/edb-postgres-alerts.yaml > manifests/tests/edb-postgres-alerts.rules.yaml
+#   promtool test rules manifests/tests/edb-postgres-alerts.test.yaml
+rule_files:
+  - edb-postgres-alerts.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # Two instances out of recovery -> split brain; NoPrimary must stay silent.
+  - interval: 1m
+    input_series:
+      - series: 'cnp_pg_replication_in_recovery{namespace="db", job="db/pg", pod="pg-1"}'
+        values: '0x10'
+      - series: 'cnp_pg_replication_in_recovery{namespace="db", job="db/pg", pod="pg-2"}'
+        values: '0x10'
+      - series: 'cnp_pg_replication_in_recovery{namespace="db", job="db/pg", pod="pg-3"}'
+        values: '1x10'
+      - series: 'cnp_collector_replica_mode{namespace="db", job="db/pg", pod="pg-1"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CNPMultiplePrimaries
+        exp_alerts:
+          - exp_labels: {severity: critical, component: edb-postgres, namespace: db, job: db/pg}
+            exp_annotations:
+              summary: "db/pg: 2 instances report being primary"
+              description: "More than one instance is out of recovery (split brain). Check `kubectl cnp status`."
+      - eval_time: 5m
+        alertname: CNPNoPrimary
+        exp_alerts: []
+
+  # All in recovery: fires for a normal cluster, silent for a replica cluster.
+  - interval: 1m
+    input_series:
+      - series: 'cnp_pg_replication_in_recovery{namespace="db", job="db/pg", pod="pg-1"}'
+        values: '1x10'
+      - series: 'cnp_pg_replication_in_recovery{namespace="db", job="db/pg", pod="pg-2"}'
+        values: '1x10'
+      - series: 'cnp_collector_replica_mode{namespace="db", job="db/pg", pod="pg-1"}'
+        values: '0x10'
+      - series: 'cnp_pg_replication_in_recovery{namespace="dr", job="dr/pg", pod="pg-1"}'
+        values: '1x10'
+      - series: 'cnp_collector_replica_mode{namespace="dr", job="dr/pg", pod="pg-1"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CNPNoPrimary
+        exp_alerts:
+          - exp_labels: {severity: critical, component: edb-postgres, namespace: db, job: db/pg}
+            exp_annotations:
+              summary: "db/pg: no primary instance"
+              description: "All instances are in recovery and the cluster is not in replica mode. Writes are failing."
+
+  # Plugin metric carries the real timestamp, deprecated cnp_collector_* stays 0.
+  # Backup at t=1s, evaluated at 30h -> TooOld fires, Missing (50h) and NoBackupEver do not.
+  - interval: 1m
+    input_series:
+      - series: 'barman_cloud_cloudnative_pg_io_last_available_backup_timestamp{namespace="db", job="db/pg", pod="pg-1"}'
+        values: '1x1800'
+      - series: 'cnp_collector_last_available_backup_timestamp{namespace="db", job="db/pg", pod="pg-1"}'
+        values: '0x1800'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: CNPBackupTooOld
+        exp_alerts:
+          - exp_labels: {severity: warning, component: edb-postgres, namespace: db, job: db/pg}
+            exp_annotations:
+              summary: "db/pg: last backup 1d 5h 59m 59s ago"
+              description: "No successful backup in 26h. Assumes a daily ScheduledBackup."
+      - eval_time: 30h
+        alertname: CNPBackupMissing
+        exp_alerts: []
+      - eval_time: 30h
+        alertname: CNPNoBackupEver
+        exp_alerts: []
+
+  # Last failure newer than last success.
+  - interval: 1m
+    input_series:
+      - series: 'cnp_collector_last_available_backup_timestamp{namespace="db", job="db/pg", pod="pg-1"}'
+        values: '1000x10'
+      - series: 'cnp_collector_last_failed_backup_timestamp{namespace="db", job="db/pg", pod="pg-1"}'
+        values: '2000x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CNPLastBackupFailed
+        exp_alerts:
+          - exp_labels: {severity: warning, component: edb-postgres, namespace: db, job: db/pg}
+            exp_annotations:
+              summary: "db/pg: most recent backup failed"
+              description: "The last failed backup is newer than the last successful one. `kubectl get backups -n db`."
+
+  # Archiving failing: alert on the primary only, not on the replica with stale stats.
+  - interval: 1m
+    input_series:
+      - series: 'cnp_pg_stat_archiver_last_failed_time{namespace="db", job="db/pg", pod="pg-1"}'
+        values: '2000x20'
+      - series: 'cnp_pg_stat_archiver_last_archived_time{namespace="db", job="db/pg", pod="pg-1"}'
+        values: '1000x20'
+      - series: 'cnp_pg_replication_in_recovery{namespace="db", job="db/pg", pod="pg-1"}'
+        values: '0x20'
+      - series: 'cnp_pg_stat_archiver_last_failed_time{namespace="db", job="db/pg", pod="pg-2"}'
+        values: '2000x20'
+      - series: 'cnp_pg_stat_archiver_last_archived_time{namespace="db", job="db/pg", pod="pg-2"}'
+        values: '1000x20'
+      - series: 'cnp_pg_replication_in_recovery{namespace="db", job="db/pg", pod="pg-2"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CNPWALArchivingFailing
+        exp_alerts:
+          - exp_labels: {severity: critical, component: edb-postgres, namespace: db, job: db/pg, pod: pg-1}
+            exp_annotations:
+              summary: "db/pg-1: WAL archiving failing"
+              description: "Last archive attempt failed and no success since. PITR is broken and pg_wal is filling up. Check object-store credentials/reachability."

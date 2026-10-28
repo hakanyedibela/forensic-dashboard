@@ -1,0 +1,151 @@
+# EDB Postgres for Kubernetes lab: S3 store (SeaweedFS), 2-instance cluster with
+# WAL archiving + hourly backups, PodMonitor. Applied by install-edb-lab.sh, which
+# creates the secrets (edb-s3-creds, seaweedfs-s3-config) first.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edb-lab
+---
+# ---------------------------------------------------------------- S3 object store
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seaweedfs-data
+  namespace: edb-lab
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs
+  namespace: edb-lab
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: seaweedfs } }
+  template:
+    metadata:
+      labels: { app: seaweedfs }
+    spec:
+      containers:
+        - name: seaweedfs
+          image: chrislusf/seaweedfs:4.48
+          args:
+            - server
+            - -dir=/data
+            - -ip.bind=0.0.0.0
+            - -master.volumeSizeLimitMB=256
+            - -volume.max=20
+            - -s3
+            - -s3.port=8333
+            - -s3.config=/etc/seaweedfs/s3.json
+          ports:
+            - { name: s3, containerPort: 8333 }
+            - { name: master, containerPort: 9333 }
+          readinessProbe:
+            tcpSocket: { port: s3 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: s3config, mountPath: /etc/seaweedfs, readOnly: true }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: seaweedfs-data }
+        - name: s3config
+          secret: { secretName: seaweedfs-s3-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs
+  namespace: edb-lab
+spec:
+  selector: { app: seaweedfs }
+  ports:
+    - { name: s3, port: 8333, targetPort: s3 }
+    - { name: master, port: 9333, targetPort: master }
+---
+# ---------------------------------------------------------------- Postgres cluster
+apiVersion: postgresql.k8s.enterprisedb.io/v1
+kind: Cluster
+metadata:
+  name: pg-lab
+  namespace: edb-lab
+spec:
+  instances: 2
+  imageName: quay.io/enterprisedb/postgresql:17
+  primaryUpdateStrategy: unsupervised
+  storage:
+    size: 2Gi
+    storageClass: local-path
+  walStorage:
+    size: 1Gi
+    storageClass: local-path
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+  postgresql:
+    parameters:
+      shared_buffers: 64MB
+      max_connections: "50"
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+  backup:
+    retentionPolicy: 3d
+    barmanObjectStore:
+      destinationPath: s3://edb-backups/
+      endpointURL: http://seaweedfs.edb-lab.svc:8333
+      s3Credentials:
+        accessKeyId: { name: edb-s3-creds, key: ACCESS_KEY_ID }
+        secretAccessKey: { name: edb-s3-creds, key: ACCESS_SECRET_KEY }
+      wal:
+        compression: gzip
+      data:
+        compression: gzip
+  # PodMonitor is created explicitly below (enablePodMonitor is deprecated).
+---
+apiVersion: postgresql.k8s.enterprisedb.io/v1
+kind: ScheduledBackup
+metadata:
+  name: pg-lab-hourly
+  namespace: edb-lab
+spec:
+  schedule: "0 0 * * * *"     # 6-field cron, seconds first: every hour
+  immediate: true
+  backupOwnerReference: self
+  cluster:
+    name: pg-lab
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  # Must NOT be named like the Cluster: with enablePodMonitor=false the operator
+  # deletes a PodMonitor called "pg-lab" on every reconcile (observed with 1.27.1).
+  name: pg-lab-metrics
+  namespace: edb-lab
+spec:
+  selector:
+    matchLabels:
+      k8s.enterprisedb.io/cluster: pg-lab
+  podMetricsEndpoints:
+    - port: metrics
+---
+# Operator metrics (kubebuilder / controller-runtime), per EDB docs.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: postgresql-operator-controller-manager
+  namespace: postgresql-operator-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloud-native-postgresql
+  podMetricsEndpoints:
+    - port: metrics

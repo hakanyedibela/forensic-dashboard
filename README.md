@@ -19,6 +19,8 @@ rke2-observability/
 │   ├── thanos-objstore.md          # object-store secret for Thanos (MinIO / S3 / GCS / Azure)
 │   ├── prometheusrules-custom.yaml # pod health + log error alerts
 │   ├── oom-alerts.yaml             # OOM-specific PrometheusRule
+│   ├── edb-postgres-alerts.yaml    # EDB Postgres for Kubernetes PrometheusRule (availability, replication, WAL, backup)
+│   ├── tests/                      # promtool unit tests for the EDB rules
 │   └── alertmanager-secrets.md     # how to create the secrets
 ├── dashboards/
 │   ├── dash-loki-logs.yaml         # Loki log overview dashboard
@@ -116,6 +118,73 @@ Or flip Grafana service to `NodePort` in `helm/values-kps.yaml` for LAN access.
 ## Configure alerting
 
 See `manifests/alertmanager-secrets.md` for Slack / Teams / SMTP setup.
+
+## EDB Postgres for Kubernetes
+
+Built from the operator's [monitoring docs](https://www.enterprisedb.com/docs/postgres_for_kubernetes/latest/monitoring/)
+(default metrics + sample `prometheusrule.yaml`).
+
+| File | Content |
+|---|---|
+| `dashboards/dashboard-edb.json` (uid `edb-pg-overview`) | Alerts, cluster health, per-instance table, connections, throughput, storage, replication, checkpoints/XID, backup summary |
+| `dashboards/dashboard-edb-backups.json` (uid `edb-pg-backups`) | Backup/WAL alerts, backup age, failed backups, PITR window, WAL archiving (German) |
+| `dashboards/dashboard-edb-alerts.json` (uid `edb-alert-center`) | Alert Center: Grafana as the alert sink for sites without mail/chat. Live inbox (with descriptions), active-alert table with "since" and a what-to-do hint per rule, history timeline, alert log for the selected range |
+| `manifests/edb-postgres-alerts.yaml` | 30 alerts, all labelled `component: edb-postgres` |
+
+Prerequisite: one `PodMonitor` per cluster (`selector.matchLabels: k8s.enterprisedb.io/cluster: <name>`, port `metrics`).
+Dashboards are scoped by `namespace` → `cluster` → `job`; the Alerts rows read the `ALERTS` series, so they stay
+empty until the PrometheusRule is deployed. Backup panels match `*_last_available_backup_timestamp`, which covers
+the deprecated `cnp_collector_*` metrics and the Barman Cloud plugin prefix without configuration.
+
+Backup thresholds assume a daily `ScheduledBackup` (warning 26 h, critical 50 h). Adjust in the rules and the
+stat-panel thresholds if your schedule differs.
+
+### Customer import
+
+`export/` holds a single-file bundle (`edb-grafana-bundle.json`: 3 dashboards + 30 alert rules), an API
+importer and UI-import fallbacks; see `export/README.md`. Regenerate after any dashboard or rule change:
+
+```bash
+python3 scripts/edb-dashboards/gen_dashboards.py dashboards && python3 scripts/edb-dashboards/export_bundle.py "$PWD"
+```
+
+### Local lab (kubeadm)
+
+`install-edb-lab.sh` sets up everything on a small cluster: kube-prometheus-stack with
+`helm/values-kps-lab.yaml`, EDB operator 1.27.1 from the public `quay.io/enterprisedb` mirror
+(implicit trial license; 1.30 needs a `docker.enterprisedb.com` token), a 2-instance cluster
+`edb-lab/pg-lab` with WAL archiving and hourly backups to SeaweedFS (MinIO no longer publishes
+community images), PodMonitors, the alert rules and both dashboards as sidecar ConfigMaps.
+S3 credentials are generated at install time and only exist as Secrets in the cluster.
+
+```bash
+KUBECONFIG=~/.kube/kubeadm_config ./install-edb-lab.sh
+```
+
+Observed on the lab, worth knowing elsewhere:
+- Do not name the PodMonitor like the Cluster: with `enablePodMonitor: false` the operator deletes it.
+- A fenced instance keeps reporting `cnp_collector_up 1`; `CNPFencingActive` catches it, `CNPInstanceDown` does not.
+- Fencing a standby during a standby backup kills `pg_backup_start` → `CNPLastBackupFailed` until the next good backup.
+- A Prometheus TSDB that once received samples from a far-future node clock rejects all new samples
+  (`prometheus_tsdb_out_of_bound_samples_total` climbing, every query empty). Only fix: new volume.
+
+Dashboards are generated; edit `scripts/edb-dashboards/gen_dashboards.py` (panels) and
+`scripts/edb-dashboards/tooltips.py` (all tooltip texts), not the JSON. `verify_static.py` fails if a panel,
+variable, link or table column has no tooltip. Table columns are explained in the table's panel tooltip,
+because Grafana 13 tables do not show field descriptions in the column header.
+
+```bash
+python3 scripts/edb-dashboards/gen_dashboards.py dashboards
+python3 scripts/edb-dashboards/verify_static.py "$PWD" scripts/edb-dashboards   # metric names, layout, vars, rule labels
+PROM_URL=http://localhost:9090 python3 scripts/edb-dashboards/verify_live.py dashboards/dashboard-edb*.json
+```
+
+```bash
+kubectl apply -f manifests/edb-postgres-alerts.yaml
+# Rule unit tests
+yq '.spec' manifests/edb-postgres-alerts.yaml > manifests/tests/edb-postgres-alerts.rules.yaml
+promtool test rules manifests/tests/edb-postgres-alerts.test.yaml
+```
 
 ## Long-term metrics with Thanos (opt-in)
 

@@ -1,0 +1,55 @@
+# Overlay for a small local kubeadm lab (3 nodes, ~2 GiB free RAM each).
+# Use together with values-kps.yaml:
+#   helm upgrade --install kps prometheus-community/kube-prometheus-stack -n monitoring \
+#     -f helm/values-kps.yaml -f helm/values-kps-lab.yaml
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    retentionSize: "20GB"
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits:   { memory: 1536Mi }
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: ["ReadWriteOnce"]
+          resources: { requests: { storage: 50Gi } }
+
+alertmanager:
+  alertmanagerSpec:
+    secrets: []          # no Slack/SMTP in the lab
+    resources:
+      requests: { cpu: 10m, memory: 32Mi }
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: "null"
+      group_by: ['alertname', 'namespace', 'severity']
+      routes: []
+    receivers:
+      - name: "null"
+    inhibit_rules:
+      - source_matchers: [ severity="critical" ]
+        target_matchers: [ severity="warning" ]
+        equal: [ alertname, namespace ]
+
+grafana:
+  persistence:
+    enabled: false       # dashboards come from ConfigMaps; avoids the init-chown-data crash on local-path
+  initChownData:
+    enabled: false
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+
+# kubeadm binds controller-manager, scheduler and etcd metrics to 127.0.0.1;
+# scraping them only produces TargetDown noise here.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false

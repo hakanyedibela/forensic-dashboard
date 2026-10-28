@@ -1,0 +1,1954 @@
+{
+  "uid": "edb-pg-backups",
+  "title": "EDB PostgreSQL — Backups",
+  "tags": [
+    "edb",
+    "postgres",
+    "cloudnative-pg",
+    "backup"
+  ],
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "refresh": "5m",
+  "timezone": "browser",
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "PostgreSQL restart",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "enable": true,
+        "iconColor": "purple",
+        "step": "60s",
+        "titleFormat": "Postmaster restart {{pod}}",
+        "expr": "changes(cnp_pg_postmaster_start_time{namespace=\"$namespace\", job=\"$job\"}[2m]) > 0"
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Cluster Overview",
+      "type": "link",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "url": "/d/edb-pg-overview?${__url_time_range}&var-datasource=${datasource}&var-namespace=${namespace}&var-cluster=${cluster}",
+      "keepTime": true,
+      "includeVars": false,
+      "tooltip": "Health, performance and replication of the same cluster."
+    },
+    {
+      "title": "Alert Center",
+      "type": "link",
+      "icon": "bolt",
+      "targetBlank": false,
+      "url": "/d/edb-alert-center?${__url_time_range}&var-datasource=${datasource}&var-namespace=${namespace}&var-cluster=${cluster}",
+      "keepTime": true,
+      "includeVars": false,
+      "tooltip": "All active and past alerts with descriptions and history."
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "options": [],
+        "refresh": 1,
+        "description": "Prometheus- (oder Thanos-Querier-) Datenquelle fuer alle Panels."
+      },
+      {
+        "name": "namespace",
+        "label": "Namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(cnp_collector_up, namespace)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "definition": "label_values(cnp_collector_up, namespace)",
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "current": {},
+        "options": [],
+        "description": "Kubernetes-Namespace des EDB-Clusters."
+      },
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(cnp_collector_up{namespace=\"$namespace\"}, cluster)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "definition": "label_values(cnp_collector_up{namespace=\"$namespace\"}, cluster)",
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "current": {},
+        "options": [],
+        "description": "EDB-Cluster-Ressource (Label 'cluster' von cnp_collector_up)."
+      },
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(cnp_collector_up{namespace=\"$namespace\", cluster=\"$cluster\"}, job)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "definition": "label_values(cnp_collector_up{namespace=\"$namespace\", cluster=\"$cluster\"}, job)",
+        "refresh": 2,
+        "sort": 1,
+        "hide": 2,
+        "includeAll": false,
+        "multi": false,
+        "current": {},
+        "options": [],
+        "description": "Scrape-Job des PodMonitors (<namespace>/<podmonitor>). Versteckt; folgt dem gewaehlten Cluster."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Alarme (Backup & WAL-Archivierung)",
+      "id": 1,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Kritisch (aktiv)",
+      "description": "Aus PrometheusRule edb-postgres-alerts (ALERTS-Serie). Leer = Regeln nicht deployed oder nichts aktiv.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "count(ALERTS{component=\"edb-postgres\", namespace=\"$namespace\", job=\"$job\", alertname=~\"CNP(Backup|LastBackup|NoBackup|WAL).*\", alertstate=\"firing\", severity=\"critical\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 2,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Warnungen (aktiv)",
+      "description": "Aus PrometheusRule edb-postgres-alerts (ALERTS-Serie). Leer = Regeln nicht deployed oder nichts aktiv.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "count(ALERTS{component=\"edb-postgres\", namespace=\"$namespace\", job=\"$job\", alertname=~\"CNP(Backup|LastBackup|NoBackup|WAL).*\", alertstate=\"firing\", severity=\"warning\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 3,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Pending",
+      "description": "Condition true, 'for' duration not yet elapsed.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "count(ALERTS{component=\"edb-postgres\", namespace=\"$namespace\", job=\"$job\", alertname=~\"CNP(Backup|LastBackup|NoBackup|WAL).*\", alertstate=\"pending\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 4,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "table",
+      "title": "Aktive Alarme",
+      "description": "Aus PrometheusRule edb-postgres-alerts (ALERTS-Serie). Leer = Regeln nicht deployed oder nichts aktiv.\n\n- **severity**: critical = sofort handeln, warning = zeitnah pruefen, info = keine Aktion.\n- **alertname**: Name der Prometheus-Regel (manifests/edb-postgres-alerts.yaml).\n- **pod**: Betroffene Instanz. Leer bei clusterweiten Alarmen (Backup, Primary-Wahl).\n- **datname**: Betroffene Datenbank, falls zutreffend.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "ALERTS{component=\"edb-postgres\", namespace=\"$namespace\", job=\"$job\", alertname=~\"CNP(Backup|LastBackup|NoBackup|WAL).*\"}",
+          "legendFormat": "",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "component": true,
+              "job": true,
+              "namespace": true,
+              "instance": true,
+              "endpoint": true,
+              "container": true,
+              "service": true,
+              "prometheus": true,
+              "alertstate": true,
+              "cluster": true,
+              "stats_reset": true,
+              "value": true
+            },
+            "indexByName": {
+              "severity": 0,
+              "alertname": 1,
+              "pod": 2,
+              "datname": 3
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "severity"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "text": "critical",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "text": "warning",
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "info": {
+                        "text": "info",
+                        "color": "blue",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "severity",
+            "desc": false
+          }
+        ]
+      },
+      "id": 5,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "state-timeline",
+      "title": "Alarm-Verlauf (firing)",
+      "description": "Aus PrometheusRule edb-postgres-alerts (ALERTS-Serie). Leer = Regeln nicht deployed oder nichts aktiv.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "max by (alertname, severity, pod) (ALERTS{component=\"edb-postgres\", namespace=\"$namespace\", job=\"$job\", alertname=~\"CNP(Backup|LastBackup|NoBackup|WAL).*\", alertstate=\"firing\"}) or on () label_replace(vector(0), \"alertname\", \"no alerts\", \"\", \"\")",
+          "legendFormat": "{{alertname}} {{pod}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "no alerts",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "firing",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "alignValue": "left",
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "id": 6,
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Backup-Status",
+      "id": 7,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Seit letztem Backup",
+      "description": "Alter des juengsten verfuegbaren Backups (Object Store oder Volume Snapshot). Annahme taegliches ScheduledBackup: gelb ab 26 h, rot ab 50 h (= Alarme CNPBackupTooOld / CNPBackupMissing).",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "time() - max({__name__=~\".+_last_available_backup_timestamp\", namespace=\"$namespace\", job=\"$job\"} > 0)",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 93600
+              },
+              {
+                "color": "red",
+                "value": 180000
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "kein Backup"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 8,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Letztes Backup fehlgeschlagen?",
+      "description": "JA = letzter Fehlversuch ist juenger als das letzte erfolgreiche Backup.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "max({__name__=~\".+_last_failed_backup_timestamp\", namespace=\"$namespace\", job=\"$job\"}) > bool max({__name__=~\".+_last_available_backup_timestamp\", namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "nein",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "JA",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "noValue": "n/a"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 9,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Restore-Fenster (PITR)",
+      "description": "Abstand zum fruehesten Wiederherstellungspunkt = wie weit zurueck PITR moeglich ist. Sollte etwa der retentionPolicy entsprechen.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "time() - min({__name__=~\".+_first_recoverability_point\", namespace=\"$namespace\", job=\"$job\"} > 0)",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "orange",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 86400
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "keins"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 10,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Letztes Backup",
+      "description": "Zeitpunkt des juengsten erfolgreichen Backups (Browser-Zeitzone).",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "max({__name__=~\".+_last_available_backup_timestamp\", namespace=\"$namespace\", job=\"$job\"} > 0) * 1000",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dateTimeAsIso",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "-"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 11,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Letzter Fehlversuch",
+      "description": "Zeitpunkt des letzten fehlgeschlagenen Backups. 'nie' = bisher kein Fehler. Aelter als 'Letztes Backup' = Fehler ist bereits ueberholt.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "max({__name__=~\".+_last_failed_backup_timestamp\", namespace=\"$namespace\", job=\"$job\"} > 0) * 1000",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dateTimeAsIso",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "nie"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 12,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Metrik-Quelle",
+      "description": "Gefundene *_last_available_backup_timestamp-Metriken: cnp_collector_* (in-core, deprecated) und/oder Barman-Cloud-Plugin. Keine = kein Backup konfiguriert oder Plugin-Sidecar nicht gescrapt.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "count by (__name__) ({__name__=~\".+_last_available_backup_timestamp\", namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "{{__name__}}",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "noValue": "keine Backup-Metriken"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "name",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 13,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "row",
+      "title": "WAL-Archivierung (Primary)",
+      "id": 14,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Archivierung fehlerhaft?",
+      "description": "JA = letzter archive_command-Fehler juenger als letzte erfolgreiche Archivierung (= Alarm CNPWALArchivingFailing).",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "max((cnp_pg_stat_archiver_last_failed_time{namespace=\"$namespace\", job=\"$job\"} - cnp_pg_stat_archiver_last_archived_time{namespace=\"$namespace\", job=\"$job\"}) > bool 1 and on (namespace, pod) cnp_pg_replication_in_recovery{namespace=\"$namespace\", job=\"$job\"} == 0)",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "nein",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "JA",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "noValue": "n/a"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 15,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 15
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Seit letzter WAL-Archivierung",
+      "description": "archive_timeout ist bei EDB/CNPG 5 min. Hohe Werte bei voellig idle DB sind normal.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "max(cnp_pg_stat_archiver_seconds_since_last_archival{namespace=\"$namespace\", job=\"$job\"} and on (namespace, pod) cnp_pg_replication_in_recovery{namespace=\"$namespace\", job=\"$job\"} == 0)",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 600
+              },
+              {
+                "color": "red",
+                "value": 3600
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 16,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 15
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "WAL wartet auf Archivierung",
+      "description": ".ready-Dateien in pg_wal/archive_status. Waechst die Zahl, kommt die Archivierung nicht hinterher oder schlaegt fehl.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "max(cnp_collector_pg_wal_archive_status{namespace=\"$namespace\", job=\"$job\", value=\"ready\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 17,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 15
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "WAL-Archivfehler (24 h)",
+      "description": "Fehlgeschlagene archive_command-Aufrufe in 24 h. Einzelne Fehler mit erfolgreichem Retry sind unkritisch; nur zusammen mit 'Archivierung fehlerhaft? = JA' ein Problem.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "sum(increase(cnp_pg_stat_archiver_failed_count{namespace=\"$namespace\", job=\"$job\"}[24h]))",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          },
+          "mappings": [],
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 18,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 15
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "pg_wal Belegung",
+      "description": "Volles pg_wal-Volume stoppt PostgreSQL. Typische Ursache: Archivierung defekt.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "max(cnp_collector_pg_wal{namespace=\"$namespace\", job=\"$job\", value=\"size\"} / ignoring (value) cnp_collector_pg_wal{namespace=\"$namespace\", job=\"$job\", value=\"volume_size\"})",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.8
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 19,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 15
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Archivierte Segmente (24 h)",
+      "description": "In 24 h ins Object Store geschriebene WAL-Segmente (je 16 MiB). Mass fuer WAL-Aufkommen und Speicherbedarf der Backups.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "sum(increase(cnp_pg_stat_archiver_archived_count{namespace=\"$namespace\", job=\"$job\"}[24h]))",
+          "legendFormat": "",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "wideLayout": true
+      },
+      "id": 20,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 15
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Verlauf",
+      "id": 21,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 19
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Alter des letzten Backups",
+      "description": "Saegezahn = gesund. Linie steigt ohne Reset = Backups laufen nicht.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "time() - max({__name__=~\".+_last_available_backup_timestamp\", namespace=\"$namespace\", job=\"$job\"} > 0)",
+          "legendFormat": "letztes erfolgreiches"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B",
+          "expr": "time() - max({__name__=~\".+_last_failed_backup_timestamp\", namespace=\"$namespace\", job=\"$job\"} > 0)",
+          "legendFormat": "letzter Fehlversuch"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 93600
+              },
+              {
+                "color": "red",
+                "value": 180000
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "letzter Fehlversuch"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 22,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Restore-Fenster",
+      "description": "Abstand zwischen fruehestem Wiederherstellungspunkt und jetzt. Faellt die Kurve, hat die retentionPolicy alte Backups geloescht; waechst sie unbegrenzt, greift keine Retention.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "time() - min({__name__=~\".+_first_recoverability_point\", namespace=\"$namespace\", job=\"$job\"} > 0)",
+          "legendFormat": "PITR-Fenster"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 23,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "WAL-Archivierung / h",
+      "description": "Archivierte (gruen) und fehlgeschlagene (rot) WAL-Segmente pro Stunde.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "sum(increase(cnp_pg_stat_archiver_archived_count{namespace=\"$namespace\", job=\"$job\"}[1h]))",
+          "legendFormat": "archiviert"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B",
+          "expr": "sum(increase(cnp_pg_stat_archiver_failed_count{namespace=\"$namespace\", job=\"$job\"}[1h]))",
+          "legendFormat": "fehlgeschlagen"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fehlgeschlagen"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 24,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "WAL archive_status (ready / done)",
+      "description": "ready = wartet auf Archivierung (Alarm ab 20), done = archiviert, wird beim naechsten Checkpoint aufgeraeumt.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "max by (value) (cnp_collector_pg_wal_archive_status{namespace=\"$namespace\", job=\"$job\"})",
+          "legendFormat": "{{value}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ready"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 25,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "pg_wal Belegung",
+      "description": "Groesse von pg_wal gegen die Groesse des WAL-Volumes (gestrichelt). Erreicht die Linie das Volume, stoppt PostgreSQL.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "A",
+          "expr": "max(cnp_collector_pg_wal{namespace=\"$namespace\", job=\"$job\", value=\"size\"})",
+          "legendFormat": "pg_wal"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "refId": "B",
+          "expr": "max(cnp_collector_pg_wal{namespace=\"$namespace\", job=\"$job\", value=\"volume_size\"})",
+          "legendFormat": "Volume"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Volume"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 26,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    }
+  ]
+}

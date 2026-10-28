@@ -1,0 +1,365 @@
+# Alerts for EDB Postgres for Kubernetes (EDB Postgres AI for CloudNativePG Cluster).
+#
+# Based on the operator's sample rules
+#   https://www.enterprisedb.com/docs/postgres_for_kubernetes/latest/monitoring/#auxiliary-resources
+#   (samples/monitoring/prometheusrule.yaml)
+# extended with availability, WAL-archiving and backup rules built on the
+# cnp_collector_* / default-monitoring metrics.
+#
+# Every rule keeps the namespace + job labels and sets component=edb-postgres,
+# which is what the "Alerts" rows in dashboard-edb*.json filter on.
+#
+# Deviations from the EDB sample, on purpose:
+#   - BackendsWaiting: the sample compares cnp_backends_waiting_total (a COUNT of
+#     lock-blocked backends) against 300 while describing it as "waiting longer
+#     than 5 minutes". Replaced by CNPBackendsBlockedOnLocks (>10 for 5m).
+#   - XID age and replication lag get an extra critical tier.
+#
+# OpenShift user-workload monitoring: drop metadata.namespace and the release
+# label, apply into the database namespace instead.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: edb-postgres-alerts
+  namespace: monitoring
+  labels:
+    release: kps
+spec:
+  groups:
+    - name: edb-postgres.availability
+      rules:
+        - alert: CNPInstanceDown
+          expr: cnp_collector_up == 0
+          for: 2m
+          labels:
+            severity: critical
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: PostgreSQL not responding"
+            description: "The instance manager cannot reach PostgreSQL on {{ $labels.pod }} (cluster {{ $labels.cluster }})."
+
+        - alert: CNPMetricsTargetDown
+          expr: up{container="postgres", endpoint="metrics"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: metrics endpoint unreachable"
+            description: "Prometheus cannot scrape port 9187 of {{ $labels.pod }}. Pod down, TLS mismatch on the PodMonitor, or NetworkPolicy."
+
+        - alert: CNPNoPrimary
+          expr: |
+            sum by (namespace, job) (1 - cnp_pg_replication_in_recovery) == 0
+            unless on (namespace, job) max by (namespace, job) (cnp_collector_replica_mode) == 1
+          for: 2m
+          labels:
+            severity: critical
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.job }}: no primary instance"
+            description: "All instances are in recovery and the cluster is not in replica mode. Writes are failing."
+
+        - alert: CNPMultiplePrimaries
+          expr: sum by (namespace, job) (1 - cnp_pg_replication_in_recovery) > 1
+          for: 2m
+          labels:
+            severity: critical
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.job }}: {{ $value }} instances report being primary"
+            description: "More than one instance is out of recovery (split brain). Check `kubectl cnp status`."
+
+        - alert: CNPFencingActive
+          expr: max by (namespace, job, pod) (cnp_collector_fencing_on) == 1
+          for: 5m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: instance fenced"
+            description: "Fencing is on; PostgreSQL on this instance is stopped. Remove the k8s.enterprisedb.io/fencedInstances annotation when done."
+
+        - alert: CNPManualSwitchoverRequired
+          expr: max by (namespace, job) (cnp_collector_manual_switchover_required) == 1
+          for: 5m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.job }}: manual switchover required"
+            description: "The operator needs a manual switchover to proceed (e.g. primaryUpdateStrategy: supervised)."
+
+        - alert: CNPNoHighAvailability
+          expr: |
+            max by (namespace, job) (cnp_collector_nodes_used) == 1
+            and on (namespace, job) count by (namespace, job) (cnp_collector_up) > 1
+          for: 30m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.job }}: all instances on one node"
+            description: "A single node failure takes down the whole cluster. Check pod anti-affinity."
+
+        - alert: CNPMetricsCollectionError
+          expr: cnp_collector_last_collection_error == 1
+          for: 10m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: monitoring query failing"
+            description: "At least one monitoring query errors. Dashboards/alerts based on it are blind. Check instance logs for 'cnp_metrics_exporter'."
+
+        - alert: CNPPostgresRestarted
+          expr: changes(cnp_pg_postmaster_start_time[15m]) > 0
+          labels:
+            severity: info
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: PostgreSQL restarted"
+            # Pod re-creation (rolling update) yields a new series (new instance IP) and is not caught here.
+            description: "Postmaster restarted inside the running pod in the last 15 minutes (crash recovery, config reload with restart, promotion)."
+
+    - name: edb-postgres.replication
+      rules:
+        - alert: CNPReplicationLag
+          expr: cnp_pg_replication_lag > 300
+          for: 1m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: replica {{ $value | humanizeDuration }} behind"
+            description: "Standby is lagging behind the primary by more than 5 minutes."
+
+        - alert: CNPReplicationLagCritical
+          expr: cnp_pg_replication_lag > 900
+          for: 5m
+          labels:
+            severity: critical
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: replica {{ $value | humanizeDuration }} behind"
+            description: "Standby is lagging behind the primary by more than 15 minutes. A failover now loses data."
+
+        - alert: CNPReplicaNotStreaming
+          expr: cnp_pg_replication_in_recovery > cnp_pg_replication_is_wal_receiver_up
+          for: 5m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: replica not streaming"
+            description: "Instance is in recovery but has no WAL receiver. Expected only on a replica cluster's designated primary restoring from object store."
+
+        - alert: CNPSyncReplicasDegraded
+          expr: |
+            cnp_collector_sync_replicas{value="observed"}
+            < ignoring (value) cnp_collector_sync_replicas{value="expected"}
+          for: 5m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: fewer synchronous replicas than requested"
+            description: "Synchronous replication is degraded. Depending on dataDurability, commits block or durability is reduced."
+
+        - alert: CNPReplicationSlotInactive
+          expr: |
+            cnp_pg_replication_slots_active == 0
+            and on (namespace, pod) cnp_pg_replication_in_recovery == 0
+          for: 30m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: replication slot {{ $labels.slot_name }} inactive"
+            description: "An inactive slot on the primary retains WAL indefinitely and will fill pg_wal."
+
+        - alert: CNPReplicationSlotWALRetention
+          # 5 GiB is a starting point; size it against your WAL volume.
+          expr: |
+            cnp_pg_replication_slots_pg_wal_lsn_diff > 5 * 1024 * 1024 * 1024
+            and on (namespace, pod) cnp_pg_replication_in_recovery == 0
+          for: 10m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: slot {{ $labels.slot_name }} retains {{ $value | humanize1024 }}B WAL"
+            description: "Slot consumer is far behind or gone."
+
+    - name: edb-postgres.database
+      rules:
+        - alert: CNPLongRunningTransaction
+          expr: |
+            max by (namespace, job, pod, datname, usename, application_name) (cnp_backends_max_tx_duration_seconds) > 300
+          for: 1m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: transaction open for {{ $value | humanizeDuration }}"
+            description: "db={{ $labels.datname }} user={{ $labels.usename }} app={{ $labels.application_name }}. Long transactions block vacuum."
+
+        - alert: CNPBackendsBlockedOnLocks
+          expr: cnp_backends_waiting_total > 10
+          for: 5m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: {{ $value }} backends blocked on locks"
+            description: "More than 10 backends have been waiting on locks held by other sessions for 5 minutes."
+
+        - alert: CNPConnectionsNearLimit
+          expr: |
+            sum by (namespace, job, pod) (cnp_backends_total)
+            / on (namespace, pod) max by (namespace, pod) (cnp_pg_settings_setting{name="max_connections"}) > 0.8
+          for: 5m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: {{ $value | humanizePercentage }} of max_connections used"
+            description: "New connections will be refused when the limit is reached. Consider a Pooler (PgBouncer)."
+
+        - alert: CNPConnectionsNearLimitCritical
+          expr: |
+            sum by (namespace, job, pod) (cnp_backends_total)
+            / on (namespace, pod) max by (namespace, pod) (cnp_pg_settings_setting{name="max_connections"}) > 0.95
+          for: 2m
+          labels:
+            severity: critical
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: {{ $value | humanizePercentage }} of max_connections used"
+            description: "Connections are about to be refused."
+
+        - alert: CNPXIDWraparoundRisk
+          expr: max by (namespace, job, datname) (cnp_pg_database_xid_age) > 300000000
+          for: 1m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.job }}: database {{ $labels.datname }} XID age {{ $value | humanize }}"
+            description: "Over 300M transactions since the oldest unfrozen XID. Check autovacuum and long transactions."
+
+        - alert: CNPXIDWraparoundCritical
+          expr: max by (namespace, job, datname) (cnp_pg_database_xid_age) > 1000000000
+          for: 5m
+          labels:
+            severity: critical
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.job }}: database {{ $labels.datname }} XID age {{ $value | humanize }}"
+            description: "Halfway to wraparound shutdown (~2.1B). Run VACUUM FREEZE now."
+
+        - alert: CNPDeadlocks
+          expr: increase(cnp_pg_stat_database_deadlocks[1h]) > 10
+          for: 1m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: {{ $value | humanize }} deadlocks/h in {{ $labels.datname }}"
+            description: "More than 10 deadlocks in the last hour."
+
+        - alert: CNPWALVolumeFillingUp
+          expr: |
+            cnp_collector_pg_wal{value="size"}
+            / ignoring (value) cnp_collector_pg_wal{value="volume_size"} > 0.8
+          for: 5m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: pg_wal {{ $value | humanizePercentage }} full"
+            description: "Usually failing WAL archiving or an inactive replication slot."
+
+        - alert: CNPWALVolumeFillingUpCritical
+          expr: |
+            cnp_collector_pg_wal{value="size"}
+            / ignoring (value) cnp_collector_pg_wal{value="volume_size"} > 0.9
+          for: 2m
+          labels:
+            severity: critical
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: pg_wal {{ $value | humanizePercentage }} full"
+            description: "PostgreSQL stops when pg_wal is full."
+
+    - name: edb-postgres.backup
+      rules:
+        - alert: CNPWALArchivingFailing
+          expr: |
+            (cnp_pg_stat_archiver_last_failed_time - cnp_pg_stat_archiver_last_archived_time) > 1
+            and on (namespace, pod) cnp_pg_replication_in_recovery == 0
+          for: 10m
+          labels:
+            severity: critical
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: WAL archiving failing"
+            description: "Last archive attempt failed and no success since. PITR is broken and pg_wal is filling up. Check object-store credentials/reachability."
+
+        - alert: CNPWALArchiveBacklog
+          expr: cnp_collector_pg_wal_archive_status{value="ready"} > 20
+          for: 15m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }}: {{ $value }} WAL segments waiting for archive"
+            description: "Archiving is not keeping up with WAL generation."
+
+        # Backup timestamps: the in-core metrics are cnp_collector_* (deprecated
+        # since 1.26); the Barman Cloud plugin exports its own prefix. The
+        # __name__ regex covers both; max() picks the newest.
+        - alert: CNPBackupTooOld
+          expr: |
+            time() - max by (namespace, job) ({__name__=~".+_last_available_backup_timestamp"} > 0) > 26 * 3600
+          for: 10m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.job }}: last backup {{ $value | humanizeDuration }} ago"
+            description: "No successful backup in 26h. Assumes a daily ScheduledBackup."
+
+        - alert: CNPBackupMissing
+          expr: |
+            time() - max by (namespace, job) ({__name__=~".+_last_available_backup_timestamp"} > 0) > 50 * 3600
+          for: 10m
+          labels:
+            severity: critical
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.job }}: last backup {{ $value | humanizeDuration }} ago"
+            description: "Two daily backups missed."
+
+        - alert: CNPLastBackupFailed
+          expr: |
+            max by (namespace, job) ({__name__=~".+_last_failed_backup_timestamp"})
+            > max by (namespace, job) ({__name__=~".+_last_available_backup_timestamp"})
+          for: 5m
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.job }}: most recent backup failed"
+            description: "The last failed backup is newer than the last successful one. `kubectl get backups -n {{ $labels.namespace }}`."
+
+        - alert: CNPNoBackupEver
+          expr: |
+            max by (namespace, job) ({__name__=~".+_last_available_backup_timestamp"}) == 0
+          for: 26h
+          labels:
+            severity: warning
+            component: edb-postgres
+          annotations:
+            summary: "{{ $labels.job }}: no backup has ever completed"
+            description: "Backup metrics exist but report no completed backup for 26h. Missing ScheduledBackup or broken object store."
