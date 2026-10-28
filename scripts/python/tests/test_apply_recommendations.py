@@ -315,3 +315,27 @@ def test_without_skip_failed_failure_still_fatal(apprec):
     rc = apprec.apply_manifest(_manifest([_patch_doc()]), runner=runner,
                                execute=True, skip_failed=False, out=io.StringIO())
     assert rc == 1
+
+
+def test_apply_report_shows_hpa_action_line(apprec, tmp_path):
+    doc = _patch_doc()
+    doc["hpa"] = {"name": "web-hpa", "min_replicas": 2, "max_replicas": 3,
+                  "current_replicas": 3, "target": "cpu=70%",
+                  "action": "INCREASE_MAX_REPLICAS"}
+    runner = _recording_runner([(0, "patched (dry run)", "")])
+    report = tmp_path / "apply-report.txt"
+    console = io.StringIO()
+    apprec.apply_manifest(_manifest([doc]), runner=runner, execute=False,
+                          out=console, report=str(report))
+    expected = ("hpa: web-hpa target=cpu=70% replicas=3/3 (min 2) "
+                "action=INCREASE_MAX_REPLICAS")
+    assert expected in console.getvalue()
+    assert expected in report.read_text()
+
+
+def test_apply_report_without_hpa_has_no_hpa_line(apprec, tmp_path):
+    runner = _recording_runner([(0, "patched (dry run)", "")])
+    report = tmp_path / "apply-report.txt"
+    apprec.apply_manifest(_manifest([_patch_doc()]), runner=runner,
+                          execute=False, out=io.StringIO(), report=str(report))
+    assert "hpa:" not in report.read_text()

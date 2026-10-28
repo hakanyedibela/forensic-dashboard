@@ -2715,3 +2715,330 @@ def test_parser_keep_empty_columns_flag(fcu):
 
 def test_legend_documents_dropped_columns(fcu):
     assert "--keep-empty-columns" in fcu.LEGEND_TEXT
+
+
+# --- HorizontalPodAutoscaler awareness --------------------------------------
+
+def _hpa_v2(name, kind, target, *, min_r=2, max_r=5, cur=3, desired=None,
+            metrics=None):
+    """autoscaling/v2 HPA object with the given scaleTargetRef and metrics."""
+    if metrics is None:
+        metrics = [{"type": "Resource", "resource": {
+            "name": "cpu", "target": {"type": "Utilization",
+                                      "averageUtilization": 70}}}]
+    return {
+        "metadata": {"name": name, "namespace": "ns1"},
+        "spec": {"scaleTargetRef": {"apiVersion": "apps/v1", "kind": kind,
+                                    "name": target},
+                 "minReplicas": min_r, "maxReplicas": max_r,
+                 "metrics": metrics},
+        "status": {"currentReplicas": cur,
+                   "desiredReplicas": cur if desired is None else desired},
+    }
+
+
+def test_parse_hpas_v2_keys_by_scale_target(fcu):
+    items = [_hpa_v2("web-hpa", "Deployment", "web", min_r=2, max_r=5, cur=3),
+             _hpa_v2("db-hpa", "StatefulSet", "db", min_r=1, max_r=3, cur=3)]
+    hpas = fcu.parse_hpas(items)
+    assert set(hpas) == {("Deployment", "web"), ("StatefulSet", "db")}
+    web = hpas[("Deployment", "web")]
+    assert web["name"] == "web-hpa"
+    assert (web["min_replicas"], web["max_replicas"]) == (2, 5)
+    assert (web["current_replicas"], web["desired_replicas"]) == (3, 3)
+    assert web["targets"] == [{"resource": "cpu", "type": "Utilization",
+                               "value": 70}]
+    assert web["at_max"] is False
+    assert hpas[("StatefulSet", "db")]["at_max"] is True
+
+
+def test_parse_hpas_v1_target_cpu_utilization(fcu):
+    item = {"metadata": {"name": "old-hpa", "namespace": "ns1"},
+            "spec": {"scaleTargetRef": {"kind": "Deployment", "name": "api"},
+                     "minReplicas": 1, "maxReplicas": 4,
+                     "targetCPUUtilizationPercentage": 60},
+            "status": {"currentReplicas": 1, "desiredReplicas": 1}}
+    hpas = fcu.parse_hpas([item])
+    assert hpas[("Deployment", "api")]["targets"] == [
+        {"resource": "cpu", "type": "Utilization", "value": 60}]
+
+
+def test_parse_hpas_non_resource_metrics_kept_as_other(fcu):
+    item = _hpa_v2("q-hpa", "Deployment", "worker", metrics=[
+        {"type": "External", "external": {"metric": {"name": "queue_depth"},
+                                          "target": {"type": "AverageValue",
+                                                     "averageValue": "10"}}},
+        {"type": "Resource", "resource": {
+            "name": "memory", "target": {"type": "AverageValue",
+                                         "averageValue": "500Mi"}}},
+    ])
+    hpa = fcu.parse_hpas([item])[("Deployment", "worker")]
+    assert hpa["targets"] == [
+        {"resource": "memory", "type": "AverageValue",
+         "value": 500 * 1024 ** 2}]
+    assert hpa["other_metrics"] == ["External:queue_depth"]
+
+
+def test_parse_hpas_skips_items_without_target(fcu):
+    assert fcu.parse_hpas([{"metadata": {"name": "x"}, "spec": {}}]) == {}
+
+
+def test_hpa_pinned_dims_only_for_utilization_targets(fcu):
+    cpu_util = fcu.parse_hpas([_hpa_v2("h", "Deployment", "w")])[("Deployment", "w")]
+    assert fcu.hpa_pinned_dims(cpu_util) == {"cpu"}
+    mem_util = fcu.parse_hpas([_hpa_v2("h", "Deployment", "w", metrics=[
+        {"type": "Resource", "resource": {
+            "name": "memory", "target": {"type": "Utilization",
+                                         "averageUtilization": 80}}}])])
+    assert fcu.hpa_pinned_dims(mem_util[("Deployment", "w")]) == {"mem"}
+    avg_val = fcu.parse_hpas([_hpa_v2("h", "Deployment", "w", metrics=[
+        {"type": "Resource", "resource": {
+            "name": "cpu", "target": {"type": "AverageValue",
+                                      "averageValue": "500m"}}}])])
+    assert fcu.hpa_pinned_dims(avg_val[("Deployment", "w")]) == set()
+    assert fcu.hpa_pinned_dims(None) == set()
+
+
+def test_compute_recommendation_hpa_pins_request_but_raises_limit(fcu):
+    hpa = fcu.parse_hpas([_hpa_v2("h", "Deployment", "w")])[("Deployment", "w")]
+    mi = 1024 * 1024
+    totals = {"cpu_peak": 0.9, "cpu_limit": 1.0, "cpu_request": 0.5,
+              "mem_peak": 95 * mi, "mem_limit": 100 * mi, "mem_request": 64 * mi}
+    rec = fcu.compute_recommendation(totals, target_util=80.0, hpa=hpa)
+    # cpu is hot, but the HPA scales on cpu utilisation (% of request):
+    # request stays untouched, only the limit gets burst headroom.
+    assert rec["cpu_request_rec"] is None
+    assert rec["cpu_limit_rec"] == pytest.approx(1.13, abs=1e-9)
+    # memory is not an HPA metric -> unchanged behaviour
+    assert rec["mem_request_rec"] == 95 * mi
+    assert rec["mem_limit_rec"] == 119 * mi
+
+
+def test_compute_recommendation_without_hpa_unchanged(fcu):
+    totals = {"cpu_peak": 0.9, "cpu_limit": 1.0}
+    assert (fcu.compute_recommendation(totals, 80.0, hpa=None)
+            == fcu.compute_recommendation(totals, 80.0))
+
+
+def test_hpa_action_states(fcu):
+    hot = {"cpu_request_rec": 0.9, "cpu_limit_rec": 1.13,
+           "mem_request_rec": None, "mem_limit_rec": None}
+    cold = {k: None for k in hot}
+    at_max = fcu.parse_hpas([_hpa_v2("h", "Deployment", "w", max_r=3, cur=3)])[
+        ("Deployment", "w")]
+    below_max = fcu.parse_hpas([_hpa_v2("h", "Deployment", "w", max_r=5, cur=3)])[
+        ("Deployment", "w")]
+    avg_val = fcu.parse_hpas([_hpa_v2("h", "Deployment", "w", max_r=5, cur=3,
+                                      metrics=[{"type": "Resource", "resource": {
+                                          "name": "cpu", "target": {
+                                              "type": "AverageValue",
+                                              "averageValue": "500m"}}}])])[
+        ("Deployment", "w")]
+    assert fcu.hpa_action(None, hot) == ""
+    assert fcu.hpa_action(at_max, hot) == "INCREASE_MAX_REPLICAS"
+    assert fcu.hpa_action(below_max, hot) == "LIMIT_ONLY"
+    assert fcu.hpa_action(avg_val, hot) == "OK"
+    assert fcu.hpa_action(at_max, cold) == "OK"
+
+
+def test_hpa_target_text(fcu):
+    hpa = fcu.parse_hpas([_hpa_v2("h", "Deployment", "w", metrics=[
+        {"type": "Resource", "resource": {
+            "name": "cpu", "target": {"type": "Utilization",
+                                      "averageUtilization": 70}}},
+        {"type": "Resource", "resource": {
+            "name": "memory", "target": {"type": "AverageValue",
+                                         "averageValue": "500Mi"}}},
+        {"type": "Pods", "pods": {"metric": {"name": "rps"},
+                                  "target": {"type": "AverageValue",
+                                             "averageValue": "100"}}},
+    ])])[("Deployment", "w")]
+    assert fcu.hpa_target_text(hpa) == "cpu=70%;memory=500Mi;Pods:rps"
+    assert fcu.hpa_target_text(None) == ""
+
+
+def test_cli_client_lists_hpas(fcu):
+    seen = []
+    client = fcu.CliK8sClient(binary="oc",
+                              run=lambda a: (seen.append(a) or '{"items": []}'))
+    client.list_horizontalpodautoscalers("ns1")
+    assert seen[0] == ["get", "horizontalpodautoscalers", "-n", "ns1",
+                       "-o", "json"]
+
+
+def test_rest_client_hpa_url(fcu):
+    seen = {}
+    client = fcu.RestK8sClient(host="https://k8s:6443", token="t",
+                               get_json=lambda u: seen.setdefault("url", u)
+                               and {"items": []})
+    client.list_horizontalpodautoscalers("ns1")
+    assert seen["url"] == ("https://k8s:6443/apis/autoscaling/v2"
+                           "/namespaces/ns1/horizontalpodautoscalers")
+
+
+class HpaFakeK8s(IdleFakeK8s):
+    def __init__(self, hpas=None, **kw):
+        super().__init__(**kw)
+        self._hpas = hpas or []
+
+    def list_horizontalpodautoscalers(self, namespace=None):
+        return self._hpas
+
+
+def _sts_pod(name, owner):
+    return {"metadata": {"name": name, "namespace": "ns1",
+                         "ownerReferences": [{"kind": "StatefulSet",
+                                              "name": owner,
+                                              "controller": True}]},
+            "spec": {"nodeName": "n1", "containers": [
+                {"name": "db", "resources": {
+                    "limits": {"cpu": "500m", "memory": "512Mi"}}}]},
+            "status": {"containerStatuses": []}}
+
+
+def test_collect_namespace_attaches_hpa_to_running_and_idle_workloads(fcu):
+    pods = [_sts_pod("db-0", "db")]
+    idle_deploy = _wl("Deployment", "web", containers=[{"name": "web"}])
+    hpas = [_hpa_v2("db-hpa", "StatefulSet", "db", max_r=3, cur=1),
+            _hpa_v2("web-hpa", "Deployment", "web", max_r=4, cur=0)]
+    node = fcu.collect_namespace(
+        HpaFakeK8s(pods=pods, deployments=[idle_deploy], hpas=hpas),
+        "ns1", thanos=None, window="24h", step="5m")
+    by = {(w["kind"], w["name"]): w for w in node["workloads"]}
+    assert by[("StatefulSet", "db")]["hpa"]["name"] == "db-hpa"
+    assert by[("Deployment", "web")]["idle"] is True
+    assert by[("Deployment", "web")]["hpa"]["name"] == "web-hpa"
+
+
+def test_collect_namespace_hpa_none_without_lister(fcu):
+    node = fcu.collect_namespace(
+        IdleFakeK8s(pods=[_sts_pod("db-0", "db")]),
+        "ns1", thanos=None, window="24h", step="5m")
+    assert node["workloads"][0]["hpa"] is None
+
+
+def _hpa_web_tree(fcu, *, max_r=5, cur=3, hpa_metrics=None):
+    """Hot-cpu Deployment/web carrying a cpu-utilisation HPA."""
+    tree = _hot_web_tree(fcu)
+    hpa = fcu.parse_hpas([_hpa_v2("web-hpa", "Deployment", "web", min_r=2,
+                                  max_r=max_r, cur=cur, metrics=hpa_metrics)])
+    tree[0]["workloads"][0]["hpa"] = hpa[("Deployment", "web")]
+    return tree
+
+
+def test_recommendation_rows_carry_hpa_columns(fcu):
+    rows = fcu.recommendation_rows(_hpa_web_tree(fcu), target_util=80.0)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["hpa_name"] == "web-hpa"
+    assert (r["hpa_min_replicas"], r["hpa_max_replicas"],
+            r["hpa_current_replicas"]) == (2, 5, 3)
+    assert r["hpa_target"] == "cpu=70%"
+    assert r["hpa_action"] == "LIMIT_ONLY"
+    # request pinned by the HPA, limit still recommended
+    assert r["cpu_request_rec"] is None
+    assert r["cpu_limit_rec"] == pytest.approx(1.13, abs=1e-9)
+    for col in ("hpa_name", "hpa_min_replicas", "hpa_max_replicas",
+                "hpa_current_replicas", "hpa_target", "hpa_action"):
+        assert col in fcu.REC_COLUMNS
+
+
+def test_recommendation_rows_hpa_at_max(fcu):
+    rows = fcu.recommendation_rows(_hpa_web_tree(fcu, max_r=3, cur=3), 80.0)
+    assert rows[0]["hpa_action"] == "INCREASE_MAX_REPLICAS"
+
+
+def test_recommendation_rows_without_hpa_blank(fcu):
+    rows = fcu.recommendation_rows(_hot_web_tree(fcu), 80.0)
+    assert rows[0]["hpa_name"] == "" and rows[0]["hpa_action"] == ""
+
+
+def test_recommendations_human_csv_hpa_cells_pass_through(fcu):
+    buf = io.StringIO()
+    fcu.render_recommendations_human_csv(_hpa_web_tree(fcu), buf, 80.0)
+    rows = list(_csv.DictReader(io.StringIO(buf.getvalue())))
+    assert rows[0]["hpa_target"] == "cpu=70%"
+    assert rows[0]["hpa_action"] == "LIMIT_ONLY"
+    # the pinned request is empty in every row -> column pruned entirely
+    assert "cpu_request_rec" not in rows[0]
+    assert rows[0]["cpu_limit_rec"] == "1.13c"
+
+
+def test_namespace_summary_uses_current_request_when_pinned(fcu):
+    tree = _hpa_web_tree(fcu)
+    summary = fcu.namespace_recommendation_summary(tree[0], 80.0)
+    # pinned cpu request stays at the configured 0.5, limit sums the rec
+    assert summary["cpu_request_rec_sum"] == pytest.approx(0.5)
+    assert summary["cpu_limit_rec_sum"] == pytest.approx(1.13, abs=1e-9)
+
+
+def test_workload_container_recommendations_respect_hpa(fcu):
+    wl = _hpa_web_tree(fcu)[0]["workloads"][0]
+    recs = fcu.workload_container_recommendations(wl, 80.0)
+    assert recs[0]["cpu_request_rec"] is None
+    assert recs[0]["cpu_limit_rec"] == pytest.approx(1.13, abs=1e-9)
+    assert recs[0]["hpa_pinned"] == {"cpu"}
+
+
+def test_build_apply_plan_hpa_pinned_patches_limit_only(fcu):
+    plan = fcu.build_apply_plan(_hpa_web_tree(fcu), 80.0)
+    assert len(plan["patches"]) == 1
+    p = plan["patches"][0]
+    res = p["patch"]["spec"]["template"]["spec"]["containers"][0]["resources"]
+    assert "requests" not in res
+    assert res["limits"] == {"cpu": "1130m"}
+    assert p["hpa"] == {"name": "web-hpa", "min_replicas": 2,
+                        "max_replicas": 5, "current_replicas": 3,
+                        "target": "cpu=70%", "action": "LIMIT_ONLY"}
+    assert "HPA-pinned" in p["summary_lines"][0]
+
+
+def test_build_apply_plan_without_hpa_has_none(fcu):
+    plan = fcu.build_apply_plan(_hot_web_tree(fcu), 80.0)
+    assert plan["patches"][0]["hpa"] is None
+    assert "HPA" not in plan["patches"][0]["summary_lines"][0]
+
+
+def test_apply_yaml_and_json_carry_hpa(fcu):
+    yaml = pytest.importorskip("yaml")
+    tree = _hpa_web_tree(fcu, max_r=3, cur=3)
+    buf = io.StringIO()
+    fcu.render_recommendations_apply_yaml(tree, buf, 80.0)
+    text = buf.getvalue()
+    assert "#   hpa: web-hpa target=cpu=70% replicas=3/3 (min 2) " \
+           "action=INCREASE_MAX_REPLICAS" in text
+    docs = [d for d in yaml.safe_load_all(text) if d]
+    res = docs[0]["patch"]["spec"]["template"]["spec"]["containers"][0]["resources"]
+    assert "requests" not in res and res["limits"]["cpu"] == "1130m"
+    buf = io.StringIO()
+    fcu.render_recommendations_apply_json(tree, buf, 80.0)
+    obj = json.loads(buf.getvalue())
+    assert obj["patches"][0]["hpa"]["action"] == "INCREASE_MAX_REPLICAS"
+
+
+def test_render_text_marks_hpa_workloads(fcu):
+    tree = _hpa_web_tree(fcu)
+    tree[0]["totals"].update(pod_count=1, container_count=1, oom_count=0)
+    buf = io.StringIO()
+    fcu.render_text(tree, buf, levels=("workload",))
+    assert "Deployment/web  (hpa: web-hpa 2-5, now 3)" in buf.getvalue()
+
+
+def test_rest_client_hpa_falls_back_to_v1_on_404(fcu):
+    import urllib.error
+    seen = []
+
+    def fake_get(url):
+        seen.append(url)
+        if "/autoscaling/v2/" in url:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        return {"items": [{"metadata": {"name": "old"}}]}
+
+    client = fcu.RestK8sClient(host="https://k8s:6443", token="t",
+                               get_json=fake_get)
+    items = client.list_horizontalpodautoscalers("ns1")
+    assert items == [{"metadata": {"name": "old"}}]
+    assert seen == ["https://k8s:6443/apis/autoscaling/v2/namespaces/ns1"
+                    "/horizontalpodautoscalers",
+                    "https://k8s:6443/apis/autoscaling/v1/namespaces/ns1"
+                    "/horizontalpodautoscalers"]

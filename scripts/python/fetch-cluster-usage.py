@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -234,6 +235,120 @@ def rollup(leaves):
     return agg
 
 
+# ------------------------------------------------- HorizontalPodAutoscaler
+
+# HPA resource metric name -> our dimension prefix.
+_HPA_DIM = {"cpu": "cpu", "memory": "mem"}
+
+
+def _hpa_resource_target(name, target):
+    """One parsed Resource target: Utilization keeps the percentage,
+    AverageValue is parsed into cores/bytes."""
+    ttype = target.get("type") or (
+        "Utilization" if target.get("averageUtilization") is not None
+        else "AverageValue")
+    if ttype == "Utilization":
+        value = target.get("averageUtilization")
+    else:
+        raw = target.get("averageValue")
+        value = parse_cpu(raw) if name == "cpu" else parse_mem(raw)
+    return {"resource": name, "type": ttype, "value": value}
+
+
+def parse_hpas(items):
+    """{(target_kind, target_name): info} for every HorizontalPodAutoscaler.
+    Handles autoscaling/v2 (spec.metrics) and v1 (targetCPUUtilizationPercentage).
+    info: name, min/max/current/desired replicas, targets (Resource metrics
+    only, parsed), other_metrics (Pods/Object/External as 'Type:name'), and
+    at_max (currently scaled to maxReplicas — no room left to scale out)."""
+    out = {}
+    for item in items or []:
+        spec = item.get("spec", {}) or {}
+        ref = spec.get("scaleTargetRef") or {}
+        kind, name = ref.get("kind"), ref.get("name")
+        if not kind or not name:
+            continue
+        targets, other = [], []
+        for m in spec.get("metrics", []) or []:
+            mtype = m.get("type")
+            if mtype == "Resource":
+                res = m.get("resource") or {}
+                if res.get("name") in _HPA_DIM:
+                    targets.append(_hpa_resource_target(
+                        res["name"], res.get("target") or {}))
+                continue
+            body = m.get((mtype or "").lower()) or {}
+            mname = (body.get("metric") or {}).get("name") or ""
+            other.append(f"{mtype}:{mname}")
+        v1_cpu = spec.get("targetCPUUtilizationPercentage")
+        if v1_cpu is not None and not targets:
+            targets.append({"resource": "cpu", "type": "Utilization",
+                            "value": v1_cpu})
+        status = item.get("status", {}) or {}
+        max_r = spec.get("maxReplicas")
+        cur = status.get("currentReplicas")
+        out[(kind, name)] = {
+            "name": item.get("metadata", {}).get("name", ""),
+            "min_replicas": spec.get("minReplicas", 1),
+            "max_replicas": max_r,
+            "current_replicas": cur,
+            "desired_replicas": status.get("desiredReplicas"),
+            "targets": targets,
+            "other_metrics": other,
+            "at_max": (max_r is not None and cur is not None and cur >= max_r),
+        }
+    return out
+
+
+def hpa_pinned_dims(hpa):
+    """Dimensions ('cpu'/'mem') whose *requests* the HPA scales on
+    (Resource target type Utilization = usage as a percentage of the request).
+    Changing those requests changes the scaling behaviour, so recommendations
+    leave them alone. Empty for no HPA / AverageValue-only targets."""
+    if not hpa:
+        return set()
+    return {_HPA_DIM[t["resource"]] for t in hpa.get("targets", [])
+            if t.get("type") == "Utilization"}
+
+
+def hpa_target_text(hpa):
+    """Compact 'cpu=70%;memory=500Mi;Pods:rps' rendering of an HPA's metrics
+    for CSV/summary cells. '' without HPA."""
+    if not hpa:
+        return ""
+    parts = []
+    for t in hpa.get("targets", []):
+        if t["type"] == "Utilization":
+            parts.append(f"{t['resource']}={t['value']}%")
+        else:
+            fmt = cpu_quantity if t["resource"] == "cpu" else mem_quantity
+            val = "-" if t["value"] is None else fmt(t["value"])
+            parts.append(f"{t['resource']}={val}")
+    parts.extend(hpa.get("other_metrics", []))
+    return ";".join(parts)
+
+
+def hpa_action(hpa, rec):
+    """What the HPA means for a hot workload's recommendation `rec`:
+    ''                     — no HPA on this workload
+    'OK'                   — HPA present, nothing hot or nothing pinned
+    'INCREASE_MAX_REPLICAS'— hot while already at maxReplicas: the HPA cannot
+                             scale out further; raise maxReplicas (a limit bump
+                             alone only buys burst headroom)
+    'LIMIT_ONLY'           — hot on a dimension the HPA scales on: request is
+                             pinned, only the limit is recommended"""
+    if not hpa:
+        return ""
+    hot_dims = {d for d in ("cpu", "mem") if rec.get(f"{d}_limit_rec") is not None}
+    if not hot_dims:
+        return "OK"
+    if hpa.get("at_max"):
+        return "INCREASE_MAX_REPLICAS"
+    if hot_dims & hpa_pinned_dims(hpa):
+        return "LIMIT_ONLY"
+    return "OK"
+
+
 def _qualifies(peak, current_limit, frac):
     """A resource qualifies for a recommendation when it has no current limit
     (unbounded -> always) or its peak exceeds `frac` of the current limit.
@@ -243,27 +358,35 @@ def _qualifies(peak, current_limit, frac):
     return peak > frac * current_limit
 
 
-def compute_recommendation(totals, target_util=80.0):
+def compute_recommendation(totals, target_util=80.0, hpa=None):
     """Recommended request/limit for one workload's `totals`, restricted to
     'hot' resources. request = round_up(peak); limit = round_up(peak / frac)
     where frac = target_util/100. Returns a dict with keys cpu_request_rec,
     cpu_limit_rec, mem_request_rec, mem_limit_rec — each None when that resource
-    has no peak or is not hot."""
+    has no peak or is not hot.
+
+    `hpa` (parse_hpas entry or None): when the HPA scales on a resource's
+    *utilisation* (usage as % of request), raising that request would silently
+    change the scaling behaviour, so the request is pinned (request_rec stays
+    None = untouched) and only the limit gets burst headroom."""
     if not 0.0 < target_util <= 100.0:
         raise ValueError(
             f"target_util must be in (0, 100], got {target_util!r}")
     frac = target_util / 100.0
+    pinned = hpa_pinned_dims(hpa)
     rec = {"cpu_request_rec": None, "cpu_limit_rec": None,
            "mem_request_rec": None, "mem_limit_rec": None}
 
     cpu_peak = totals.get("cpu_peak")
     if cpu_peak is not None and _qualifies(cpu_peak, totals.get("cpu_limit"), frac):
-        rec["cpu_request_rec"] = round_up_cpu_10m(cpu_peak)
+        if "cpu" not in pinned:
+            rec["cpu_request_rec"] = round_up_cpu_10m(cpu_peak)
         rec["cpu_limit_rec"] = round_up_cpu_10m(cpu_peak / frac)
 
     mem_peak = totals.get("mem_peak")
     if mem_peak is not None and _qualifies(mem_peak, totals.get("mem_limit"), frac):
-        rec["mem_request_rec"] = round_up_mem_mi(mem_peak)
+        if "mem" not in pinned:
+            rec["mem_request_rec"] = round_up_mem_mi(mem_peak)
         rec["mem_limit_rec"] = round_up_mem_mi(mem_peak / frac)
     return rec
 
@@ -291,7 +414,7 @@ def namespace_recommendation_summary(node, target_util=80.0):
     an overall quota_action (INCREASE_QUOTA if any dimension EXCEEDS, else OK)."""
     collected = {base: [] for base in _REC_BASES}
     for wl in node["workloads"]:
-        rec = compute_recommendation(wl["totals"], target_util)
+        rec = compute_recommendation(wl["totals"], target_util, wl.get("hpa"))
         for base, rkey in _REC_BASES.items():
             val = rec[rkey]
             if val is None:
@@ -821,6 +944,8 @@ _RESOURCES = {
     "deployments":  ("deployments",  "/apis/apps/v1",  True),
     "statefulsets": ("statefulsets", "/apis/apps/v1",  True),
     "daemonsets":   ("daemonsets",   "/apis/apps/v1",  True),
+    "horizontalpodautoscalers": ("horizontalpodautoscalers",
+                                 "/apis/autoscaling/v2", True),
     "storageclasses": ("storageclasses", "/apis/storage.k8s.io/v1", False),
     "namespaces":   ("namespaces",   "/api/v1",        False),
     # OpenShift: listing projects returns what the caller can see and doesn't
@@ -892,6 +1017,9 @@ class CliK8sClient:
     def list_daemonsets(self, namespace=None):
         return self._list("daemonsets", namespace)
 
+    def list_horizontalpodautoscalers(self, namespace=None):
+        return self._list("horizontalpodautoscalers", namespace)
+
 
 class RestK8sClient:
     """In-cluster backend talking to the API server over HTTPS. `get_json(url)`
@@ -951,6 +1079,19 @@ class RestK8sClient:
 
     def list_daemonsets(self, namespace=None):
         return self._list("daemonsets", namespace)
+
+    def list_horizontalpodautoscalers(self, namespace=None):
+        # autoscaling/v2 is GA since k8s 1.23; older API servers only serve
+        # v1 (cpu-utilisation only), which parse_hpas also understands.
+        try:
+            return self._list("horizontalpodautoscalers", namespace)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            url = self._url("horizontalpodautoscalers", namespace).replace(
+                "/apis/autoscaling/v2/", "/apis/autoscaling/v1/")
+            payload = self._get(url)
+            return payload.get("items", []) if isinstance(payload, dict) else []
 
 
 # ----------------------------------------------------------- thanos client
@@ -1256,6 +1397,14 @@ def collect_namespace(fcu_k8s, namespace, thanos, window, step,
         if idle:
             node["workloads"] = sorted(node["workloads"] + idle,
                                        key=lambda w: (w["kind"], w["name"]))
+    # HorizontalPodAutoscalers, matched to their scaleTargetRef (kind, name).
+    # Recommendations consult wl["hpa"]: utilisation-targeted requests are
+    # pinned and at-maxReplicas workloads get INCREASE_MAX_REPLICAS. None when
+    # the workload has no HPA or the client cannot list them.
+    hpa_lister = getattr(fcu_k8s, "list_horizontalpodautoscalers", None)
+    hpas = parse_hpas(hpa_lister(namespace) if hpa_lister else [])
+    for wl in node["workloads"]:
+        wl["hpa"] = hpas.get((wl["kind"], wl["name"]))
     return node
 
 
@@ -1634,6 +1783,15 @@ REC_FIELDS = [
     ("mem_limit_cur_bytes", "mem_limit"),
     ("mem_request_rec_bytes", "mem_request_rec"),
     ("mem_limit_rec_bytes", "mem_limit_rec"),
+    # HorizontalPodAutoscaler on the workload (blank without one). hpa_action:
+    # LIMIT_ONLY = request pinned by a utilisation target, only the limit is
+    # recommended; INCREASE_MAX_REPLICAS = hot while already at maxReplicas.
+    ("hpa_name", "hpa_name"),
+    ("hpa_min_replicas", "hpa_min_replicas"),
+    ("hpa_max_replicas", "hpa_max_replicas"),
+    ("hpa_current_replicas", "hpa_current_replicas"),
+    ("hpa_target", "hpa_target"),
+    ("hpa_action", "hpa_action"),
 ]
 REC_COLUMNS = [h for h, _ in REC_FIELDS]
 REC_HUMAN_COLUMNS = [_human_header(h) for h, _ in REC_FIELDS]
@@ -1660,7 +1818,8 @@ def recommendation_rows(trees, target_util=80.0):
     rows = []
     for node in sorted(trees, key=lambda n: (n["stage"], n["namespace"])):
         for wl in node["workloads"]:
-            rec = compute_recommendation(wl["totals"], target_util)
+            hpa = wl.get("hpa")
+            rec = compute_recommendation(wl["totals"], target_util, hpa)
             if all(v is None for v in rec.values()):
                 continue
             t = wl["totals"]
@@ -1677,8 +1836,22 @@ def recommendation_rows(trees, target_util=80.0):
                 "mem_limit": t.get("mem_limit"),
                 "mem_request_rec": rec["mem_request_rec"],
                 "mem_limit_rec": rec["mem_limit_rec"],
+                **_hpa_cells(hpa, rec),
             })
     return rows
+
+
+def _hpa_cells(hpa, rec):
+    """The hpa_* recommendation columns for one workload ('' without HPA)."""
+    if not hpa:
+        return {"hpa_name": "", "hpa_min_replicas": "", "hpa_max_replicas": "",
+                "hpa_current_replicas": "", "hpa_target": "", "hpa_action": ""}
+    return {"hpa_name": hpa["name"],
+            "hpa_min_replicas": hpa["min_replicas"],
+            "hpa_max_replicas": hpa["max_replicas"],
+            "hpa_current_replicas": hpa["current_replicas"],
+            "hpa_target": hpa_target_text(hpa),
+            "hpa_action": hpa_action(hpa, rec)}
 
 
 def render_recommendations_csv(trees, stream, target_util=80.0):
@@ -1745,6 +1918,7 @@ def workload_container_recommendations(wl, target_util=80.0):
     for pod in wl.get("pods", []) or []:
         for c in pod.get("containers", []) or []:
             by_name.setdefault(c["container"], []).append(c)
+    hpa = wl.get("hpa")
     out = []
     for name in sorted(by_name):
         leaves = by_name[name]
@@ -1754,9 +1928,10 @@ def workload_container_recommendations(wl, target_util=80.0):
             "cpu_limit": _opt_first(l.get("cpu_limit") for l in leaves),
             "mem_limit": _opt_first(l.get("mem_limit") for l in leaves),
         }
-        rec = compute_recommendation(totals, target_util)
+        rec = compute_recommendation(totals, target_util, hpa)
         out.append({
             "container": name,
+            "hpa_pinned": hpa_pinned_dims(hpa),
             "cpu_request_cur": _opt_first(l.get("cpu_request") for l in leaves),
             "cpu_limit_cur": totals["cpu_limit"],
             "mem_request_cur": _opt_first(l.get("mem_request") for l in leaves),
@@ -1774,15 +1949,17 @@ def _has_recommendation(c):
 
 def _container_patch_resources(c):
     """Strategic-merge `resources` body for one container: only the hot
-    dimensions, each with both requests and limits (compute_recommendation
-    always pairs them). Cold dimensions are omitted so the merge preserves the
-    live object's untouched keys."""
+    dimensions. Request and limit come together unless the HPA pins the
+    request (request_rec None): then only the limit is set. Cold dimensions
+    are omitted so the merge preserves the live object's untouched keys."""
     req, lim = {}, {}
     if c["cpu_limit_rec"] is not None:      # cpu hot
-        req["cpu"] = cpu_quantity(c["cpu_request_rec"])
+        if c["cpu_request_rec"] is not None:
+            req["cpu"] = cpu_quantity(c["cpu_request_rec"])
         lim["cpu"] = cpu_quantity(c["cpu_limit_rec"])
     if c["mem_limit_rec"] is not None:      # mem hot
-        req["memory"] = mem_quantity(c["mem_request_rec"])
+        if c["mem_request_rec"] is not None:
+            req["memory"] = mem_quantity(c["mem_request_rec"])
         lim["memory"] = mem_quantity(c["mem_limit_rec"])
     res = {}
     if req:
@@ -1792,20 +1969,23 @@ def _container_patch_resources(c):
     return res
 
 
-def _summary_cell(kind, cur, rec):
+def _summary_cell(kind, cur, rec, pinned=False):
     fmt = cpu_quantity if kind == "cpu" else mem_quantity
     cur_s = "-" if cur is None else fmt(cur)
     new = rec if rec is not None else cur
     new_s = "-" if new is None else fmt(new)
-    return f"{cur_s}→{new_s}"
+    return f"{cur_s}→{new_s}" + (" (HPA-pinned)" if pinned else "")
 
 
 def _container_summary_line(c):
     """One human old->new line per container, e.g.
-    `web: cpu req 500m->900m, lim 1000m->1130m | mem req 64Mi->64Mi, lim ...`."""
-    cpu = (f"cpu req {_summary_cell('cpu', c['cpu_request_cur'], c['cpu_request_rec'])}"
+    `web: cpu req 500m->900m, lim 1000m->1130m | mem req 64Mi->64Mi, lim ...`.
+    A request the HPA scales on is tagged `(HPA-pinned)` when its dimension is
+    hot (the limit moves, the request does not)."""
+    pinned = c.get("hpa_pinned") or set()
+    cpu = (f"cpu req {_summary_cell('cpu', c['cpu_request_cur'], c['cpu_request_rec'], 'cpu' in pinned and c['cpu_limit_rec'] is not None)}"
            f", lim {_summary_cell('cpu', c['cpu_limit_cur'], c['cpu_limit_rec'])}")
-    mem = (f"mem req {_summary_cell('mem', c['mem_request_cur'], c['mem_request_rec'])}"
+    mem = (f"mem req {_summary_cell('mem', c['mem_request_cur'], c['mem_request_rec'], 'mem' in pinned and c['mem_limit_rec'] is not None)}"
            f", lim {_summary_cell('mem', c['mem_limit_cur'], c['mem_limit_rec'])}")
     return f"{c['container']}: {cpu} | {mem}"
 
@@ -1817,6 +1997,23 @@ def _exceeds_reason(base, summary):
     fmt = cpu_quantity if base.startswith("cpu") else mem_quantity
     return (f"{base} sum {fmt(summary[base + '_rec_sum'])} "
             f"> quota {fmt(summary[base + '_quota'])}")
+
+
+def _patch_hpa(hpa, hot_containers):
+    """HPA block for one apply patch (None without HPA): identity, replica
+    bounds, metric targets and the action derived from the hot containers
+    (any container hot on a dimension -> workload hot on it)."""
+    if not hpa:
+        return None
+    merged = {k: None for k in ("cpu_limit_rec", "mem_limit_rec")}
+    for c in hot_containers:
+        for k in merged:
+            if c.get(k) is not None:
+                merged[k] = c[k]
+    return {"name": hpa["name"], "min_replicas": hpa["min_replicas"],
+            "max_replicas": hpa["max_replicas"],
+            "current_replicas": hpa["current_replicas"],
+            "target": hpa_target_text(hpa), "action": hpa_action(hpa, merged)}
 
 
 def build_apply_plan(trees, target_util=80.0):
@@ -1845,6 +2042,7 @@ def build_apply_plan(trees, target_util=80.0):
             plan["patches"].append({
                 "stage": node["stage"], "namespace": node["namespace"],
                 "kind": wl["kind"], "name": wl["name"],
+                "hpa": _patch_hpa(wl.get("hpa"), hot),
                 "summary_lines": [_container_summary_line(c) for c in hot],
                 "patch": {"spec": {"template": {"spec":
                                                 {"containers": containers}}}},
@@ -1880,6 +2078,11 @@ def render_recommendations_apply_yaml(trees, stream, target_util=80.0):
     for p in plan["patches"]:
         w("---\n")
         w(f"# {p['namespace']} / {p['kind']} {p['name']}\n")
+        if p.get("hpa"):
+            h = p["hpa"]
+            w(f"#   hpa: {h['name']} target={h['target']} "
+              f"replicas={h['current_replicas']}/{h['max_replicas']} "
+              f"(min {h['min_replicas']}) action={h['action']}\n")
         for line in p["summary_lines"]:
             w(f"#   {line}\n")
         w("apiVersion: forensic-dashboards/v1\n")
@@ -1912,7 +2115,7 @@ def render_recommendations_apply_json(trees, stream, target_util=80.0):
         "target_util": target_util,
         "skipped": plan["skipped"],
         "patches": [{"namespace": p["namespace"], "stage": p["stage"],
-                     "kind": p["kind"], "name": p["name"],
+                     "kind": p["kind"], "name": p["name"], "hpa": p["hpa"],
                      "summary": p["summary_lines"], "patch": p["patch"]}
                     for p in plan["patches"]],
     }
@@ -2088,7 +2291,7 @@ Erzeugt von scripts/python/fetch-cluster-usage.py.
 - `resources-human.csv` — dieselben Zeilen wie `resources.csv`, aber jeder Wert mit Einheit (z. B. `200m`, `6.3Mi`, `4.9%`) statt Rohzahl; CPU-Mikrowerte als `µ` (z. B. `0.525µ`).
 - `namespaces.csv` — kompakte Übersicht: genau eine Zeile pro Namespace (Summe: verbraucht vs. limitiert), ohne Workload-/Pod-/Container-Details.
 - `namespaces-human.csv` — dieselben Zeilen wie `namespaces.csv`, aber jeder Wert mit Einheit (z. B. `200m`, `6.3Mi`, `4.9%`) statt Rohzahl.
-- `recommendations.csv` — Empfehlung zum Right-Sizing: eine Zeile pro **heißem** Workload (Spitze nahe/über dem Limit), aktuelle Werte neben den empfohlenen. Rohzahlen.
+- `recommendations.csv` — Empfehlung zum Right-Sizing: eine Zeile pro **heißem** Workload (Spitze nahe/über dem Limit), aktuelle Werte neben den empfohlenen, plus HPA-Kontext (`hpa_*`-Spalten). Rohzahlen.
 - `recommendations-human.csv` — dieselben Zeilen wie `recommendations.csv`, aber jeder Wert mit Einheit (z. B. `200m`, `1.13c`, `6.3Mi`) statt Rohzahl.
 - `recommendations-apply.yaml` — anwendbares Patch-Manifest: ein `ResourcePatch`-Dokument pro **heißem** Workload, das die empfohlenen `requests`/`limits` pro Container als Strategic-Merge-Patch setzt. Namespaces, deren Summe das ResourceQuota überschreiten würde (`quota_action=INCREASE_QUOTA`), werden **übersprungen** und im `SKIPPED`-Kopfblock genannt (Quota zuerst manuell erhöhen). Zum menschlichen Review gedacht.
 - `recommendations-apply.json` — maschinenlesbares Pendant zu `recommendations-apply.yaml` (dieselben Patches), das `apply-recommendations.py` mit der Python-Standardbibliothek liest (kein YAML-Paket nötig).
@@ -2202,6 +2405,21 @@ Empfehlung pro Dimension: `request = aufgerundet(Spitze)`,
     — die **empfohlenen** Werte (`rec`). Leer, wenn diese Dimension nicht heiß ist
       (also keine Änderung nötig). `cur` und `rec` stehen nebeneinander, damit
       alt-vs-neu in einer Zeile vergleichbar ist.
+- `hpa_name`, `hpa_min_replicas`, `hpa_max_replicas`, `hpa_current_replicas`,
+  `hpa_target` — der HorizontalPodAutoscaler des Workloads (leer ohne HPA).
+  `hpa_target` listet die Metriken, z. B. `cpu=70%` (Auslastung in % des
+  Requests), `memory=500Mi` (Absolutwert) oder `Pods:rps` (Custom-Metrik).
+- `hpa_action` — was der HPA für die Empfehlung bedeutet:
+    - leer: kein HPA.
+    - `OK`: HPA vorhanden, beeinflusst die Empfehlung nicht.
+    - `LIMIT_ONLY`: der HPA skaliert über die **Auslastung** dieser Dimension
+      (Verbrauch ÷ Request). Ein höherer Request würde die Auslastung senken
+      und den HPA zum Herunterskalieren bringen — deshalb bleibt der Request
+      **unverändert** (`*_request_rec` leer) und nur das Limit bekommt Luft.
+    - `INCREASE_MAX_REPLICAS`: der Workload ist heiß, obwohl der HPA schon auf
+      `maxReplicas` steht — er kann nicht weiter ausskalieren. Das Limit wird
+      trotzdem empfohlen (Burst-Reserve), die eigentliche Abhilfe ist ein
+      höheres `maxReplicas` (manuell; das Skript patcht keine HPAs).
 In `recommendations-human.csv` tragen alle Werte ihre Einheit (CPU `c`/`m`/`µ`,
 Speicher `Ki`/`Mi`/`Gi`) — siehe Einheiten-Abschnitt oben.
 
@@ -2216,6 +2434,12 @@ ResourceQuota wird **nie** verändert.
   Speicher, jeweils request **und** limit zusammen); kalte Dimensionen bleiben
   weg, damit der Merge die Live-Werte unberührt lässt. Mehrere Container werden
   per Name (Strategic-Merge-Key) getrennt aufgeführt.
+- **HPA-Schutz:** Skaliert ein HorizontalPodAutoscaler über die Auslastung
+  einer Dimension (`hpa_action=LIMIT_ONLY`), wird nur deren **Limit** gesetzt;
+  der Request bleibt unangetastet (im Kommentar als `(HPA-pinned)` markiert).
+  Steht der HPA bereits auf `maxReplicas` (`INCREASE_MAX_REPLICAS`), nennt der
+  Kommentarkopf das als manuellen Folgeschritt. Die `hpa:`-Zeile im Kopf und
+  das `hpa`-Feld im JSON tragen Name, Replikabereich, Metriken und Aktion.
 - **Quota-Schutz:** Würde die Summe der Empfehlungen eines Namespace dessen
   ResourceQuota überschreiten (`quota_action=INCREASE_QUOTA`), wird der Namespace
   **komplett übersprungen** und im `SKIPPED`-Kopfblock mit der überschrittenen
@@ -2564,6 +2788,14 @@ def _has_storage(node):
     return bool(node.get("storage")) or bool(node.get("pvcs"))
 
 
+def _hpa_marker(hpa):
+    """'  (hpa: web-hpa 2-5, now 3)' suffix for the WORKLOADS table."""
+    if not hpa:
+        return ""
+    return (f"  (hpa: {hpa['name']} {hpa['min_replicas']}-{hpa['max_replicas']}"
+            f", now {hpa['current_replicas']})")
+
+
 def render_text(trees, stream, levels=("namespace", "workload", "pod",
                                        "container"), summary=True):
     if summary and trees:
@@ -2611,7 +2843,8 @@ def render_text(trees, stream, levels=("namespace", "workload", "pod",
         if "workload" in levels:
             stream.write("\nWORKLOADS\n")
             rows = [[f"{wl['kind']}/{wl['name']}"
-                     + ("  (idle: 0 pods)" if wl.get("idle") else ""),
+                     + ("  (idle: 0 pods)" if wl.get("idle") else "")
+                     + _hpa_marker(wl.get("hpa")),
                      *_usage_cells(wl["totals"])]
                     for wl in node["workloads"]]
             _print_table(["WORKLOAD", *_USAGE_HEADERS], rows, stream)

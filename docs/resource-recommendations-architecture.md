@@ -67,7 +67,7 @@ Stdlib-only Python. Runs **in-cluster** (REST API + ServiceAccount token) or
 flowchart TB
     subgraph IN["Inputs"]
         direction TB
-        A1["Kubernetes API<br/>pods · deployments/statefulsets/daemonsets<br/>ResourceQuota · PersistentVolumeClaims<br/>StorageClasses · namespaces"]
+        A1["Kubernetes API<br/>pods · deployments/statefulsets/daemonsets<br/>HorizontalPodAutoscalers<br/>ResourceQuota · PersistentVolumeClaims<br/>StorageClasses · namespaces"]
         A2["Thanos / Prometheus<br/>CPU rate · memory working-set<br/>peak & avg over --window"]
         A3["Live pod state<br/>lastState = OOMKilled"]
     end
@@ -78,7 +78,7 @@ flowchart TB
         P2["Attach real usage<br/>(now / peak / avg)"]
         P3["Overlay ResourceQuota<br/>CPU/mem Hard+Used · storage per StorageClass"]
         P4["PVCs → capacity + StorageClass<br/>(+ description annotation)"]
-        P5["compute_recommendation<br/>hot workloads → request/limit"]
+        P5["compute_recommendation<br/>hot workloads → request/limit<br/>HPA-aware: pinned request · at maxReplicas"]
         P6["namespace quota gate<br/>fits quota? else INCREASE_QUOTA"]
         P1 --> P2 --> P3 --> P4 --> P5 --> P6
     end
@@ -107,6 +107,15 @@ flowchart TB
 its peak is unbounded or above the target utilisation (`--target-util`, default
 80 %). Then `request = round_up(peak)` and `limit = round_up(peak ÷ target_util)`
 (CPU → next 10m, memory → next Mi). Quiet workloads are omitted.
+
+**HPA rule:** each workload's HorizontalPodAutoscaler (matched by
+`scaleTargetRef`) is consulted before recommending. If the HPA scales on a
+resource's *utilisation* (usage ÷ request, e.g. `cpu=70%`), raising that request
+would lower the utilisation and make the HPA scale in — so the request is
+**pinned** and only the limit is recommended (`hpa_action=LIMIT_ONLY`). If the
+workload is hot while the HPA already sits at `maxReplicas`, the CSV/apply
+manifest flags `INCREASE_MAX_REPLICAS` as the manual follow-up; the script never
+patches HPAs. `sizing.csv` (t-shirt shapes) is descriptive and ignores HPAs.
 
 ---
 
@@ -236,5 +245,6 @@ flowchart LR
 | **StorageClass** | the type/tier of disk (e.g. `file-silver`) |
 | **peak utilisation** | the highest real usage observed over the look-back window |
 | **right-sizing** | adjusting requests/limits to match real usage (save waste, avoid OOM) |
+| **HPA** | HorizontalPodAutoscaler — adds/removes replicas based on a metric, usually CPU utilisation as % of the request |
 | **dry-run** | a validated "what would happen" with **no actual change** |
 | **OOMKilled** | a container killed for exceeding its memory limit |

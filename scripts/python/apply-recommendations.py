@@ -142,7 +142,14 @@ def apply_manifest(manifest, runner=subprocess_runner, execute=False,
     results = []
     for p in patches:
         label = f"{p['namespace']}/{p['kind']} {p['name']}"
-        summary = p.get("summary", []) or []
+        summary = list(p.get("summary", []) or [])
+        # HPA context first: INCREASE_MAX_REPLICAS is a manual follow-up the
+        # patch itself cannot perform.
+        h = p.get("hpa")
+        if h:
+            summary.insert(0, f"hpa: {h['name']} target={h['target']} "
+                              f"replicas={h['current_replicas']}/{h['max_replicas']} "
+                              f"(min {h['min_replicas']}) action={h['action']}")
         for line in summary:
             print(f"  {label}  {line}", file=out)
 
