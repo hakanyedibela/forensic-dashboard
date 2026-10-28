@@ -1,6 +1,6 @@
 {
-  "uid": "edb-alert-center",
-  "title": "EDB PostgreSQL — Alert Center",
+  "uid": "edb-alert-center-simple",
+  "title": "EDB PostgreSQL Simple — Alert Center",
   "tags": [
     "edb",
     "postgres",

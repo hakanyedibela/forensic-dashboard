@@ -1,6 +1,6 @@
 {
-  "uid": "edb-pg-overview",
-  "title": "EDB PostgreSQL — Cluster Overview",
+  "uid": "edb-pg-overview-simple",
+  "title": "EDB PostgreSQL Simple — Cluster Overview",
   "tags": [
     "edb",
     "postgres",

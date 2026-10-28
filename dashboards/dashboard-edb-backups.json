@@ -1,6 +1,6 @@
 {
-  "uid": "edb-pg-backups",
-  "title": "EDB PostgreSQL — Backups",
+  "uid": "edb-pg-backups-simple",
+  "title": "EDB PostgreSQL Simple — Backups",
   "tags": [
     "edb",
     "postgres",
