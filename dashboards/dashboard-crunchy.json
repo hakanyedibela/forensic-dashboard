@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "CloudNativePG cluster health, connections, transactions, replication",
+  "description": "Crunchy PostgreSQL (PGO) cluster health, connections, transactions, replication and backups",
   "editable": true,
   "graphTooltip": 1,
   "links": [],
@@ -75,7 +75,8 @@
           "expr": "count(pg_up{pg_cluster=\"$cluster\"})",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Number of PostgreSQL instances reporting pg_up for this cluster."
     },
     {
       "datasource": {
@@ -136,7 +137,8 @@
           "expr": "sum(pg_up{pg_cluster=\"$cluster\"})",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Instances whose exporter can reach PostgreSQL (pg_up = 1). Red below 2 = no standby available."
     },
     {
       "datasource": {
@@ -201,7 +203,8 @@
           "expr": "sum(ccp_stat_database_blks_hit{pg_cluster=\"$cluster\"}) / (sum(ccp_stat_database_blks_hit{pg_cluster=\"$cluster\"}) + sum(ccp_stat_database_blks_read{pg_cluster=\"$cluster\"}))",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Share of blocks served from shared_buffers instead of disk, cumulative since the last statistics reset (not the current value, so it moves slowly). Red below 80 %, green from 95 %."
     },
     {
       "datasource": {
@@ -258,7 +261,8 @@
           "expr": "sum(ccp_connection_stats_total{pg_cluster=\"$cluster\"})",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "All connections (active and idle) summed over all instances (ccp_connection_stats_total)."
     },
     {
       "datasource": {
@@ -315,7 +319,8 @@
           "expr": "sum(ccp_database_size_bytes{pg_cluster=\"$cluster\", role=\"master\"})",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Size of all databases on the primary (role=master)."
     },
     {
       "datasource": {
@@ -372,7 +377,8 @@
           "expr": "sum(ccp_wal_activity_total_size_bytes{pg_cluster=\"$cluster\", role=\"master\"})",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Current size of the pg_wal directory on the primary. A steady rise usually means archiving is failing or a replication slot holds WAL back."
     },
     {
       "collapsed": false,
@@ -479,7 +485,8 @@
           "refId": "C",
           "legendFormat": "Max Query Time (s)"
         }
-      ]
+      ],
+      "description": "Total connections, connections idle in transaction (they hold locks and block vacuum), and the longest running query in seconds. Note: the query time shares the axis with the counts."
     },
     {
       "datasource": {
@@ -564,7 +571,8 @@
           "refId": "B",
           "legendFormat": "Rollbacks/s"
         }
-      ]
+      ],
+      "description": "Commits and rollbacks per second over all databases and instances. A growing rollback share points to application errors."
     },
     {
       "collapsed": false,
@@ -652,7 +660,8 @@
           "refId": "A",
           "legendFormat": "{{dbname}}"
         }
-      ]
+      ],
+      "description": "Size per database on the primary."
     },
     {
       "datasource": {
@@ -737,7 +746,8 @@
           "refId": "B",
           "legendFormat": "Blocks Hit/s (cache)"
         }
-      ]
+      ],
+      "description": "Blocks read from disk vs. found in shared_buffers per second. Sustained high disk reads = working set larger than memory."
     },
     {
       "collapsed": false,
@@ -823,7 +833,8 @@
           "refId": "A",
           "legendFormat": "WAL Bytes/s (5m avg)"
         }
-      ]
+      ],
+      "description": "WAL written by the primary, averaged over the last 5 minutes (bytes/s). Drives archive volume and replication traffic."
     },
     {
       "datasource": {
@@ -907,7 +918,8 @@
           "refId": "B",
           "legendFormat": "Receive Lag {{pod}}"
         }
-      ]
+      ],
+      "description": "Per replica: time since the last replayed transaction (Replay) and the last received WAL (Receive). Both also grow while the primary has no writes, so check together with WAL Activity."
     },
     {
       "collapsed": false,
@@ -993,7 +1005,8 @@
           "refId": "A",
           "legendFormat": "Temp Bytes/s"
         }
-      ]
+      ],
+      "description": "Sorts and hashes spilling to disk. Persistent values = work_mem too small or expensive queries."
     },
     {
       "datasource": {
@@ -1066,7 +1079,8 @@
           "refId": "A",
           "legendFormat": "Deadlocks"
         }
-      ]
+      ],
+      "description": "Deadlocks per 5 minutes. Any non-zero value is worth a look in the PostgreSQL log."
     },
     {
       "collapsed": false,
@@ -1144,7 +1158,8 @@
           "expr": "min(\n  label_replace(ccp_backrest_last_full_backup_time_since_completion_seconds{pg_cluster=\"$cluster\", role=\"master\"}, \"backup_type\", \"full\", \"\", \"\")\n  or label_replace(ccp_backrest_last_diff_backup_time_since_completion_seconds{pg_cluster=\"$cluster\", role=\"master\"}, \"backup_type\", \"diff\", \"\", \"\")\n  or label_replace(ccp_backrest_last_incr_backup_time_since_completion_seconds{pg_cluster=\"$cluster\", role=\"master\"}, \"backup_type\", \"incr\", \"\", \"\")\n)",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Age of the newest successful pgBackRest backup of any type. Orange from 1 day, red from 2 days. Details: Crunchy Backups dashboard."
     },
     {
       "datasource": {
@@ -1228,7 +1243,8 @@
           "refId": "B",
           "legendFormat": "Failed"
         }
-      ]
+      ],
+      "description": "Archived and failed WAL segments as absolute counters since the last statistics reset (not a rate). A rising 'Failed' line means archive_command is failing."
     },
     {
       "datasource": {
@@ -1293,7 +1309,8 @@
           "expr": "max(ccp_archive_command_status_seconds_since_last_archive{pg_cluster=\"$cluster\", role=\"master\"})",
           "refId": "A"
         }
-      ]
+      ],
+      "description": "Time since the primary archived its last WAL segment. Orange from 5 min, red from 10 min. Also rises on an idle database without any error."
     },
     {
       "datasource": {
@@ -1396,7 +1413,8 @@
           "refId": "D",
           "legendFormat": "Fetched/s"
         }
-      ]
+      ],
+      "description": "Rows inserted, updated, deleted and fetched per second over all databases and instances."
     }
   ],
   "schemaVersion": 39,
@@ -1421,7 +1439,8 @@
         "options": [],
         "query": "prometheus",
         "refresh": 1,
-        "type": "datasource"
+        "type": "datasource",
+        "description": "Prometheus (or Thanos Querier) datasource all panels query."
       },
       {
         "current": {
@@ -1441,7 +1460,8 @@
         "name": "cluster",
         "query": "label_values(pg_up, pg_cluster)",
         "refresh": 2,
-        "type": "query"
+        "type": "query",
+        "description": "PostgresCluster (label 'pg_cluster' set by the Crunchy pgMonitor exporter)."
       }
     ]
   },

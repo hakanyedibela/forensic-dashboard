@@ -139,6 +139,16 @@ the deprecated `cnp_collector_*` metrics and the Barman Cloud plugin prefix with
 Backup thresholds assume a daily `ScheduledBackup` (warning 26 h, critical 50 h). Adjust in the rules and the
 stat-panel thresholds if your schedule differs.
 
+### Crunchy dashboards
+
+`dashboards/dashboard-crunchy*.json` are maintained by hand. Their tooltips live in
+`scripts/crunchy-dashboards/apply_tooltips.py` (idempotent; keeps the files' formatting):
+
+```bash
+python3 scripts/crunchy-dashboards/apply_tooltips.py "$PWD"          # add/refresh tooltips
+python3 scripts/crunchy-dashboards/apply_tooltips.py "$PWD" --check  # fails if a panel, variable, link or column has none
+```
+
 ### Customer import
 
 `export/` holds a single-file bundle (`edb-grafana-bundle.json`: 3 dashboards + 30 alert rules), an API

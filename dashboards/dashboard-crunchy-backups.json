@@ -37,7 +37,8 @@
         "options": [],
         "query": "prometheus",
         "refresh": 1,
-        "type": "datasource"
+        "type": "datasource",
+        "description": "Prometheus- (oder Thanos-Querier-) Datenquelle fuer alle Panels."
       },
       {
         "current": {
@@ -57,7 +58,8 @@
         "name": "cluster",
         "query": "label_values(pg_up, pg_cluster)",
         "refresh": 2,
-        "type": "query"
+        "type": "query",
+        "description": "PostgresCluster (Label 'pg_cluster' des Crunchy-pgMonitor-Exporters)."
       },
       {
         "name": "namespace",
@@ -76,7 +78,8 @@
         "options": [],
         "sort": 0,
         "includeAll": false,
-        "multi": false
+        "multi": false,
+        "description": "Namespace des Clusters. Versteckt; folgt dem gewaehlten Cluster."
       },
       {
         "name": "pgname",
@@ -95,7 +98,8 @@
         "options": [],
         "sort": 0,
         "includeAll": false,
-        "multi": false
+        "multi": false,
+        "description": "Clustername fuer die Suche nach Backup-CronJobs (<name>-repo...). Versteckt; folgt dem Cluster."
       }
     ]
   },
@@ -1030,7 +1034,7 @@
         "x": 0,
         "y": 32
       },
-      "description": "Alle CronJobs im Namespace, deren Name \"backup\" enthaelt (auch nicht von pgBackRest verwaltete). Leeres \"Seit letztem Erfolg\" = nie erfolgreich. Schwellwert je CronJob: gelb ab 50 h (incr pausiert sonntags), rot ab 8 d. Negativer \"Naechster Lauf in\" = Lauf ueberfaellig, CronJob haengt.",
+      "description": "Alle CronJobs im Namespace, deren Name \"backup\" enthaelt (auch nicht von pgBackRest verwaltete). Leeres \"Seit letztem Erfolg\" = nie erfolgreich. Schwellwert je CronJob: gelb ab 50 h (incr pausiert sonntags), rot ab 8 d. Negativer \"Naechster Lauf in\" = Lauf ueberfaellig, CronJob haengt.\n\n- **CronJob**: Name des CronJobs (pgBackRest-Repo-Jobs heissen <cluster>-repo<n>-<typ>).\n- **Seit letztem Lauf**: Zeit seit dem letzten geplanten Start, egal ob erfolgreich.\n- **Seit letztem Erfolg**: Zeit seit dem letzten erfolgreichen Lauf. Leer = nie erfolgreich.\n- **Naechster Lauf in**: Zeit bis zum naechsten geplanten Start. Negativ = ueberfaellig.\n- **Suspendiert**: 1 = CronJob ist angehalten (spec.suspend) und laeuft nicht.",
       "targets": [
         {
           "datasource": {
@@ -1260,7 +1264,8 @@
       "title": "Cluster Overview",
       "type": "link",
       "url": "/d/crunchy-pg-overview?${cluster:queryparam}&${datasource:queryparam}",
-      "icon": "dashboard"
+      "icon": "dashboard",
+      "tooltip": "Health, Performance und Replikation desselben Clusters."
     }
   ]
 }
